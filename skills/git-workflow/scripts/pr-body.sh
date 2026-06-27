@@ -1,0 +1,167 @@
+#!/usr/bin/env bash
+# pr-body.sh — Generate a PR description from commit history and diff stat
+#
+# Usage: pr-body.sh [base-branch]
+#
+# Arguments:
+#   base-branch  Branch to compare against (default: auto-detected from main/master/develop)
+#
+# Output:
+#   Formatted markdown PR body ready for use with 'gh pr create --body "$(pr-body.sh)"'
+#   or for pasting into a GitHub/GitLab PR form.
+#
+# Exit codes:
+#   0  - Success
+#   1  - Not in a git repository
+#   2  - No commits found between current branch and base
+set -euo pipefail
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+die() {
+  echo "ERROR: $*" >&2
+  exit "${2:-1}"
+}
+
+# ── Verify git context ────────────────────────────────────────────────────────
+
+if ! git rev-parse --git-dir > /dev/null 2>&1; then
+  die "Not in a git repository" 1
+fi
+
+# ── Determine base branch ─────────────────────────────────────────────────────
+
+detect_base_branch() {
+  # Check remote branches for common names
+  for candidate in main master develop trunk; do
+    if git rev-parse --verify "origin/$candidate" > /dev/null 2>&1; then
+      echo "$candidate"
+      return
+    fi
+    if git rev-parse --verify "$candidate" > /dev/null 2>&1; then
+      echo "$candidate"
+      return
+    fi
+  done
+  echo "main"
+}
+
+BASE_BRANCH="${1:-$(detect_base_branch)}"
+CURRENT_BRANCH=$(git branch --show-current)
+
+if [ "$CURRENT_BRANCH" = "$BASE_BRANCH" ]; then
+  die "Currently on '$BASE_BRANCH'. Checkout a feature branch first." 2
+fi
+
+# ── Collect commit data ───────────────────────────────────────────────────────
+
+# Determine the merge base (divergence point)
+MERGE_BASE=$(git merge-base "$BASE_BRANCH" HEAD 2>/dev/null || git merge-base "origin/$BASE_BRANCH" HEAD 2>/dev/null || echo "")
+
+if [ -z "$MERGE_BASE" ]; then
+  die "Cannot determine merge base between '$CURRENT_BRANCH' and '$BASE_BRANCH'" 2
+fi
+
+# Commit log since divergence
+COMMITS=$(git log --oneline "$MERGE_BASE"..HEAD 2>/dev/null)
+COMMIT_COUNT=$(echo "$COMMITS" | grep -c . || true)
+
+if [ "$COMMIT_COUNT" -eq 0 ]; then
+  die "No commits found between '$CURRENT_BRANCH' and '$BASE_BRANCH'. Nothing to PR." 2
+fi
+
+# Diff stat
+DIFF_STAT=$(git diff --stat "$MERGE_BASE"..HEAD 2>/dev/null || echo "No diff stat available")
+
+# File list (just names)
+CHANGED_FILES=$(git diff --name-only "$MERGE_BASE"..HEAD 2>/dev/null || echo "")
+FILE_COUNT=$(echo "$CHANGED_FILES" | grep -c . || true)
+
+# Insertions / deletions summary line
+DIFF_SUMMARY=$(git diff --shortstat "$MERGE_BASE"..HEAD 2>/dev/null || echo "")
+
+# ── Generate PR title ─────────────────────────────────────────────────────────
+
+# Use the first commit's message as the basis for the PR title
+FIRST_COMMIT_MSG=$(git log --format="%s" "$MERGE_BASE"..HEAD 2>/dev/null | tail -1)
+
+# If multiple commits, try to find a common theme; otherwise use first commit
+if [ "$COMMIT_COUNT" -eq 1 ]; then
+  PR_TITLE="$FIRST_COMMIT_MSG"
+else
+  # Extract the scope/type prefix if conventional commit format
+  PR_TITLE=$(echo "$FIRST_COMMIT_MSG" | head -c 70)
+fi
+
+# ── Generate commit bullets ───────────────────────────────────────────────────
+
+COMMIT_BULLETS=$(git log --format="- %s" "$MERGE_BASE"..HEAD 2>/dev/null)
+
+# ── Generate test plan skeleton from changed files ────────────────────────────
+
+generate_test_plan() {
+  local files="$1"
+
+  local has_tests=false
+  local has_api=false
+  local has_db=false
+  local has_config=false
+  local has_ui=false
+
+  echo "$files" | grep -qiE '(_test\.|\.test\.|_spec\.|\.spec\.|tests/|test/)' && has_tests=true || true
+  echo "$files" | grep -qiE '(api/|handler|controller|route|endpoint)' && has_api=true || true
+  echo "$files" | grep -qiE '(migration|schema|model|repository|dao)' && has_db=true || true
+  echo "$files" | grep -qiE '(config|\.env\.example|\.yaml$|\.yml$|\.toml$)' && has_config=true || true
+  echo "$files" | grep -qiE '(\.(tsx?|jsx?|vue|svelte)$|components/|pages/)' && has_ui=true || true
+
+  echo "- [ ] Existing tests pass"
+  $has_tests && echo "- [ ] New tests cover the added behavior"
+  $has_api   && echo "- [ ] API endpoints return expected responses and status codes"
+  $has_db    && echo "- [ ] Database migrations run cleanly on a fresh schema"
+  $has_config && echo "- [ ] Configuration changes are documented and backward compatible"
+  $has_ui    && echo "- [ ] UI renders correctly on target browsers/viewports"
+  echo "- [ ] Manual smoke test of the primary user flow"
+}
+
+TEST_PLAN=$(generate_test_plan "$CHANGED_FILES")
+
+# ── Output PR body ────────────────────────────────────────────────────────────
+
+cat <<PR_BODY
+## Summary
+<!-- 1-3 bullet points describing what changed and why -->
+${COMMIT_BULLETS}
+
+## Changes
+
+\`\`\`
+${DIFF_STAT}
+\`\`\`
+
+**${FILE_COUNT} files changed.** ${DIFF_SUMMARY}
+
+## Test Plan
+
+${TEST_PLAN}
+
+## Related
+
+<!-- Ticket links, related PRs, documentation -->
+- Branch: \`${CURRENT_BRANCH}\`
+- Base: \`${BASE_BRANCH}\`
+- Commits: ${COMMIT_COUNT}
+
+---
+*Generated by git-workflow skill — edit before submitting.*
+PR_BODY
+
+# ── Print usage hint to stderr (doesn't pollute the body) ────────────────────
+
+echo "" >&2
+echo "=== PR Body Generated ===" >&2
+echo "Title suggestion (under 70 chars):" >&2
+echo "  $PR_TITLE" >&2
+echo "" >&2
+echo "To create PR with gh CLI:" >&2
+echo "  gh pr create --title \"$PR_TITLE\" --body \"\$(bash scripts/pr-body.sh)\"" >&2
+echo "" >&2
