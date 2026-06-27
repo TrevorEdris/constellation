@@ -1,0 +1,11 @@
+{
+  "name": "constellation",
+  "description": "Best-of-both-worlds skills plugin: superpowers' bulletproofed discipline merged with the fellowship-of-the-workflows skills and customizations, for Claude Code and Codex",
+  "version": "0.1.0",
+  "author": {
+    "name": "Trevor Edris",
+    "email": "trevor.edris@gmail.com"
+  },
+  "license": "MIT",
+  "keywords": ["skills", "tdd", "debugging", "code-review", "planning", "session-docs", "codex", "workflows"]
+}

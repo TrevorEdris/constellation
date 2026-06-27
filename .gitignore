@@ -1,0 +1,11 @@
+# local scratch / generated
+discovery-raw.json
+*.log
+.DS_Store
+
+# symlink artifacts from local installs
+.agents/
+
+# python
+__pycache__/
+*.pyc
