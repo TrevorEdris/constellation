@@ -33,6 +33,13 @@ for d in "${PLUGIN_ROOT}"/skills/*/; do
   run "ln -sfn '${d%/}' '${CC_SKILLS}/${name}'"
 done
 
+echo "== Claude Code output-styles (persona system): ${HOME}/.claude/output-styles"
+run "mkdir -p '${HOME}/.claude/output-styles'"
+for f in "${PLUGIN_ROOT}"/output-styles/*.md; do
+  [ -e "$f" ] || continue
+  run "ln -sfn '$f' '${HOME}/.claude/output-styles/$(basename "$f")'"
+done
+
 cat <<EOF
 
 Next steps:
