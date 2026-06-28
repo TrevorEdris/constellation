@@ -29,7 +29,7 @@ NO PLAN PRESENTED FOR APPROVAL WITHOUT A FRESH plan-validator PASS (>= 70)
 
 ## Constellation gate (PLAN v2)
 
-This validates the canonical PLAN v2 format at `docs/PLAN-TEMPLATE.md`. Beyond the script's score, three constellation requirements are HARD gates — a plan failing any of them is not PASS regardless of numeric score:
+This validates the canonical PLAN v2 format defined by constellation:writing-plans (bundled at `skills/writing-plans/references/PLAN-TEMPLATE.md`). Beyond the script's score, three constellation requirements are HARD gates — a plan failing any of them is not PASS regardless of numeric score:
 
 1. **PLAN v2 frontmatter** — `schema: plan/v2` plus the canonical fixed section headings (Target repo & files, Structure (phased), Ordered steps, Risks & assumptions, Verification (aggregate), Traceability, Out of scope, Git strategy). Do not rename headings.
 2. **Traceability table present and populated** — a `## Traceability` section mapping every Discovery finding to a plan step. Findings with no step must be justified as out of scope. An empty or missing table fails the gate.

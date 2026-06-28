@@ -105,7 +105,7 @@ Note: the bad example bundles test + implementation + verification into one unte
 
 ## Emit the plan in PLAN v2 format
 
-Write to `.ai/sessions/YYYY-MM-DD_<TICKET>_<SLUG>/PLAN.md` (user preferences override). Use the canonical structure in `docs/PLAN-TEMPLATE.md` exactly — do not rename headings, they are parsed programmatically.
+Write to `.ai/sessions/YYYY-MM-DD_<TICKET>_<SLUG>/PLAN.md` (user preferences override). Use the canonical structure in `references/PLAN-TEMPLATE.md` (bundled with this skill) exactly — do not rename headings, they are parsed programmatically.
 
 - **Frontmatter** — fill `schema: plan/v2`, `date`, `slug`, `status`, `targets`. Leave `plan_validator_score: null`; the validator fills it.
 - **Plan header / executor hand-off** — directly under the title, include the executor pointer so whoever runs it knows the chain:

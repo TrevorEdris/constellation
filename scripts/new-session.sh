@@ -25,7 +25,7 @@ fill() { # template -> dest
 
 [ -f "$DIR/SESSION.md" ]   || fill "$PLUGIN/docs/SESSION-TEMPLATE.md"   "$DIR/SESSION.md"
 [ -f "$DIR/DISCOVERY.md" ] || fill "$PLUGIN/docs/DISCOVERY-TEMPLATE.md" "$DIR/DISCOVERY.md"
-[ -f "$DIR/PLAN.md" ]      || fill "$PLUGIN/docs/PLAN-TEMPLATE.md"      "$DIR/PLAN.md"
+[ -f "$DIR/PLAN.md" ]      || fill "$PLUGIN/skills/writing-plans/references/PLAN-TEMPLATE.md" "$DIR/PLAN.md"
 
 printf '%s\n' "$NAME" > "$ROOT/.active"
 printf '%s\n' "$DIR"
