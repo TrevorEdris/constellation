@@ -8,12 +8,6 @@
         ]
       },
       {
-        "matcher": "",
-        "hooks": [
-          { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/persona-context.js\"" }
-        ]
-      },
-      {
         "matcher": "compact",
         "hooks": [
           { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/post-compact-logger.js\"" }

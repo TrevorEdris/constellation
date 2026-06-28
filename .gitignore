@@ -6,6 +6,9 @@ discovery-raw.json
 # symlink artifacts from local installs
 .agents/
 
+# cruft written by other plugins' hooks during local work
+.impeccable/
+
 # python
 __pycache__/
 *.pyc

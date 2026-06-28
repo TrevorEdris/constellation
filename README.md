@@ -15,11 +15,20 @@ Constellation takes the best of both: superpowers' discipline applied to a curat
 - `scripts/` — `install.sh`, `gen-catalog.py`, `gen-bootstrap`.
 
 ## Install
+
+**Claude Code** — load as a plugin (no script needed):
+```
+/plugin marketplace add ~/src/constellation
+/plugin install constellation@constellation-dev
+```
+This wires skills, agents, and hooks from the manifest.
+
+**Codex** — symlink skills into the official `~/.agents/skills/` path:
 ```bash
-bash scripts/install.sh            # symlink skills for Claude Code + Codex
+bash scripts/install.sh            # link skills for Codex
 bash scripts/install.sh --dry-run  # preview
 ```
-Codex uses the official `~/.agents/skills/` discovery path. See `.codex/INSTALL.md`.
+See `.codex/INSTALL.md`.
 
 ## Adding a skill
 Drop `skills/<name>/SKILL.md` (frontmatter: `name` + `description` only, description starts with "Use when …"). Run `python scripts/gen-catalog.py` to register it. No manifest edit needed.
