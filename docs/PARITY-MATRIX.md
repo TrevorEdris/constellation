@@ -9,7 +9,7 @@ Constellation targets Claude Code and Codex. Skills are portable; everything els
 | Subagents (`agents/`) | ✅ | ⚠️ needs `multi_agent=true`; else single-session | `Task` → `spawn_agent`/`wait`/`close_agent` |
 | Slash commands (`commands/`) | ✅ | ❌ use skill or AGENTS.md | — |
 | Hooks (`hooks/`) | ✅ | ❌ | Session bootstrap + safety + session-doc automation are CC-only; intent mirrored in AGENTS.md/rules |
-| Output styles / personas | not shipped | not shipped | Personas are a fellowship-of-the-workflows feature; constellation only keeps the rule that personas apply to live chat, never committed files |
+| Output styles / personas | not shipped | not shipped | Not shipped; constellation only keeps the rule that personas apply to live chat, never committed files |
 | Rules (`rules/`) | ✅ via CLAUDE.md | ✅ via AGENTS.md | Same body; emitted into each bootstrap |
 | Tool names | native | translate via `skills/_shared/platform/codex-tools.md` | `TodoWrite`→`update_plan`, etc. |
 | `Workflow` JS orchestration | ✅ | ❌ | Codex falls back to sequential `spawn_agent` |

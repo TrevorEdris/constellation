@@ -2,9 +2,9 @@
 /**
  * Shared session-resolution helpers for constellation session-doc hooks.
  *
- * Fixes the fotw wrong-session bug: findTodaySessionDir picked the last
- * dir alphabetically among same-day dirs, so with many same-day sessions the
- * snapshot/summary could land in the wrong one. Resolution order here:
+ * Picks the active session robustly. Choosing the last dir alphabetically among
+ * same-day dirs can land the snapshot/summary in the wrong session when many
+ * share a date. Resolution order here:
  *   1. .ai/sessions/.active pointer file (explicit active session)
  *   2. SESSION.md frontmatter session_id matching the hook's session_id
  *   3. most-recently-MODIFIED today-dated dir (mtime, not alphabetical)

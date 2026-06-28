@@ -28,7 +28,7 @@ Every subtask must define all required fields before execution begins. Optional 
 ```
 T1:
   title: "Review code quality of auth module"
-  description: "Perform a pragmatic code review of src/auth/ focusing on architecture, correctness, and maintainability. Flag issues using the FotW triage matrix."
+  description: "Perform a pragmatic code review of src/auth/ focusing on architecture, correctness, and maintainability. Flag issues using a severity triage matrix."
   acceptance_criteria:
     - Review report produced with findings categorized by severity
     - At least architecture and security sections covered

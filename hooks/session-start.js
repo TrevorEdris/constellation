@@ -4,7 +4,7 @@
  * Injects the using-constellation router skill verbatim at startup|clear|compact
  * so the skill that tells the agent to use skills is always present.
  *
- * @fotw-hook {"event":"SessionStart","matcher":"startup|clear|compact","description":"Injects the using-constellation router at session start"}
+ * @hook {"event":"SessionStart","matcher":"startup|clear|compact","description":"Injects the using-constellation router at session start"}
  */
 const fs = require('fs');
 const path = require('path');

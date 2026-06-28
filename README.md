@@ -1,24 +1,26 @@
 # Constellation
 
-A local Claude Code + Codex skills plugin: **superpowers' bulletproofed discipline** merged with the **fellowship-of-the-workflows** skills and customizations actually used in this workspace.
+A Claude Code + Codex skills plugin: a curated set of skills that work together for a complete dev workflow — brainstorm, plan, TDD, debug, review, ship — with reliable triggering, enforced discipline, and automated session documentation.
 
-## Why
-- **superpowers** is exceptional at making skills *trigger reliably* and *resist agent rationalization under pressure* (Iron Laws, harvested rationalization tables, verification gates, adversarial review). See `docs/SUPERPOWERS-EFFECTIVENESS.md`.
-- **fellowship-of-the-workflows** brings the breadth, the spec-driven planning pipeline, automated session documentation, and the customizations that fit this workflow.
-
-Constellation takes the best of both: superpowers' discipline applied to a curated, usage-driven set of fotw skills.
+## What you get
+- **Discipline that holds under pressure** — TDD, systematic debugging, and verification skills with bright-line rules, rationalization tables, and verification gates, so steps don't get skipped.
+- **A spec-driven delivery loop** — PRD → roadmap → plan (scored gate) → TDD build → review (code / security / chaos) → ship.
+- **Parallel execution** — orchestration and subagent-driven development for fan-out work.
+- **Automated session docs** — `.ai/sessions/` scaffolding, pre-compact snapshots, and handoffs, maintained by hooks.
+- **One portable source for Claude Code and Codex.**
 
 ## Layout
 - `skills/<name>/SKILL.md` — portable skills (one source, read by both CC and Codex). Full list: `CATALOG.md`.
-- `agents/`, `commands/`, `hooks/` — Claude Code subagents, slash commands, and hooks (session bootstrap, safety, session-doc automation).
-- `rules/` — standing conventions. `docs/` — distillation doc, PLAN v2 template, CC↔Codex parity matrix.
-- `scripts/` — `install.sh`, `gen-catalog.py`, `gen-bootstrap`.
+- `agents/` — specialist subagents for dispatched review and debugging.
+- `hooks/` — session bootstrap, safety guards, and session-doc automation.
+- `rules/` — standing conventions. `docs/` — design notes, PLAN v2 template, CC↔Codex parity matrix.
+- `scripts/` — `install.sh`, `gen-catalog.py`, `gen-bootstrap.py`, `new-session.sh`.
 
 ## Install
 
-**Claude Code** — load as a plugin (no script needed):
+**Claude Code** — load as a plugin:
 ```
-/plugin marketplace add ~/src/constellation
+/plugin marketplace add TrevorEdris/constellation
 /plugin install constellation@constellation
 ```
 This wires skills, agents, and hooks from the manifest.
@@ -31,12 +33,13 @@ bash scripts/install.sh --dry-run  # preview
 See `.codex/INSTALL.md`.
 
 ## Adding a skill
-Drop `skills/<name>/SKILL.md` (frontmatter: `name` + `description` only, description starts with "Use when …"). Run `python scripts/gen-catalog.py` to register it. No manifest edit needed.
+Drop `skills/<name>/SKILL.md` (frontmatter: `name` + `description` only; description starts with "Use when …"). Run `python scripts/gen-catalog.py` to register it. No manifest edit needed.
 
 ## Design principles
 1. One portable `SKILL.md` per skill — no per-platform forks.
 2. `description` = WHEN to trigger, never a workflow summary.
 3. Discipline skills carry an Iron Law + rationalization table + verification gate.
-4. CC-only machinery (hooks, commands, subagents) degrades gracefully on Codex.
+4. CC-only machinery (hooks, subagents) degrades gracefully on Codex.
 
-Status: in active build. See the build session under `~/src/.ai/sessions/2026-06-26_Constellation-Plugin-Build/`.
+## Credits
+Builds on ideas from [superpowers](https://github.com/obra/superpowers) (skill-effectiveness discipline) and fellowship-of-the-workflows (spec-driven planning and session automation).

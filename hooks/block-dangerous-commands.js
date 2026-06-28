@@ -3,7 +3,7 @@
  * Block Dangerous Commands - PreToolUse Hook for Bash
  * Blocks dangerous patterns before execution. Logs to: ~/.claude/hooks-logs/
  *
- * @fotw-hook {"event":"PreToolUse","matcher":"Bash","description":"Blocks dangerous shell patterns"}
+ * @hook {"event":"PreToolUse","matcher":"Bash","description":"Blocks dangerous shell patterns"}
  *
  * SAFETY_LEVEL: 'critical' | 'high' | 'strict'
  *   critical - Only catastrophic: rm -rf ~, dd to disk, fork bombs

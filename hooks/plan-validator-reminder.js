@@ -4,7 +4,7 @@
  * Nudges the agent to run /plan-validator after writing a PLAN.md file.
  * Non-blocking: injects a reminder into context, does not prevent the write.
  *
- * @fotw-hook {"event":"PostToolUse","matcher":"Write","description":"Reminds agent to run /plan-validator after writing PLAN.md"}
+ * @hook {"event":"PostToolUse","matcher":"Write","description":"Reminds agent to run /plan-validator after writing PLAN.md"}
  *
  * Setup in .claude/settings.json:
  * {

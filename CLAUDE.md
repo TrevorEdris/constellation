@@ -1,11 +1,11 @@
 # Constellation (Claude Code)
 
-This plugin merges superpowers' bulletproofed discipline with the fellowship-of-the-workflows skills and customizations. Skills auto-load via the plugin manifest; the `using-constellation` router is injected at session start by the SessionStart hook.
+Constellation is a curated Claude Code + Codex skills plugin for a complete dev workflow. Skills auto-load via the plugin manifest; the `using-constellation` router is injected at session start by the SessionStart hook.
 
 ## Where things are
 - `skills/<name>/SKILL.md` — the skills. The full list is in `CATALOG.md`.
-- `agents/` — Claude Code subagents. `commands/` — slash commands. `hooks/` — session bootstrap, safety, and session-doc automation.
-- `rules/` — standing conventions. `docs/` — the superpowers-effectiveness distillation, PLAN template, and the CC↔Codex parity matrix.
+- `agents/` — Claude Code subagents. `hooks/` — session bootstrap, safety, and session-doc automation.
+- `rules/` — standing conventions. `docs/` — skill design notes, PLAN template, and the CC↔Codex parity matrix.
 
 ## Standing rules (summarized; full text in `rules/`)
 - Discover → Plan → Implement with an explicit approval gate; PLAN passes `plan-validator` (≥ 70) before being shown. Maintain `.ai/sessions/` docs automatically.

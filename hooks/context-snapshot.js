@@ -4,7 +4,7 @@
  * Before compaction, writes CONTEXT_SNAPSHOT.md to the ACTIVE session dir
  * (resolved by session_id / .active pointer / mtime, not alphabetical).
  *
- * @fotw-hook {"event":"PreCompact","matcher":"","description":"Saves context snapshot to the active session before compaction"}
+ * @hook {"event":"PreCompact","matcher":"","description":"Saves context snapshot to the active session before compaction"}
  */
 const fs = require('fs');
 const path = require('path');

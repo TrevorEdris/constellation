@@ -4,7 +4,7 @@
  * Prevents reading, modifying, or exfiltrating sensitive files.
  * Logs to: ~/.claude/hooks-logs/
  *
- * @fotw-hook {"event":"PreToolUse","matcher":"Read|Edit|Write|Bash","description":"Prevents access to sensitive files and secrets"}
+ * @hook {"event":"PreToolUse","matcher":"Read|Edit|Write|Bash","description":"Prevents access to sensitive files and secrets"}
  *
  * SAFETY_LEVEL: 'critical' | 'high' | 'strict'
  *   critical - SSH keys, AWS creds, .env files only

@@ -5,7 +5,7 @@
  * targets a .md file and the content contains the section-sign character, emit a
  * non-blocking warning telling the agent to replace it with the word "section".
  *
- * @fotw-hook {"event":"PostToolUse","matcher":"Write","description":"Warns when authored markdown contains the section-sign character"}
+ * @hook {"event":"PostToolUse","matcher":"Write","description":"Warns when authored markdown contains the section-sign character"}
  */
 const SECTION_SIGN = '§';
 

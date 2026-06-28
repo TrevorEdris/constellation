@@ -5,7 +5,7 @@
  * new-session.sh script (which CREATES the dir + docs from templates and sets
  * the .active pointer) rather than just hand-creating it.
  *
- * @fotw-hook {"event":"UserPromptSubmit","matcher":"","description":"Nudges agent to scaffold a session via session-bootstrap"}
+ * @hook {"event":"UserPromptSubmit","matcher":"","description":"Nudges agent to scaffold a session via new-session.sh"}
  */
 const fs = require('fs');
 const { DEFAULT_SESSION_ROOT, today } = require('./lib/session');

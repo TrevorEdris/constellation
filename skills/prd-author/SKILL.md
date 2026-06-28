@@ -65,7 +65,7 @@ Codebase context from discovery *informs* requirements but stays in DISCOVERY.md
 Checklist (one TodoWrite item each):
 
 1. **Discovery** — ask the 8 questions from `references/discovery-questions.md`. One question per message. Do not write sections yet.
-2. **Existing-context check** — if discovery Q8 reveals existing code, suggest fotw:reverse-engineer (discover mode) before authoring.
+2. **Existing-context check** — if discovery Q8 reveals existing code, suggest a reverse-engineering pass over the existing code before authoring.
 3. **Section authoring** — walk the PRD template section by section using `references/facilitation-prompts.md`; pre-fill from discovery answers; confirm each section before the next.
 4. **Write** the PRD to `PRD.md` (or the user-specified path) using `references/prd-template.md`.
 5. **Validate** — run `references/prd-validator/scripts/validate_prd.py` (see `references/prd-validator/SKILL.md`). If NEEDS WORK (< 70), fix the findings and re-validate. Repeat until PASS.
@@ -145,7 +145,7 @@ digraph prd_author {
 
 - **Pipeline:** prd-author -> `references/prd-validator/` (>= 70 gate) -> `references/prd-to-roadmap/`. Do not skip the validator; do not hand a sub-70 PRD downstream.
 - **Roadmaps name features, not PRs.** The roadmap stage produces phased *feature* descriptions; PR decomposition happens later at slice-spec time, not in the PRD or the roadmap.
-- **Upstream (optional):** fotw:reverse-engineer (discover mode) when existing code should seed requirements.
+- **Upstream (optional):** a reverse-engineering pass when existing code should seed requirements.
 - **Sibling:** for designing a technical solution to a defined requirement, use constellation:brainstorming.
 
 ## References

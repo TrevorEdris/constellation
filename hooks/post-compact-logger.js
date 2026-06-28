@@ -5,7 +5,7 @@
  * (resolved by session_id / .active pointer / mtime). Preserves decisions across
  * compaction boundaries.
  *
- * @fotw-hook {"event":"SessionStart","matcher":"compact","description":"Appends compact summary to the active SESSION.md"}
+ * @hook {"event":"SessionStart","matcher":"compact","description":"Appends compact summary to the active SESSION.md"}
  */
 const fs = require('fs');
 const path = require('path');
