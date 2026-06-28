@@ -36,7 +36,7 @@ Reading the PRD and judging it "looks complete" is not validation. A score from 
 5. ONLY THEN call the PRD ready / proceed to roadmap.
 ```
 
-Run from the skill directory (`skills/prd-validator/`) so the relative script path resolves. Exit code 0 = PASS, 1 = NEEDS WORK.
+Run from this skill's base directory so the relative `scripts/` path resolves (the script is bundled alongside this file at `scripts/validate_prd.py`). Exit code 0 = PASS, 1 = NEEDS WORK.
 
 ## Checks Performed (17)
 
@@ -113,7 +113,7 @@ When the PRD scores NEEDS WORK, make each ERROR a TodoWrite entry, fix them, the
 
 - Called by constellation:prd-author — invoked automatically after a PRD is created or iterated. (REQUIRED SUB-SKILL for prd-author's completion gate.)
 - Gates constellation:prd-to-roadmap — that skill refuses to proceed unless the PRD passed this validator. Do not enter roadmap translation on an unvalidated PRD.
-- Tool portability (Codex tool names): skills/_shared/platform/codex-tools.md.
+- Tool portability (Codex tool names): see the plugin's `skills/_shared/platform/codex-tools.md`.
 
 ## The Bottom Line
 

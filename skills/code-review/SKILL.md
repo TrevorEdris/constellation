@@ -69,7 +69,7 @@ Categorize by actual severity. Not everything is Critical; do not bury a Critica
 
 ## Dispatching a reviewer subagent
 
-To preserve your context or get an independent pass, dispatch a Task subagent with the fill-in template at `references/reviewer-prompt.md`. Paste the FULL requirement/spec/ticket text and the base/head SHAs into the prompt — never tell the subagent to "read the plan" and never pass your session history. The template carries the adversarial stance, the scope pin, and the fixed report format. See REQUIRED SUB-SKILL constellation:code-review for the dispatch discipline and SHA setup.
+To preserve your context or get an independent pass, dispatch a Task subagent with the fill-in template at `references/reviewer-prompt.md`. Paste the FULL requirement/spec/ticket text and the base/head SHAs into the prompt — never tell the subagent to "read the plan" and never pass your session history. The template carries the adversarial stance, the scope pin, and the fixed report format. See `references/requesting-code-review/` for the dispatch discipline and SHA setup.
 
 ## Report format
 
@@ -120,7 +120,7 @@ When you are on the receiving end of review, do not perform agreement — verify
 
 ## Integration
 
-- REQUIRED SUB-SKILL: constellation:code-review — how to dispatch the reviewer with constructed context and git SHAs.
+- `references/requesting-code-review/` — how to dispatch the reviewer with constructed context and git SHAs.
 - REQUIRED SUB-SKILL: constellation:receiving-code-review — how to respond to and act on review feedback without performative agreement.
 - Pairs with constellation:verification-before-completion — the false-green countermeasure and run-the-real-path evidence standard.
 - References the Pragmatic Quality reviewer in `references/pragmatic-code-review.md`.

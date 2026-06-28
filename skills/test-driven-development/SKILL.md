@@ -256,4 +256,4 @@ Standalone copy: `references/verification-checklist.md`.
 - `references/tdd-cycle-examples.md` — full RED-GREEN-REFACTOR examples in TypeScript, Python, and Go.
 - `references/verification-checklist.md` — standalone checklist to fill in per task.
 
-Tool names are Claude Code; on Codex see `skills/_shared/platform/codex-tools.md`.
+Tool names are Claude Code; on Codex see the plugin's `skills/_shared/platform/codex-tools.md`.

@@ -35,8 +35,8 @@ or "I'll batch the reviews at the end," you are violating the law. Stop.
 ## When NOT to Use
 
 - Tasks are tightly coupled → execute manually or re-plan into independent slices.
-- You want parallel sessions instead of same-session → use
-  constellation:subagent-driven-development.
+- You want inline, single-session execution instead of subagent dispatch → use
+  `references/executing-plans/`.
 - No plan exists yet → use constellation:brainstorming then constellation:writing-plans first.
 
 ## Required setup before the first task
@@ -114,7 +114,7 @@ and lets reviewers judge the work product rather than the reasoning that produce
 - Pin every reviewer's scope to the diff: `gh pr diff --name-only` (or
   `git diff --name-only BASE_SHA HEAD_SHA`). Without a pinned scope, reviewers
   drift to unrelated merged code.
-- On Codex, `Task` maps to `spawn_agent`; see `_shared/platform/codex-tools.md`.
+- On Codex, `Task` maps to `spawn_agent`; see the plugin's `skills/_shared/platform/codex-tools.md`.
 
 ## Model selection
 
@@ -194,4 +194,4 @@ degrades honest feedback.
 - REQUIRED BACKGROUND: constellation:test-driven-development — subagents follow RED-GREEN-REFACTOR per task.
 - Upstream (creates the plan): constellation:writing-plans.
 - Downstream (after all tasks pass): constellation:git-workflow.
-- Alternative (parallel session instead of same-session): constellation:subagent-driven-development.
+- Alternative (inline, no subagents): `references/executing-plans/`.

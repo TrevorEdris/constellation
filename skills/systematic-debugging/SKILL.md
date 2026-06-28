@@ -176,7 +176,7 @@ edit, which structurally prevents fix-first behavior. Invoke it by name from a W
 with `subagent_type: systematic-debugger`), paste the full bug context into the prompt, and require the
 fixed report format. The agent file holds the read-only mandate and report schema; the dispatch template
 and controller responsibilities are in `references/systematic-debugger-subagent.md`. On Codex, map `Task`
--> `spawn_agent`; see `skills/_shared/platform/codex-tools.md`.
+-> `spawn_agent`; see the plugin's `skills/_shared/platform/codex-tools.md`.
 
 ## When investigation reveals "no root cause"
 

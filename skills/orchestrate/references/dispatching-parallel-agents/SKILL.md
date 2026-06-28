@@ -128,4 +128,4 @@ Do not integrate on the agents' word. Run this before declaring success:
 - REQUIRED BACKGROUND: `constellation:orchestrate` — coordinates multi-domain dispatch; this skill is its per-agent dispatch playbook.
 - Pairs with `constellation:systematic-debugging` — use it to confirm each domain is genuinely independent before splitting.
 - Pairs with `constellation:verification-before-completion` — the full-suite run above is the verification gate; do not skip it.
-- On Codex, `Task` maps to `spawn_agent`; see `skills/_shared/platform/codex-tools.md`.
+- On Codex, `Task` maps to `spawn_agent`; see the plugin's `skills/_shared/platform/codex-tools.md`.

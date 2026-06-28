@@ -28,7 +28,7 @@ If the user's instructions conflict with a skill, follow the user. The user is i
 Never read skill files manually with file tools — use your platform's skill loader so the skill activates.
 
 - **Claude Code:** use the `Skill` tool. Slash commands map to skills.
-- **Codex:** skills load natively from `~/.agents/skills/`; follow the instructions presented. For tool-name differences, consult `skills/_shared/platform/codex-tools.md`.
+- **Codex:** skills load natively from `~/.agents/skills/`; follow the instructions presented. For tool-name differences, consult the plugin's `skills/_shared/platform/codex-tools.md`.
 
 The full catalog of available skills is in `CATALOG.md` at the plugin root — consult it when deciding what applies. It is generated from the `skills/` directory, so it always reflects what is installed.
 

@@ -111,7 +111,7 @@ Write to `.ai/sessions/YYYY-MM-DD_<TICKET>_<SLUG>/PLAN.md` (user preferences ove
 - **Plan header / executor hand-off** — directly under the title, include the executor pointer so whoever runs it knows the chain:
 
   ```markdown
-  > **For the executor:** REQUIRED SUB-SKILL — use constellation:subagent-driven-development (recommended) or constellation:subagent-driven-development to run this plan step-by-step. Steps use checkbox (`- [ ]`) syntax for tracking.
+  > **For the executor:** REQUIRED SUB-SKILL — use constellation:subagent-driven-development to run this plan step-by-step; for inline, no-subagent execution see that skill's bundled executing-plans reference. Steps use checkbox (`- [ ]`) syntax for tracking.
   ```
 
 - **Target repo & files** — explicit New/Modified list with exact paths (from your file-structure pass).
@@ -165,5 +165,5 @@ The ONLY skills you invoke after writing-plans are plan-validator (during writin
 
 ## Notes
 
-- Tool names above (`Task`, `TodoWrite`, `Read`, `Write`, `Edit`, `Bash`) are Claude Code; on Codex see `skills/_shared/platform/codex-tools.md`.
+- Tool names above (`Task`, `TodoWrite`, `Read`, `Write`, `Edit`, `Bash`) are Claude Code; on Codex see the plugin's `skills/_shared/platform/codex-tools.md`.
 - Principles to keep visible in every plan: DRY, YAGNI, TDD, frequent commits.

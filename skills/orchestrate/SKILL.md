@@ -58,7 +58,7 @@ For each batch you intend to run concurrently, confirm BOTH:
 2. **No sequential dependency** — none needs another's output to start.
 
 If either fails, do not parallelize that batch — sequence it. REQUIRED BACKGROUND:
-constellation:orchestrate is the per-agent dispatch playbook this gate comes from.
+`references/dispatching-parallel-agents/` is the per-agent dispatch playbook this gate comes from.
 
 ### 4. Plan and Approval
 
@@ -114,7 +114,7 @@ recommendation (SHIP / NEEDS WORK / BLOCKED) with rationale.
   ```
 
   Without a pinned scope, reviewers drift into merged worktree code outside the diff.
-- On Codex, `Task` maps to `spawn_agent`; see `skills/_shared/platform/codex-tools.md`.
+- On Codex, `Task` maps to `spawn_agent`; see the plugin's `skills/_shared/platform/codex-tools.md`.
 
 ## Writing the Subtask Prompt
 
@@ -179,7 +179,7 @@ feedback.
 
 ## Integration
 
-- REQUIRED BACKGROUND: constellation:orchestrate — the per-agent dispatch
+- REQUIRED BACKGROUND: `references/dispatching-parallel-agents/` — the per-agent dispatch
   and independence-gate playbook this skill coordinates at scale.
 - REQUIRED BACKGROUND: constellation:verification-before-completion — the full-suite run is
   the completion gate; do not skip it.
