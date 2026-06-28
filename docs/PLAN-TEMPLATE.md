@@ -1,7 +1,7 @@
 ---
 schema: plan/v2
-date: YYYY-MM-DD
-slug: <session-slug>
+date: {{DATE}}
+slug: {{SLUG}}
 status: draft            # draft | awaiting-approval | approved | in-progress | complete
 plan_validator_score: null   # 0-100, PASS >= 70 (filled by plan-validator)
 traceability_complete: false
