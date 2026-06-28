@@ -1,0 +1,130 @@
+# Python CI Pipeline
+# -------------------
+# Runs lint (ruff), test (pytest with coverage), and optionally builds a
+# distribution package. Python version read from pyproject.toml or .python-version.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.12"    # Override with your required version
+
+jobs:
+  # --------------------------------------------------------------------------
+  # Lint -- ruff (linter + formatter check)
+  # --------------------------------------------------------------------------
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - uses: actions/setup-python@a26af69be951a213d495a4f99b4a7e1547b2428c  # v5.6.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: |
+            requirements*.txt
+            pyproject.toml
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]"  # Adjust to your project's dev install command
+        # Alternatives:
+        # pip install -r requirements-dev.txt
+        # poetry install --with dev
+        # uv sync --dev
+
+      - name: Run ruff (lint)
+        run: ruff check .
+
+      - name: Run ruff (format check)
+        run: ruff format --check .
+        # Replace ruff with flake8/black/isort if not using ruff:
+        # flake8 .
+        # black --check .
+
+      - name: Type check with mypy
+        run: mypy .
+        continue-on-error: true  # Remove once type annotations are complete
+
+  # --------------------------------------------------------------------------
+  # Test -- pytest with coverage
+  # --------------------------------------------------------------------------
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - uses: actions/setup-python@a26af69be951a213d495a4f99b4a7e1547b2428c  # v5.6.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: |
+            requirements*.txt
+            pyproject.toml
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]"  # Adjust to match your dev install command
+
+      - name: Run tests
+        run: |
+          pytest \
+            --cov=src \
+            --cov-report=xml:coverage.xml \
+            --cov-report=term-missing \
+            -v \
+            tests/
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: coverage
+          path: coverage.xml
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # --------------------------------------------------------------------------
+  # Build -- package build (for libraries) -- optional for services
+  # --------------------------------------------------------------------------
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [lint, test]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - uses: actions/setup-python@a26af69be951a213d495a4f99b4a7e1547b2428c  # v5.6.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install build tools
+        run: pip install build
+
+      - name: Build package
+        run: python -m build
+        # For services, replace with your container build or artifact creation step
+
+      - name: Upload dist
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: dist
+          path: dist/
+          retention-days: 7
+          if-no-files-found: ignore

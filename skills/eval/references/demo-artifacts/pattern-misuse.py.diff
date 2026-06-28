@@ -1,0 +1,49 @@
+diff --git a/models/user.py b/models/user.py
+index abc1234..def5678 100644
+--- /dev/null
++++ b/models/user.py
+@@ -0,0 +1,45 @@
++class User:
++    """User entity — anemic domain model."""
++    def __init__(self, name, email, role):
++        self.name = name
++        self.email = email
++        self.role = role
++
++
++class UserService:
++    """All logic lives here instead of in the domain model."""
++    def validate_email(self, user):
++        return "@" in user.email
++
++    def can_access(self, user, resource):
++        return user.role == "admin"
++
++    def format_display_name(self, user):
++        return f"{user.name} <{user.email}>"
++
++
++class AbstractNotificationFactory:
++    """Factory for a single implementation — speculative generality."""
++    def create_notifier(self, channel):
++        if channel == "email":
++            return EmailNotifier()
++        raise ValueError(f"Unknown channel: {channel}")
++
++
++class EmailNotifier:
++    def notify(self, user, message):
++        print(f"Sending to {user.email}: {message}")
++
++
++class NotificationService:
++    def __init__(self):
++        self._factory = AbstractNotificationFactory()
++        self._strategy = None
++
++    def set_strategy(self, strategy):
++        self._strategy = strategy
++
++    def send(self, user, message, channel="email"):
++        notifier = self._factory.create_notifier(channel)
++        notifier.notify(user, message)

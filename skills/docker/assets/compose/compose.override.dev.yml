@@ -1,0 +1,31 @@
+---
+# compose.override.yml — Dev-only settings, auto-merged by `docker compose up`
+# DO NOT commit credentials here. Use .env file (gitignored) for local secrets.
+# This file is intentionally NOT named compose.override.yml to avoid auto-merge
+# in projects where manual merging is preferred. Rename to compose.override.yml to enable.
+
+services:
+  app:
+    build:
+      target: builder    # Build to builder stage for hot-reload support
+    environment:
+      LOG_LEVEL: debug
+      HOT_RELOAD: "true"
+    volumes:
+      # Mount source for live reload (Go: air, Node: nodemon, Python: uvicorn --reload)
+      - ./src:/app/src:ro
+    ports:
+      - "2345:2345"      # Delve debugger port (Go)
+      # - "9229:9229"    # Node.js inspector
+    # Override restart policy for dev
+    restart: "no"
+
+  postgres:
+    # Expose postgres port to host for local DB client (TablePlus, psql, etc.)
+    ports:
+      - "5432:5432"
+
+  redis:
+    # Expose redis port for local redis-cli and RedisInsight
+    ports:
+      - "6379:6379"

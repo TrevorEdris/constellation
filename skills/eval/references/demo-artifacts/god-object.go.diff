@@ -1,0 +1,44 @@
+diff --git a/internal/service/manager.go b/internal/service/manager.go
+index abc1234..def5678 100644
+--- a/internal/service/manager.go
++++ b/internal/service/manager.go
+@@ -0,0 +1,55 @@
++package service
++
++type Manager struct {
++	db       *sql.DB
++	cache    *redis.Client
++	mailer   *smtp.Client
++	logger   *zap.Logger
++	metrics  *prometheus.Registry
++}
++
++func (m *Manager) CreateUser(name, email string) error {
++	_, err := m.db.Exec("INSERT INTO users (name, email) VALUES (?, ?)", name, email)
++	if err != nil { return err }
++	m.cache.Del(context.Background(), "users:list")
++	m.mailer.SendWelcome(email, name)
++	m.metrics.Counter("users.created").Inc()
++	m.logger.Info("user created", zap.String("email", email))
++	return nil
++}
++
++func (m *Manager) GetUser(id int) (*User, error) { /* db query */ return nil, nil }
++func (m *Manager) UpdateUser(id int, data map[string]interface{}) error { return nil }
++func (m *Manager) DeleteUser(id int) error { return nil }
++func (m *Manager) ListUsers(page, size int) ([]*User, error) { return nil, nil }
++func (m *Manager) SearchUsers(query string) ([]*User, error) { return nil, nil }
++
++func (m *Manager) SendEmail(to, subject, body string) error { return nil }
++func (m *Manager) SendBulkEmail(users []*User, template string) error { return nil }
++func (m *Manager) ValidateEmail(email string) bool { return true }
++
++func (m *Manager) GenerateReport(startDate, endDate time.Time) ([]byte, error) { return nil, nil }
++func (m *Manager) ExportCSV(users []*User) ([]byte, error) { return nil, nil }
++
++func (m *Manager) CacheUser(u *User) error { return nil }
++func (m *Manager) InvalidateCache(key string) error { return nil }
++func (m *Manager) WarmCache() error { return nil }
++
++func (m *Manager) RecordMetric(name string, value float64) { }
++func (m *Manager) HealthCheck() error { return nil }

@@ -1,0 +1,50 @@
+{
+  "mcpServers": {
+    "aws-docs": {
+      "command": "uvx",
+      "args": ["awslabs.aws-documentation-mcp-server"],
+      "env": {
+        "AWS_REGION": "us-east-1"
+      }
+    },
+    "aws-iac": {
+      "command": "uvx",
+      "args": ["awslabs.aws-iac-mcp-server"],
+      "env": {
+        "AWS_PROFILE": "dev",
+        "AWS_REGION": "us-east-1"
+      }
+    },
+    "aws-serverless": {
+      "command": "uvx",
+      "args": ["awslabs.aws-serverless-mcp-server"],
+      "env": {
+        "AWS_PROFILE": "dev",
+        "AWS_REGION": "us-east-1"
+      }
+    },
+    "aws-ecs": {
+      "command": "uvx",
+      "args": ["awslabs.ecs-mcp-server"],
+      "env": {
+        "AWS_PROFILE": "dev",
+        "AWS_REGION": "us-east-1"
+      }
+    },
+    "aws-cloudwatch": {
+      "command": "uvx",
+      "args": ["awslabs.cloudwatch-mcp-server"],
+      "env": {
+        "AWS_PROFILE": "dev",
+        "AWS_REGION": "us-east-1"
+      }
+    },
+    "aws-pricing": {
+      "command": "uvx",
+      "args": ["awslabs.aws-pricing-mcp-server"],
+      "env": {
+        "AWS_REGION": "us-east-1"
+      }
+    }
+  }
+}

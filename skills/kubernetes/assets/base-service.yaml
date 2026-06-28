@@ -1,0 +1,26 @@
+---
+# Service template for a standard HTTP backend
+# Replace <APP_NAME> and <NAMESPACE> with your values.
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: <APP_NAME>
+  namespace: <NAMESPACE>
+  labels:
+    app.kubernetes.io/name: <APP_NAME>
+    app.kubernetes.io/managed-by: kustomize
+  annotations:
+    # Prometheus scraping (if using ServiceMonitor or pod annotations)
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "8080"
+    prometheus.io/path: "/metrics"
+spec:
+  type: ClusterIP      # ClusterIP = internal only; LoadBalancer = external; NodePort = node port
+  selector:
+    app.kubernetes.io/name: <APP_NAME>   # Must match pod labels
+  ports:
+    - name: http
+      protocol: TCP
+      port: 80          # Port on the Service (what clients call)
+      targetPort: http  # Named port on the container (or numeric: 8080)

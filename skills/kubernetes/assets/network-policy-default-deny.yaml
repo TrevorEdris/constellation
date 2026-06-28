@@ -1,0 +1,82 @@
+---
+# Default-deny NetworkPolicy for a namespace.
+# Apply this FIRST, then add explicit allow policies for your services.
+# Replace <NAMESPACE> with your target namespace.
+
+# Step 1: Deny all ingress and egress in the namespace
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: <NAMESPACE>
+spec:
+  podSelector: {}    # Applies to all pods in the namespace
+  policyTypes:
+    - Ingress
+    - Egress
+
+---
+# Step 2: Allow DNS egress (required for all pods to resolve service names)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: <NAMESPACE>
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+---
+# Step 3: Allow specific service ingress (repeat per service)
+# Replace <APP_NAME> and adjust namespaceSelector/podSelector for your ingress source.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ingress-<APP_NAME>
+  namespace: <NAMESPACE>
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: <APP_NAME>
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        # Allow from ingress controller namespace
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+        # Allow from same namespace (service-to-service)
+        - podSelector: {}
+      ports:
+        - protocol: TCP
+          port: 8080
+
+---
+# Step 4: Allow egress to downstream services (repeat per dependency)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-<APP_NAME>-to-postgres
+  namespace: <NAMESPACE>
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: <APP_NAME>
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: postgres
+      ports:
+        - protocol: TCP
+          port: 5432

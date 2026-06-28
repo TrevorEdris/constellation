@@ -1,0 +1,31 @@
+diff --git a/README.md b/README.md
+index abc1234..def5678 100644
+--- a/README.md
++++ b/README.md
+@@ -10,10 +10,10 @@
+ ## API Reference
+
+-### `calculate_shipping(weight, destination)`
++### `estimate_delivery(order_id)`
+
+-Calculates shipping cost based on weight and destination.
++Estimates delivery date for an existing order.
+
+-### `validate_address(address)`
++### `geocode_address(address_string)`
+
+-Validates a shipping address and returns normalized form.
++Converts an address string to lat/lng coordinates.
+
+ ## Usage
+@@ -25,7 +25,7 @@
+ ```python
+-from shipping import calculate_shipping, validate_address
++from shipping import estimate_delivery
+
+-cost = calculate_shipping(2.5, "US")
+-normalized = validate_address({"street": "123 Main St"})
++eta = estimate_delivery("order-123")
+ ```
++
++Note: The `validate_address` and `calculate_shipping` functions were removed in v2.0.

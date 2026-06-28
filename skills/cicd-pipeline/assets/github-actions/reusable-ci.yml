@@ -1,0 +1,212 @@
+# Reusable CI Workflow
+# ----------------------
+# A reusable workflow (workflow_call) for shared lint + test + build logic.
+# Callable from other workflows in the same organization or repository.
+#
+# Usage example in a caller workflow:
+#
+#   jobs:
+#     ci:
+#       uses: org/shared-workflows/.github/workflows/reusable-ci.yml@main
+#       with:
+#         node-version: "20"
+#         working-directory: packages/api
+#         test-command: pnpm test:ci
+#       secrets: inherit
+
+name: Reusable CI
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: "Node.js version to use"
+        type: string
+        default: "20"
+        required: false
+
+      pnpm-version:
+        description: "pnpm version to use"
+        type: string
+        default: "9"
+        required: false
+
+      working-directory:
+        description: "Directory to run commands in (for monorepos)"
+        type: string
+        default: "."
+        required: false
+
+      lint-command:
+        description: "Command to run for linting"
+        type: string
+        default: "pnpm lint"
+        required: false
+
+      typecheck-command:
+        description: "Command to run for type checking (empty string to skip)"
+        type: string
+        default: "pnpm typecheck"
+        required: false
+
+      test-command:
+        description: "Command to run tests"
+        type: string
+        default: "pnpm test"
+        required: false
+
+      build-command:
+        description: "Command to build the project"
+        type: string
+        default: "pnpm build"
+        required: false
+
+      upload-coverage:
+        description: "Whether to upload coverage as an artifact"
+        type: boolean
+        default: true
+        required: false
+
+      upload-build:
+        description: "Whether to upload build output as an artifact"
+        type: boolean
+        default: false
+        required: false
+
+      artifact-name-suffix:
+        description: "Suffix for artifact names (useful in monorepos)"
+        type: string
+        default: ""
+        required: false
+
+    secrets:
+      NPM_TOKEN:
+        description: "npm registry token (if using private packages)"
+        required: false
+
+    outputs:
+      build-artifact-name:
+        description: "Name of the uploaded build artifact (if upload-build is true)"
+        value: ${{ jobs.build.outputs.artifact-name }}
+
+permissions:
+  contents: read
+
+jobs:
+  # --------------------------------------------------------------------------
+  # Lint and type-check
+  # --------------------------------------------------------------------------
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - uses: pnpm/action-setup@a7487ba4f4f5e0a6b19d8d5b20c4c0eba041f3c0  # v4.1.0
+        with:
+          version: ${{ inputs.pnpm-version }}
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Run lint
+        run: ${{ inputs.lint-command }}
+
+      - name: Run type check
+        if: inputs.typecheck-command != ''
+        run: ${{ inputs.typecheck-command }}
+
+  # --------------------------------------------------------------------------
+  # Test
+  # --------------------------------------------------------------------------
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - uses: pnpm/action-setup@a7487ba4f4f5e0a6b19d8d5b20c4c0eba041f3c0  # v4.1.0
+        with:
+          version: ${{ inputs.pnpm-version }}
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Run tests
+        run: ${{ inputs.test-command }}
+
+      - name: Upload coverage
+        if: inputs.upload-coverage && always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: coverage${{ inputs.artifact-name-suffix != '' && format('-{0}', inputs.artifact-name-suffix) || '' }}
+          path: ${{ inputs.working-directory }}/coverage/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # --------------------------------------------------------------------------
+  # Build
+  # --------------------------------------------------------------------------
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [lint, test]
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    outputs:
+      artifact-name: dist${{ inputs.artifact-name-suffix != '' && format('-{0}', inputs.artifact-name-suffix) || '' }}
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - uses: pnpm/action-setup@a7487ba4f4f5e0a6b19d8d5b20c4c0eba041f3c0  # v4.1.0
+        with:
+          version: ${{ inputs.pnpm-version }}
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Build
+        run: ${{ inputs.build-command }}
+
+      - name: Upload build artifact
+        if: inputs.upload-build
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: dist${{ inputs.artifact-name-suffix != '' && format('-{0}', inputs.artifact-name-suffix) || '' }}
+          path: ${{ inputs.working-directory }}/dist/
+          retention-days: 1
+          if-no-files-found: warn

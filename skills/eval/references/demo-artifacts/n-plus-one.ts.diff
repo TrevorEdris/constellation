@@ -1,0 +1,33 @@
+diff --git a/src/services/orderService.ts b/src/services/orderService.ts
+index abc1234..def5678 100644
+--- /dev/null
++++ b/src/services/orderService.ts
+@@ -0,0 +1,25 @@
++import { db } from '../db';
++
++interface OrderSummary {
++  orderId: string;
++  customerName: string;
++  totalItems: number;
++  totalPrice: number;
++}
++
++export async function getOrderSummaries(): Promise<OrderSummary[]> {
++  const orders = await db.query('SELECT * FROM orders');
++  const summaries: OrderSummary[] = [];
++
++  for (const order of orders) {
++    const customer = await db.query('SELECT name FROM customers WHERE id = ?', [order.customerId]);
++    const items = await db.query('SELECT * FROM order_items WHERE order_id = ?', [order.id]);
++    const totalPrice = items.reduce((sum: number, item: any) => sum + item.price * item.quantity, 0);
++
++    summaries.push({
++      orderId: order.id,
++      customerName: customer[0].name,
++      totalItems: items.length,
++      totalPrice,
++    });
++  }
++
++  return summaries;
++}

@@ -1,0 +1,120 @@
+# Node.js / TypeScript GitLab CI Pipeline
+# ------------------------------------------
+# Stages: lint -> test -> build
+# Uses pnpm with project-relative store for reliable caching.
+# Customize: NODE_VERSION, PNPM_VERSION, and script commands per project.
+
+variables:
+  NODE_VERSION: "20"
+  PNPM_VERSION: "9"
+  PNPM_STORE_DIR: ".pnpm-store"    # Project-relative pnpm store (cacheable by GitLab Runner)
+
+stages:
+  - lint
+  - test
+  - build
+
+# --------------------------------------------------------------------------
+# Shared configuration
+# --------------------------------------------------------------------------
+
+.node-base:
+  image: node:${NODE_VERSION}-alpine
+  before_script:
+    - corepack enable
+    - corepack prepare pnpm@${PNPM_VERSION} --activate
+    - pnpm config set store-dir ${PNPM_STORE_DIR}
+  cache:
+    key:
+      files:
+        - pnpm-lock.yaml
+    paths:
+      - ${PNPM_STORE_DIR}
+    policy: pull    # Jobs pull cache; install job pushes it
+
+# --------------------------------------------------------------------------
+# Install dependencies (populates cache for downstream jobs)
+# --------------------------------------------------------------------------
+
+install:
+  extends: .node-base
+  stage: .pre    # Runs before all stages
+  cache:
+    key:
+      files:
+        - pnpm-lock.yaml
+    paths:
+      - ${PNPM_STORE_DIR}
+    policy: pull-push    # This job writes the cache
+  script:
+    - pnpm install --frozen-lockfile
+  interruptible: true
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
+# --------------------------------------------------------------------------
+# Lint
+# --------------------------------------------------------------------------
+
+lint:
+  extends: .node-base
+  stage: lint
+  needs: [install]
+  timeout: 10 minutes
+  script:
+    - pnpm install --frozen-lockfile --prefer-offline    # Uses cached store
+    - pnpm lint
+    - pnpm typecheck
+  interruptible: true
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
+# --------------------------------------------------------------------------
+# Test
+# --------------------------------------------------------------------------
+
+test:
+  extends: .node-base
+  stage: test
+  needs: [install]
+  timeout: 15 minutes
+  script:
+    - pnpm install --frozen-lockfile --prefer-offline
+    - pnpm test
+  coverage: '/Lines\s*:\s*(\d+\.?\d*)%/'    # Extract coverage percentage from output
+  artifacts:
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage/cobertura-coverage.xml
+    paths:
+      - coverage/
+    expire_in: 1 week
+    when: always
+  interruptible: true
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
+# --------------------------------------------------------------------------
+# Build (runs after lint + test pass)
+# --------------------------------------------------------------------------
+
+build:
+  extends: .node-base
+  stage: build
+  needs: [lint, test]
+  timeout: 15 minutes
+  script:
+    - pnpm install --frozen-lockfile --prefer-offline
+    - pnpm build
+  artifacts:
+    paths:
+      - dist/          # Adjust to your build output directory
+    expire_in: 1 week
+  interruptible: true
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'

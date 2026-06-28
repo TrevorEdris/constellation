@@ -1,0 +1,147 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: "TODO: SAM application description"
+
+# =============================================================================
+# Globals — applied to all functions unless overridden
+# =============================================================================
+Globals:
+  Function:
+    Runtime: nodejs20.x
+    Timeout: 30           # Adjust based on p99 latency requirements
+    MemorySize: 512       # Profile to find cost/performance sweet spot
+    Tracing: Active       # X-Ray tracing
+    Environment:
+      Variables:
+        TABLE_NAME: !Ref AppTable
+        LOG_LEVEL: !Ref LogLevel
+  Api:
+    TracingEnabled: true
+    Cors:
+      AllowMethods: "'GET,POST,PUT,DELETE,OPTIONS'"
+      AllowHeaders: "'Content-Type,Authorization'"
+      AllowOrigin: "'*'"  # Restrict to specific origin in production
+
+# =============================================================================
+# Parameters
+# =============================================================================
+Parameters:
+  Env:
+    Type: String
+    AllowedValues: [dev, staging, prod]
+    Description: "Deployment environment"
+
+  LogLevel:
+    Type: String
+    Default: INFO
+    AllowedValues: [DEBUG, INFO, WARN, ERROR]
+
+# =============================================================================
+# Resources
+# =============================================================================
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # API Gateway + Lambda Functions
+  # ---------------------------------------------------------------------------
+  GetItemFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-${Env}-get-item"
+      Handler: src/handlers/get-item.handler
+      Description: "Retrieve a single item by ID"
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref AppTable
+      Events:
+        GetItem:
+          Type: Api
+          Properties:
+            Path: /items/{id}
+            Method: GET
+
+  CreateItemFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-${Env}-create-item"
+      Handler: src/handlers/create-item.handler
+      Description: "Create a new item"
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref AppTable
+      Events:
+        CreateItem:
+          Type: Api
+          Properties:
+            Path: /items
+            Method: POST
+
+  ProcessQueueFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-${Env}-process-queue"
+      Handler: src/handlers/process-queue.handler
+      Description: "Process items from SQS queue"
+      Policies:
+        - SQSPollerPolicy:
+            QueueName: !GetAtt ItemQueue.QueueName
+        - DynamoDBCrudPolicy:
+            TableName: !Ref AppTable
+      Events:
+        Queue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt ItemQueue.Arn
+            BatchSize: 10
+            FunctionResponseTypes:
+              - ReportBatchItemFailures  # Partial batch success
+
+  # ---------------------------------------------------------------------------
+  # Storage — DynamoDB
+  # ---------------------------------------------------------------------------
+  AppTable:
+    Type: AWS::Serverless::SimpleTable
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub "${AWS::StackName}-${Env}-items"
+      PrimaryKey:
+        Name: itemId
+        Type: String
+      SSESpecification:
+        SSEEnabled: true
+
+  # ---------------------------------------------------------------------------
+  # Messaging — SQS
+  # ---------------------------------------------------------------------------
+  ItemQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-${Env}-items"
+      VisibilityTimeout: 90      # Must be >= 6x Lambda timeout
+      MessageRetentionPeriod: 86400  # 24 hours
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ItemDLQ.Arn
+        maxReceiveCount: 3
+
+  ItemDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-${Env}-items-dlq"
+      MessageRetentionPeriod: 1209600  # 14 days for DLQ investigation
+
+# =============================================================================
+# Outputs
+# =============================================================================
+Outputs:
+  ApiUrl:
+    Description: "API Gateway endpoint URL"
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/"
+
+  TableName:
+    Description: "DynamoDB table name"
+    Value: !Ref AppTable
+
+  QueueUrl:
+    Description: "SQS queue URL"
+    Value: !Ref ItemQueue

@@ -56,16 +56,22 @@ def lint(skills):
             errs.append(f"{name}: description must start with 'Use when' (triggering conditions only)")
         if sk_name != name:
             errs.append(f"{name}: frontmatter name '{sk_name}' != directory name")
-    # section-sign scan across tracked markdown
-    for dirpath, _, files in os.walk(ROOT):
-        if "/.git" in dirpath:
-            continue
-        for fn in files:
+    # section-sign scan over AUTHORED content only (skill bodies + our docs).
+    # Vendored third-party reference material (e.g. bundled Wikipedia guides) is
+    # exempt: the no-section-sign rule governs authored output, not vendored data.
+    authored = []
+    for name, _, _ in skills:
+        authored.append(os.path.join(SKILLS, name, "SKILL.md"))
+    docs_dir = os.path.join(ROOT, "docs")
+    if os.path.isdir(docs_dir):
+        for fn in os.listdir(docs_dir):
             if fn.endswith(".md"):
-                p = os.path.join(dirpath, fn)
-                with open(p, encoding="utf-8", errors="ignore") as f:
-                    if SECTION_SIGN in f.read():
-                        errs.append(f"{os.path.relpath(p, ROOT)}: contains the section-sign character")
+                authored.append(os.path.join(docs_dir, fn))
+    for p in authored:
+        if os.path.isfile(p):
+            with open(p, encoding="utf-8", errors="ignore") as f:
+                if SECTION_SIGN in f.read():
+                    errs.append(f"{os.path.relpath(p, ROOT)}: contains the section-sign character")
     return errs
 
 
