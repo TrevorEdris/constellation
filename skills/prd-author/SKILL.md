@@ -15,7 +15,7 @@ This skill is flexible facilitation, but two gates are non-negotiable:
 
 ```
 GATE 1 — Discovery before authoring (create mode): no PRD sections until the 8 discovery questions are answered or sourced.
-GATE 2 — Validation before handoff: the PRD must score >= 70 on constellation:prd-validator before it leaves this skill.
+GATE 2 — Validation before handoff: the PRD must score >= 70 on constellation:prd-author before it leaves this skill.
 ```
 
 Skipping discovery produces a PRD that answers the wrong question. Skipping validation ships an untestable spec to engineering.
@@ -45,7 +45,7 @@ Codebase context from discovery *informs* requirements but stays in DISCOVERY.md
 
 ## When NOT to use
 
-- The PRD is already validated and you need to break it into phases — go to constellation:prd-to-roadmap (REQUIRED SUB-SKILL downstream).
+- The PRD is already validated and you need to break it into phases — go to constellation:prd-author (REQUIRED SUB-SKILL downstream).
 - You are designing a technical solution for an already-defined requirement — use constellation:brainstorming.
 - The task is pure implementation against an approved plan.
 
@@ -57,7 +57,7 @@ Codebase context from discovery *informs* requirements but stays in DISCOVERY.md
 | "I know the code, I'll put the file paths in the requirement." | File paths make the PRD a plan. Describe behavior; paths go to PLAN.md. |
 | "The acceptance criteria are obvious." | If you can't demo it, an engineer can't build to it. Write observable, testable criteria. |
 | "I'll skip non-goals — we'll just not build that." | Unwritten non-goals become scope creep. The Scope Boundary is one of the most important sections. |
-| "It reads fine, I'll skip the validator." | 'Reads fine' is not >= 70. Run constellation:prd-validator; fix findings; re-run. |
+| "It reads fine, I'll skip the validator." | 'Reads fine' is not >= 70. Run constellation:prd-author; fix findings; re-run. |
 | "I'll hand it to engineering now, validation can come later." | Later never comes. The validation gate is before handoff, not after. |
 
 ## Mode: Create
@@ -68,7 +68,7 @@ Checklist (one TodoWrite item each):
 2. **Existing-context check** — if discovery Q8 reveals existing code, suggest fotw:reverse-engineer (discover mode) before authoring.
 3. **Section authoring** — walk the PRD template section by section using `references/facilitation-prompts.md`; pre-fill from discovery answers; confirm each section before the next.
 4. **Write** the PRD to `PRD.md` (or the user-specified path) using `references/prd-template.md`.
-5. **Validate** — run constellation:prd-validator. If NEEDS WORK (< 70), fix the findings and re-validate. Repeat until PASS.
+5. **Validate** — run constellation:prd-author. If NEEDS WORK (< 70), fix the findings and re-validate. Repeat until PASS.
 
 ### Discovery questions (Phase 1)
 
@@ -99,7 +99,7 @@ Update an existing PRD per `references/iteration-guide.md`. Checklist:
 2. **Ask what changed** — new requirements, scope shifts, reprioritization, engineering feedback.
 3. **Apply** changes using the guide's conventions — change markers (`[ADDED]`, `[MODIFIED]`, `[REMOVED]`, `[SPLIT]`, `[MERGED]`), keep ID gaps (never renumber).
 4. **Write** the updated PRD.
-5. **Re-validate** — run constellation:prd-validator. If a previously passing PRD now fails, the iteration introduced a gap; address it before handoff.
+5. **Re-validate** — run constellation:prd-author. If a previously passing PRD now fails, the iteration introduced a gap; address it before handoff.
 
 Skip discovery when iterating — it was answered in the original authoring session.
 
@@ -138,13 +138,13 @@ digraph prd_author {
 ✅ "FR-003 Acceptance: a user searching by partial name sees matching results within 2 seconds." (observable, demoable)
 ❌ "FR-003: implement fuzzy search." (no observable done-state)
 
-✅ "PRD scored 82 on prd-validator. Handing off to constellation:prd-to-roadmap." (gate cleared)
+✅ "PRD scored 82 on prd-validator. Handing off to constellation:prd-author." (gate cleared)
 ❌ "PRD looks complete, sending to engineering." (no validation run)
 
 ## Integration
 
-- **Pipeline (terminal):** prd-author -> constellation:prd-validator (REQUIRED SUB-SKILL, >= 70 gate) -> constellation:prd-to-roadmap (REQUIRED SUB-SKILL downstream). Do not skip the validator; do not hand a sub-70 PRD downstream.
-- **Roadmaps name features, not PRs.** constellation:prd-to-roadmap produces phased *feature* descriptions; PR decomposition happens later at slice-spec time, not in the PRD or the roadmap.
+- **Pipeline (terminal):** prd-author -> constellation:prd-author (REQUIRED SUB-SKILL, >= 70 gate) -> constellation:prd-author (REQUIRED SUB-SKILL downstream). Do not skip the validator; do not hand a sub-70 PRD downstream.
+- **Roadmaps name features, not PRs.** constellation:prd-author produces phased *feature* descriptions; PR decomposition happens later at slice-spec time, not in the PRD or the roadmap.
 - **Upstream (optional):** fotw:reverse-engineer (discover mode) when existing code should seed requirements.
 - **Sibling:** for designing a technical solution to a defined requirement, use constellation:brainstorming.
 

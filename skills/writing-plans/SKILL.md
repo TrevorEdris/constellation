@@ -111,7 +111,7 @@ Write to `.ai/sessions/YYYY-MM-DD_<TICKET>_<SLUG>/PLAN.md` (user preferences ove
 - **Plan header / executor hand-off** — directly under the title, include the executor pointer so whoever runs it knows the chain:
 
   ```markdown
-  > **For the executor:** REQUIRED SUB-SKILL — use constellation:subagent-driven-development (recommended) or constellation:executing-plans to run this plan step-by-step. Steps use checkbox (`- [ ]`) syntax for tracking.
+  > **For the executor:** REQUIRED SUB-SKILL — use constellation:subagent-driven-development (recommended) or constellation:subagent-driven-development to run this plan step-by-step. Steps use checkbox (`- [ ]`) syntax for tracking.
   ```
 
 - **Target repo & files** — explicit New/Modified list with exact paths (from your file-structure pass).
@@ -145,7 +145,7 @@ After the plan scores PASS and the reviewer approves, offer the execution choice
 > Which approach?
 
 - If Subagent-Driven: **REQUIRED SUB-SKILL** — use `constellation:subagent-driven-development`.
-- If Inline: **REQUIRED SUB-SKILL** — use `constellation:executing-plans`.
+- If Inline: **REQUIRED SUB-SKILL** — use `constellation:subagent-driven-development`.
 
 The ONLY skills you invoke after writing-plans are plan-validator (during writing), then subagent-driven-development or executing-plans (for execution). Do not start editing production code from this skill.
 

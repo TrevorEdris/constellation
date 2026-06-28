@@ -40,7 +40,8 @@
       {
         "matcher": "Write",
         "hooks": [
-          { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/plan-validator-reminder.js\"" }
+          { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/plan-validator-reminder.js\"" },
+          { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/section-sign-lint.js\"" }
         ]
       }
     ],

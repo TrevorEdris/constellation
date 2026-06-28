@@ -111,7 +111,7 @@ Recording the result:
 
 - Called by the Plan phase of Discover → Plan → Implement: a plan must PASS here before the approval gate.
 - REQUIRED SUB-SKILL: constellation:writing-plans — produces the PLAN v2 document this skill scores. If the plan does not yet follow PLAN v2, fix it there first, then validate here.
-- Pairs with constellation:executing-plans — only an approved, passing plan moves to execution.
+- Pairs with constellation:subagent-driven-development — only an approved, passing plan moves to execution.
 - Forbidden transition: never present a plan to the human, and never begin implementation, on a plan that has not PASSED here this session.
 
 ## The Bottom Line

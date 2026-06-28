@@ -245,7 +245,7 @@ Standalone copy: `references/verification-checklist.md`.
 
 ## Integration
 
-- **Pairs with `constellation:requesting-code-review`** — after green, request review before committing; the false-green countermeasure here is what makes the review trustworthy.
+- **Pairs with `constellation:code-review`** — after green, request review before committing; the false-green countermeasure here is what makes the review trustworthy.
 - **Pairs with `constellation:subagent-driven-development`** — when delegating implementation to a subagent, the subagent runs this cycle.
 - **Enforced by the `tdd-enforcer` agent** (`agents/tdd-enforcer.md`) — dispatch it to run and gate RED-GREEN-REFACTOR inside a subagent, including the break-the-code check, with a fixed per-cycle report format. Use it when TDD discipline must be guaranteed in delegated work.
 - **REQUIRED BACKGROUND when writing or changing tests:** `references/testing-anti-patterns.md` — false-green, mock forests, tautology tests, and the gate functions that catch them.

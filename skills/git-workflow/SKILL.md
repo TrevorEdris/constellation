@@ -30,8 +30,8 @@ Detect the sub-workflow from the request or context; if ambiguous, ask.
 | pr | User wants to open a PR | Generate PR body, push, create via `gh` |
 | branch | User wants a new branch | Enforce naming, create branch |
 | conflict | `UU` markers in `git status` | Guide per-file resolution |
-| worktree | User wants an isolated workspace | Delegate to `constellation:using-git-worktrees` |
-| finish | Work done, branch ready to dispose | Delegate to `constellation:finishing-a-development-branch` |
+| worktree | User wants an isolated workspace | Delegate to `constellation:git-workflow` |
+| finish | Work done, branch ready to dispose | Delegate to `constellation:git-workflow` |
 
 Auto-detect: staged files + no conflicts → commit; conflict markers → conflict; clean branch + no argument → ask.
 
@@ -95,7 +95,7 @@ Note: during `git rebase`, "ours" and "theirs" are swapped (HEAD is the upstream
 
 ## Sub-Workflow: worktree
 
-**REQUIRED SUB-SKILL:** delegate to `constellation:using-git-worktrees`. Do not hand-roll worktree creation here. That skill owns directory selection and the safety gates below.
+**REQUIRED SUB-SKILL:** delegate to `constellation:git-workflow`. Do not hand-roll worktree creation here. That skill owns directory selection and the safety gates below.
 
 Non-negotiable safety carried from that skill — apply even if you set up a worktree inline:
 - **Verify the worktree directory is gitignored before creating it.** For project-local dirs run `git check-ignore -q .worktrees || git check-ignore -q worktrees`. If NOT ignored: add the line to `.gitignore` and commit it (auto-fix immediately), then proceed. Skipping this lets worktree contents get tracked and committed.
@@ -104,13 +104,13 @@ Non-negotiable safety carried from that skill — apply even if you set up a wor
 
 ## Sub-Workflow: finish
 
-**REQUIRED SUB-SKILL:** delegate to `constellation:finishing-a-development-branch` for branch disposition (run tests, then merge / PR / keep / discard, plus worktree cleanup). The "keep as-is" path pairs with `constellation:session-handoff`. Do not delete a branch or merge to a base without running the test suite first and getting explicit confirmation for destructive options.
+**REQUIRED SUB-SKILL:** delegate to `constellation:git-workflow` for branch disposition (run tests, then merge / PR / keep / discard, plus worktree cleanup). The "keep as-is" path pairs with `constellation:session-handoff`. Do not delete a branch or merge to a base without running the test suite first and getting explicit confirmation for destructive options.
 
 ## Integration
 
-- `constellation:using-git-worktrees` — REQUIRED SUB-SKILL for the worktree mode.
-- `constellation:finishing-a-development-branch` — REQUIRED SUB-SKILL for the finish mode.
-- `constellation:requesting-code-review` / `code-review` — review a PR this skill opened (no direct coupling; pin reviewers to `gh pr diff --name-only` scope).
+- `constellation:git-workflow` — REQUIRED SUB-SKILL for the worktree mode.
+- `constellation:git-workflow` — REQUIRED SUB-SKILL for the finish mode.
+- `constellation:code-review` / `code-review` — review a PR this skill opened (no direct coupling; pin reviewers to `gh pr diff --name-only` scope).
 - `constellation:verification-before-completion` — run before claiming a commit/PR is done; verify by running, not by reasoning.
 
 ## References

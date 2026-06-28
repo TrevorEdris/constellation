@@ -138,7 +138,7 @@ The terminal state is invoking constellation:writing-plans. Do NOT invoke fronte
 
 ## The durable artifact
 
-A brainstorm always leaves a committed design spec. Save to `docs/specs/YYYY-MM-DD-<topic>-design.md` (user preference overrides the location) and commit it. Use constellation:writing-clearly-and-concisely (REQUIRED BACKGROUND) for the prose. The spec MUST contain:
+A brainstorm always leaves a committed design spec. Save to `docs/specs/YYYY-MM-DD-<topic>-design.md` (user preference overrides the location) and commit it. Use fotw:writing-clearly-and-concisely (REQUIRED BACKGROUND) for the prose. The spec MUST contain:
 
 ```markdown
 # <Topic> Design
@@ -204,7 +204,7 @@ Wait for the response. Changes re-enter the review loop. Proceed only on explici
 - **Called when:** any new feature/component/behavior work is about to start.
 - **Hands off to (terminal):** constellation:writing-plans (REQUIRED SUB-SKILL) — the only skill invoked after brainstorming.
 - **For product features started from requirements:** route through the PRD pipeline first via constellation:prd-author, then return here to design.
-- **Background:** constellation:writing-clearly-and-concisely (REQUIRED BACKGROUND) for the spec prose.
+- **Background:** fotw:writing-clearly-and-concisely (REQUIRED BACKGROUND) for the spec prose.
 
 ## Visual companion (optional)
 

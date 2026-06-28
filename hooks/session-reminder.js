@@ -2,8 +2,8 @@
 /**
  * Session Reminder - UserPromptSubmit Hook (constellation)
  * If no session dir exists for today, nudge the agent to scaffold one via the
- * constellation:session-bootstrap skill (which CREATES the dir + docs from
- * templates and sets the .active pointer) rather than just hand-creating it.
+ * new-session.sh script (which CREATES the dir + docs from templates and sets
+ * the .active pointer) rather than just hand-creating it.
  *
  * @fotw-hook {"event":"UserPromptSubmit","matcher":"","description":"Nudges agent to scaffold a session via session-bootstrap"}
  */
@@ -16,7 +16,7 @@ function checkSession(sessionRoot = DEFAULT_SESSION_ROOT) {
   } catch { /* dir missing */ }
   return {
     remind: true,
-    message: `REMINDER: No session directory for ${today()}. Invoke the constellation:session-bootstrap skill to scaffold ${sessionRoot}/${today()}_<TICKET>_<TITLE_SLUG>/ (SESSION.md, DISCOVERY.md, PLAN.md from templates) and set the .active pointer.`,
+    message: `REMINDER: No session directory for ${today()}. Run "\${CLAUDE_PLUGIN_ROOT}/scripts/new-session.sh" <Title-Slug> [TICKET] [session-id] to scaffold ${sessionRoot}/${today()}_<TICKET>_<TITLE_SLUG>/ (SESSION.md, DISCOVERY.md, PLAN.md from templates) and set the .active pointer.`,
   };
 }
 

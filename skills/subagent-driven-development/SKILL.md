@@ -36,12 +36,12 @@ or "I'll batch the reviews at the end," you are violating the law. Stop.
 
 - Tasks are tightly coupled → execute manually or re-plan into independent slices.
 - You want parallel sessions instead of same-session → use
-  constellation:executing-plans.
+  constellation:subagent-driven-development.
 - No plan exists yet → use constellation:brainstorming then constellation:writing-plans first.
 
 ## Required setup before the first task
 
-- Set up an isolated workspace — REQUIRED SUB-SKILL: constellation:using-git-worktrees.
+- Set up an isolated workspace — REQUIRED SUB-SKILL: constellation:git-workflow.
 - Branch check: never start implementation on main/master without explicit user consent.
 - Read the plan ONCE. Extract every task's full text and context. Create a TodoWrite
   with one item per task. (Checklists without TodoWrite tracking get skipped. Every time.)
@@ -67,7 +67,7 @@ digraph process {
     "Mark task complete in TodoWrite" [shape=box];
     "More tasks remain?" [shape=diamond];
     "Dispatch final reviewer for whole implementation" [shape=box];
-    "constellation:finishing-a-development-branch" [shape=doublecircle];
+    "constellation:git-workflow" [shape=doublecircle];
 
     "Extract all tasks + context, create TodoWrite" -> "Dispatch implementer (fresh subagent, full task text)";
     "Dispatch implementer (fresh subagent, full task text)" -> "Subagent asks questions?";
@@ -87,7 +87,7 @@ digraph process {
     "Mark task complete in TodoWrite" -> "More tasks remain?";
     "More tasks remain?" -> "Dispatch implementer (fresh subagent, full task text)" [label="yes"];
     "More tasks remain?" -> "Dispatch final reviewer for whole implementation" [label="no"];
-    "Dispatch final reviewer for whole implementation" -> "constellation:finishing-a-development-branch";
+    "Dispatch final reviewer for whole implementation" -> "constellation:git-workflow";
 }
 ```
 
@@ -189,9 +189,9 @@ degrades honest feedback.
 
 ## Integration
 
-- REQUIRED SUB-SKILL: constellation:using-git-worktrees — isolate the workspace before starting.
-- REQUIRED SUB-SKILL: constellation:requesting-code-review — template the code-quality reviewer uses.
+- REQUIRED SUB-SKILL: constellation:git-workflow — isolate the workspace before starting.
+- REQUIRED SUB-SKILL: constellation:code-review — template the code-quality reviewer uses.
 - REQUIRED BACKGROUND: constellation:test-driven-development — subagents follow RED-GREEN-REFACTOR per task.
 - Upstream (creates the plan): constellation:writing-plans.
-- Downstream (after all tasks pass): constellation:finishing-a-development-branch.
-- Alternative (parallel session instead of same-session): constellation:executing-plans.
+- Downstream (after all tasks pass): constellation:git-workflow.
+- Alternative (parallel session instead of same-session): constellation:subagent-driven-development.
