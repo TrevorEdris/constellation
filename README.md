@@ -19,7 +19,7 @@ Constellation takes the best of both: superpowers' discipline applied to a curat
 **Claude Code** — load as a plugin (no script needed):
 ```
 /plugin marketplace add ~/src/constellation
-/plugin install constellation@constellation-dev
+/plugin install constellation@constellation
 ```
 This wires skills, agents, and hooks from the manifest.
 

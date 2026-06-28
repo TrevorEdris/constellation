@@ -1,6 +1,6 @@
 {
-  "name": "constellation-dev",
-  "description": "Local development marketplace for the constellation plugin",
+  "name": "constellation",
+  "description": "Marketplace for the constellation plugin",
   "owner": {
     "name": "Trevor Edris",
     "email": "trevor.edris@gmail.com"
@@ -8,7 +8,7 @@
   "plugins": [
     {
       "name": "constellation",
-      "description": "superpowers discipline + fellowship-of-the-workflows skills, for Claude Code and Codex",
+      "description": "Curated skills that work together for a complete dev workflow",
       "version": "0.1.0",
       "source": "./",
       "author": {

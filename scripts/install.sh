@@ -6,7 +6,7 @@
 #
 # Claude Code does NOT need this script — it loads the plugin natively:
 #     /plugin marketplace add  <this repo path>
-#     /plugin install constellation@constellation-dev
+#     /plugin install constellation@constellation
 # That wires skills + agents + commands + hooks via the manifest. Symlinking
 # skills into ~/.claude/skills would double-register them and skip hook/agent
 # wiring, so we don't.
@@ -34,5 +34,5 @@ Codex next steps:
 
 Claude Code (no script needed):
   /plugin marketplace add ${PLUGIN_ROOT}
-  /plugin install constellation@constellation-dev
+  /plugin install constellation@constellation
 EOF
