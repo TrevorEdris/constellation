@@ -6,7 +6,7 @@ A Claude Code + Codex skills plugin: a curated set of skills that work together 
 - **Discipline that holds under pressure** — TDD, systematic debugging, and verification skills with bright-line rules, rationalization tables, and verification gates, so steps don't get skipped.
 - **A spec-driven delivery loop** — PRD → roadmap → plan (scored gate) → TDD build → review (code / security / chaos) → ship.
 - **Parallel execution** — orchestration and subagent-driven development for fan-out work.
-- **Automated session docs** — `.ai/sessions/` scaffolding, pre-compact snapshots, and handoffs, maintained by hooks.
+- **Automated session docs** — `.ai/sessions/` scaffolding named automatically from Claude Code's own session title, pre-compact snapshots, and handoffs, maintained by hooks.
 - **One portable source for Claude Code and Codex.**
 
 ## Layout

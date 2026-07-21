@@ -89,7 +89,53 @@ function sessionIdFromStdin(input) {
   try { return JSON.parse(input || '{}').session_id; } catch { return undefined; }
 }
 
+function readLines(filePath) {
+  try {
+    return fs.readFileSync(filePath, 'utf8').split('\n').filter(Boolean);
+  } catch { return []; }
+}
+
+function latestCustomTitle(transcriptPath) {
+  let title = null;
+  for (const line of readLines(transcriptPath)) {
+    let obj;
+    try { obj = JSON.parse(line); } catch { continue; }
+    if (obj.type === 'custom-title' && obj.customTitle) title = obj.customTitle;
+  }
+  return title;
+}
+
+const NOISE_RE = /^(<local-command|<command-name|<command-message|<command-args|Caveat:|<system-reminder|\[Request interrupted)/;
+function extractText(content) {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    if (content.some(b => b && b.type === 'tool_result')) return null;
+    return content.filter(b => b && b.type === 'text').map(b => b.text).join('\n') || null;
+  }
+  return null;
+}
+
+function firstRealPromptText(transcriptPath) {
+  for (const line of readLines(transcriptPath)) {
+    let obj; try { obj = JSON.parse(line); } catch { continue; }
+    if (obj.type !== 'user' || obj.isSidechain) continue;
+    const text = extractText(obj.message && obj.message.content);
+    if (text && !NOISE_RE.test(text.trimStart())) return text.trim();
+  }
+  return null;
+}
+
+const TICKET_RE = /\b([A-Z][A-Z0-9]{1,9}-\d+)\b/;
+function detectTicket(text) { const m = TICKET_RE.exec(text || ''); return m ? m[1] : null; }
+function slugifyTitle(title, ticket) {
+  let text = ticket ? title.replace(ticket, ' ') : title;
+  text = text.replace(/[^\w\s-]/g, ' ');
+  const words = text.split(/[\s_-]+/).filter(Boolean);
+  return words.join('-').slice(0, 60).replace(/-+$/, '') || 'session';
+}
+
 module.exports = {
   DEFAULT_SESSION_ROOT, today, parseFrontmatter, readSafe, todayDirs,
   resolveSessionDir, inferPhase, sessionIdFromStdin,
+  latestCustomTitle, firstRealPromptText, detectTicket, slugifyTitle, extractText,
 };
