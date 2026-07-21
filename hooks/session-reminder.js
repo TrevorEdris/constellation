@@ -1,37 +1,24 @@
 #!/usr/bin/env node
 /**
  * Session Reminder - UserPromptSubmit Hook (constellation)
- * If no session dir exists for today, nudge the agent to scaffold one via the
- * new-session.sh script (which CREATES the dir + docs from templates and sets
- * the .active pointer) rather than just hand-creating it.
+ * Points the agent at the active SESSION.md once session-bootstrap.js
+ * (Stop hook) has scaffolded it; on turn 1 injects a heads-up instead of
+ * instructing the agent to run a script by hand.
  *
- * @hook {"event":"UserPromptSubmit","matcher":"","description":"Nudges agent to scaffold a session via new-session.sh"}
+ * @hook {"event":"UserPromptSubmit","matcher":"","description":"Points the agent at the active SESSION.md"}
  */
-const fs = require('fs');
-const { DEFAULT_SESSION_ROOT, today } = require('./lib/session');
-
-function checkSession(sessionRoot = DEFAULT_SESSION_ROOT) {
-  try {
-    if (fs.readdirSync(sessionRoot).some(e => e.startsWith(today() + '_'))) return { remind: false, message: '' };
-  } catch { /* dir missing */ }
-  return {
-    remind: true,
-    message: `REMINDER: No session directory for ${today()}. Run "\${CLAUDE_PLUGIN_ROOT}/scripts/new-session.sh" <Title-Slug> [TICKET] [session-id] to scaffold ${sessionRoot}/${today()}_<TICKET>_<TITLE_SLUG>/ (SESSION.md, DISCOVERY.md, PLAN.md from templates) and set the .active pointer.`,
-  };
-}
+const { DEFAULT_SESSION_ROOT, resolveSessionDir, sessionIdFromStdin } = require('./lib/session');
+const path = require('path');
 
 async function main() {
   let input = '';
   for await (const chunk of process.stdin) input += chunk;
-  try {
-    const r = checkSession();
-    if (r.remind) {
-      console.log(JSON.stringify({ hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: r.message } }));
-      return;
-    }
-  } catch { /* fall through */ }
-  console.log('{}');
+  const sessionDir = resolveSessionDir(DEFAULT_SESSION_ROOT, { sessionId: sessionIdFromStdin(input) });
+  const message = sessionDir
+    ? `Session journal: ${path.join(sessionDir, 'SESSION.md')} (auto-scaffolded). Keep '## Decisions' and '## Status' current.`
+    : 'A session journal will be scaffolded automatically after this turn, named from this session\'s title.';
+  console.log(JSON.stringify({ hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: message } }));
 }
 
 if (require.main === module) main();
-else module.exports = { checkSession };
+else module.exports = { main };
