@@ -120,6 +120,18 @@ Write to `.ai/sessions/YYYY-MM-DD_<TICKET>_<SLUG>/PLAN.md` (user preferences ove
 - **Ordered steps** — the atomic 2-5 minute steps. Tag behavioral steps `[RED→GREEN]`; tag config/docs/codegen `[exempt: reason]` per the project's TDD rule. This is where the Iron Law lives.
 - **Risks & assumptions**, **Verification (aggregate)**, **Traceability** (every Discovery finding → a step, or justified out of scope), **Out of scope**, **Git strategy** (branch, conventional commit checkpoints, PR title/description; check `.github/PULL_REQUEST_TEMPLATE.md`; never push to main without approval).
 
+## Estimate the PR size
+
+Every plan MUST include the `## Estimated PR size` section. After the file-structure pass and ordered steps, forecast the total line delta:
+
+1. **Count** — each New file contributes its full line count; each Modified file contributes the added + removed lines implied by its step code. Sum to a total (added + removed). This is an estimate, not a measured diff.
+2. **Record** — fill the per-area table and the bolded `Estimated PR size: <N> lines`.
+3. **Threshold (1,000 lines)** — if the total exceeds 1,000 lines you MUST:
+   - Add a `> ⚠️ Large PR warning` block naming the estimate and the 1,000-line threshold.
+   - Find clean split points — independent subsystems, phase boundaries, or file groups that each ship working, testable software alone (reuse the Scope check in "Before you write steps").
+   - Use `AskUserQuestion` to confirm the split BEFORE restructuring. Make splitting into the proposed smaller PRs the first/recommended option; always include "keep as one PR". Never split silently or force a split.
+   - If confirmed: emit one PLAN per PR (each independently shippable) via the multi-plan path. If declined: keep one plan and record the decision in the size section.
+
 ## Validate (the GREEN gate)
 
 1. Run `constellation:plan-validator` (REQUIRED SUB-SKILL) against the PLAN.md.
@@ -155,6 +167,7 @@ The ONLY skills you invoke after writing-plans are plan-validator (during writin
 - [ ] Scope check — split multi-subsystem specs into separate plans
 - [ ] File-structure pass — every file + its single responsibility
 - [ ] Write PLAN.md in PLAN v2 format with the executor hand-off header
+- [ ] Estimate PR size; if > 1,000 lines, warn and AskUserQuestion to confirm a clean split
 - [ ] Every step satisfies the Iron Law (exact path, complete code, exact command, expected output)
 - [ ] Behavioral steps tagged `[RED→GREEN]`; exempt steps tagged `[exempt: ...]`
 - [ ] Traceability table maps every Discovery finding to a step

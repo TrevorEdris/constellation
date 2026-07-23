@@ -18,6 +18,18 @@ tags: []
 ## Target repo & files
 Explicit repos and every file to be touched (New / Modified). Exact paths, not vague areas.
 
+## Estimated PR size
+Forecast total line delta (added + removed) for the PR this plan produces, with a per-area breakdown. Estimate from the New/Modified file list and the code in the Ordered steps — a forecast, not a git diff.
+
+| Area / file group | Est. lines added | Est. lines removed |
+|---|---|---|
+| | | |
+| **Total** | | |
+
+**Estimated PR size: <N> lines.**
+
+If the total exceeds 1,000 lines, a `> ⚠️ Large PR` warning block and a split analysis are REQUIRED here, and the split decision (confirmed/declined + why) recorded. See constellation:writing-plans.
+
 ## Architecture decision
 Only if a genuine fork exists. State options, recommend one, mark the assumed default.
 

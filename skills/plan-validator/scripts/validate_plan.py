@@ -121,6 +121,8 @@ VERIFICATION_KEYWORDS = re.compile(
     re.IGNORECASE,
 )
 
+PR_SIZE_TOTAL_RE = re.compile(r"estimated\s+pr\s+size[:*\s]+.*?([\d,]{2,})", re.IGNORECASE)
+
 
 def find_section(lines: list[str], pattern: str) -> tuple[int, int]:
     """Find a section by heading pattern. Returns (start_line, end_line) 1-indexed, or (0, 0)."""
@@ -517,6 +519,46 @@ def check_structure_section(lines: list[str], report: ValidationReport) -> None:
         report.score -= 5
 
 
+def check_pr_size_estimate(lines: list[str], report: ValidationReport) -> None:
+    """Require an Estimated PR size section; warn if a >1000-line estimate lacks a split analysis."""
+    ss, se = find_section(lines, r"^#{1,3}\s+estimated\s+pr\s+size")
+    if ss == 0:
+        report.issues.append(
+            Issue(
+                severity="warning",
+                category="structure",
+                message="No 'Estimated PR size' section found. Every plan must forecast its total line delta.",
+            )
+        )
+        report.score -= 5
+        return
+    body = section_content(lines, ss, se)
+    if len(body.strip()) < 10:
+        report.issues.append(
+            Issue(
+                severity="warning",
+                category="structure",
+                message="Estimated PR size section exists but is nearly empty.",
+                line=ss,
+            )
+        )
+        report.score -= 5
+        return
+    m = PR_SIZE_TOTAL_RE.search(body)
+    if m:
+        total = int(m.group(1).replace(",", ""))
+        if total > 1000 and "split" not in body.lower() and "warning" not in body.lower():
+            report.issues.append(
+                Issue(
+                    severity="warning",
+                    category="structure",
+                    message=f"Estimated PR size ({total} lines) exceeds 1000 but the section has no large-PR warning or split analysis.",
+                    line=ss,
+                )
+            )
+            report.score -= 5
+
+
 def check_git_branch(lines: list[str], report: ValidationReport) -> None:
     """Check 15: A branch name is specified."""
     content = "\n".join(lines)
@@ -685,6 +727,7 @@ def validate_plan(path: Path) -> ValidationReport:
     check_step_file_specificity(lines, report)
     check_per_step_verification(lines, report)
     check_structure_section(lines, report)
+    check_pr_size_estimate(lines, report)
     check_git_branch(lines, report)
     check_git_commit_plan(lines, report)
 
