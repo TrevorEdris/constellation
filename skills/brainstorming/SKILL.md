@@ -202,7 +202,7 @@ Wait for the response. Changes re-enter the review loop. Proceed only on explici
 ## Integration
 
 - **Called when:** any new feature/component/behavior work is about to start.
-- **Hands off to (terminal):** constellation:writing-plans (REQUIRED SUB-SKILL) — the only skill invoked after brainstorming.
+- **Hands off to (terminal):** constellation:writing-plans (REQUIRED SUB-SKILL) — the only skill invoked after brainstorming. The plan it produces carries an estimated PR size and, above 1,000 lines, proposes a clean split for your confirmation.
 - **For product features started from requirements:** route through the PRD pipeline first via constellation:prd-author, then return here to design.
 - **Background:** write the spec prose clearly and concisely.
 
