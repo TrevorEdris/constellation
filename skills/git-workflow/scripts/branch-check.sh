@@ -96,10 +96,16 @@ if echo "$BRANCH" | grep -q ' '; then
 fi
 
 # ── Check: No special characters (except /, -, .) ────────────────────────────
+#
+# The hyphen must come last and unescaped in both classes below. Inside a POSIX
+# bracket expression a backslash is a literal character, not an escape, so the
+# earlier form '[^a-zA-Z0-9/\-\.]' parsed the hyphen as a range operator
+# spanning '\' to '\'. That silently dropped the literal hyphen from the allowed
+# set and rejected nearly every conventional branch name.
 
-if echo "$BRANCH" | grep -qE '[^a-zA-Z0-9/\-\.]'; then
+if echo "$BRANCH" | grep -qE '[^a-zA-Z0-9/._-]'; then
   FAILURES+=("Contains invalid special characters. Only alphanumerics, '/', '-', and '.' are allowed")
-  CLEAN=$(echo "$BRANCH" | sed 's/[^a-zA-Z0-9\/\-\.]/-/g')
+  CLEAN=$(echo "$BRANCH" | sed 's|[^a-zA-Z0-9/._-]|-|g')
   SUGGESTIONS+=("$CLEAN")
 fi
 
