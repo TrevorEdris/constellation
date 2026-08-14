@@ -20,6 +20,13 @@ These mirror the user's standing git-safety rules. They override convenience.
 - **Prefix `gh` with the token.** The bare `GITHUB_TOKEN` env var is invalid here; run GitHub commands as `GITHUB_TOKEN= gh ...` so `gh` falls back to keyring auth.
 - **Commit trailer.** End commit messages with `Co-Authored-By: Claude <noreply@anthropic.com>`.
 
+Stacking-specific, whenever `gh stack` is in play:
+
+- **Never run `gh stack modify`.** It is a full-screen TUI with no non-interactive path. Restructuring a stack (drop, fold, reorder, rename) is a human hand-off — describe the change you want and stop.
+- **Always pass `--auto` to `gh stack submit`, and explicit branch names to `init`/`add`.** Without them these commands open an editor or prompt. Never rely on the tool detecting a non-interactive terminal.
+- **Never run `gh stack merge` without explicit human approval.** It merges every layer up to the chosen PR in one all-or-nothing operation, and it cannot bypass merge requirements.
+- **Never trust `gh stack sync`'s exit code.** A diverged stack aborts the sync *with exit status 0* in a non-interactive terminal, pushing nothing. Confirm with `gh stack view --json`.
+
 ## Mode Selection
 
 Detect the sub-workflow from the request or context; if ambiguous, ask.
@@ -28,12 +35,13 @@ Detect the sub-workflow from the request or context; if ambiguous, ask.
 |------|---------|--------|
 | commit | Staged changes exist, user wants to commit | Generate a conventional commit message |
 | pr | User wants to open a PR | Generate PR body, push, create via `gh` |
+| stack | Related work spans 2+ dependent branches, or one PR would be too big | Build a stack with `gh stack`; one PR per layer |
 | branch | User wants a new branch | Enforce naming, create branch |
 | conflict | `UU` markers in `git status` | Guide per-file resolution |
 | worktree | User wants an isolated workspace | Follow `references/using-git-worktrees/` |
 | finish | Work done, branch ready to dispose | Follow `references/finishing-a-development-branch/` |
 
-Auto-detect: staged files + no conflicts → commit; conflict markers → conflict; clean branch + no argument → ask.
+Auto-detect: staged files + no conflicts → commit; conflict markers → conflict; branch in a tracked stack (`gh stack view` exits 0) → stack; clean branch + no argument → ask.
 
 ## Sub-Workflow: commit
 
@@ -56,6 +64,8 @@ Good/bad messages:
 
 ## Sub-Workflow: pr
 
+**Before step 1:** if this branch is part of a tracked stack (`gh stack view` exits 0), use the stack sub-workflow instead — a plain `gh pr create` would base the PR on the trunk rather than the layer below it.
+
 1. Determine the base branch (`main` → `master` → `develop`).
 2. Collect history: `git log --oneline <base>..HEAD` and `git diff <base>...HEAD --stat`.
 3. Generate a title under 70 chars summarizing the whole change.
@@ -66,7 +76,100 @@ Good/bad messages:
 
 `scripts/pr-body.sh [base-branch]` generates a formatted body from commit history.
 
+## Sub-Workflow: stack
+
+Stacked PRs split one large change into a chain of small PRs, each based on the branch below it, so every PR's diff shows only its own layer. Driven by the official `gh stack` extension.
+
+**Prefer a stack when any of these hold:**
+- The new branch would build on an unmerged, non-trunk branch.
+- The plan has 2+ phases that each ship something reviewable on their own.
+- The estimated PR size exceeds 1,000 lines (the `constellation:writing-plans` threshold).
+- Layers have a strict dependency order — later ones cannot build or pass tests without earlier ones.
+
+**Do not stack when:** the change is self-contained; the layers cannot be reviewed independently; or the base branch uses a merge queue (the queue picks the merge method and may land layers in separate groups).
+
+### 1. Preflight
+
+```bash
+bash scripts/stack-check.sh
+```
+Any FAIL means stop and fix it first. If the extension is missing, offer `gh extension install github/gh-stack` (requires `gh` v2.0+) or use the fallback below. Add `--remote` to also compare each branch against the remote.
+
+### 2. Build the stack
+
+Name every layer bottom to top, validating each with `scripts/branch-check.sh` before creating it.
+
+```bash
+GITHUB_TOKEN= gh stack init --base main <layer1> <layer2> <layer3>
+GITHUB_TOKEN= gh stack bottom
+# ... commit layer 1 per the commit sub-workflow ...
+GITHUB_TOKEN= gh stack rebase     # cascade new commits upward
+GITHUB_TOKEN= gh stack up         # move to the next layer
+```
+
+`init` leaves you on the top layer, so step down before starting work. It also enables `git rerere`. Navigation: `up [n]`, `down [n]`, `top`, `bottom`, `trunk`.
+
+### 3. Submit as drafts
+
+```bash
+GITHUB_TOKEN= gh stack submit --auto
+```
+Pushes every branch, opens one PR per layer with the bases chained, and links them as a Stack on GitHub. `--auto` creates them as **drafts**; `--open` would mark them ready for review instead.
+
+### 4. Replace the generated titles and bodies
+
+`--auto` invents throwaway titles and writes no body. For each PR, apply the title and body you would have produced in the `pr` sub-workflow, using `assets/stacked-pr-template.md`:
+
+```bash
+GITHUB_TOKEN= gh stack view --json                          # read the PR numbers
+GITHUB_TOKEN= gh pr edit <n> --title "<title>" --body "<body>"
+GITHUB_TOKEN= gh pr view <n> --json title,body,isDraft      # verify
+```
+Skipping this ships a stack of PRs with meaningless titles.
+
+### 5. Responding to review on a lower layer
+
+```bash
+GITHUB_TOKEN= gh stack down       # or: gh stack bottom
+# ... commit the fix ...
+GITHUB_TOKEN= gh stack rebase     # replays every branch above it
+GITHUB_TOKEN= gh stack push
+```
+`push` is **not atomic** — some branches may update while another is rejected; fix the rejected one and re-run. On a rebase conflict, resolve per the conflict sub-workflow then `gh stack rebase --continue`, or `gh stack rebase --abort` to restore every branch.
+
+### 6. After the bottom PR merges
+
+```bash
+GITHUB_TOKEN= gh stack sync --prune
+GITHUB_TOKEN= gh stack view --json    # verify; do NOT trust sync's exit code
+```
+Confirm trunk moved and the merged layer is gone. If the stacks diverged, sync did nothing despite succeeding — `gh stack unstack`, then rebuild with `gh stack submit --auto`.
+
+### Retrofitting branches that already exist
+
+```bash
+GITHUB_TOKEN= gh stack link --base main <b1> <b2> <b3>
+```
+Pushes the branches, creates or reuses their PRs, chains the bases, and links them into a stack without taking over local tracking. Additive only — it never removes a PR from a stack.
+
+### Fallback when the extension is unavailable
+
+Create each branch off the previous one, then:
+```bash
+GITHUB_TOKEN= gh pr create --draft --base <branch-below> --head <branch>
+git rebase --onto <new-parent> <old-parent> <branch>   # cascade by hand, bottom to top
+GITHUB_TOKEN= gh pr edit <n> --base main               # retarget once the bottom merges
+```
+
+### Notes
+
+- `gh stack view` exits 0 inside a stack and 2 outside one — the reliable "am I in a stack?" probe. Exit 8 means another process or worktree holds the lock.
+- Stack metadata lives in the **common** git dir (`.git/gh-stack`), so every worktree of a repo shares one stack and only one may operate on it at a time. It is not committed: a fresh clone has no stack, so recover with `gh stack checkout <stack-number>`.
+- `rerere` replays earlier conflict resolutions automatically. Verify what it replayed — a stale resolution applies silently.
+
 ## Sub-Workflow: branch
+
+**Before step 1:** if the new branch would build on unmerged, non-trunk work, or the plan has 2+ phases that each ship independently, use the stack sub-workflow instead of a lone branch.
 
 1. Ask for purpose (`feature|fix|chore|docs|refactor|test|hotfix|release`), optional ticket ID, and a 2–5 word description.
 2. Build the name: with ticket `<type>/<ticket>-<kebab-desc>`, without `<type>/<kebab-desc>`.
@@ -93,6 +196,8 @@ Constraints (full set in `references/branch-naming.md`): lowercase; hyphens not 
 
 Note: during `git rebase`, "ours" and "theirs" are swapped (HEAD is the upstream target, "theirs" is your replayed commits). Full patterns in `references/merge-conflict-guide.md`.
 
+In a stack, `gh stack init` has enabled `git rerere`, so a conflict you resolved once is replayed automatically on later cascades. Read what it replayed before continuing — a resolution that was right for an earlier version of the layer applies silently to the new one.
+
 ## Sub-Workflow: worktree
 
 **Bundled reference:** follow `references/using-git-worktrees/` (its SKILL.md). Do not hand-roll worktree creation here. That reference owns directory selection and the safety gates below.
@@ -106,12 +211,15 @@ Non-negotiable safety carried from that skill — apply even if you set up a wor
 
 **Bundled reference:** follow `references/finishing-a-development-branch/` for branch disposition (run tests, then merge / PR / keep / discard, plus worktree cleanup). The "keep as-is" path pairs with `constellation:session-handoff`. Do not delete a branch or merge to a base without running the test suite first and getting explicit confirmation for destructive options.
 
+Stacked branches are disposed of with `gh stack sync --prune` after their PR merges, never with `git branch -D` — deleting a layer by hand leaves the stack metadata pointing at a branch that no longer exists.
+
 ## Integration
 
 - `references/using-git-worktrees/` — bundled reference for the worktree mode.
 - `references/finishing-a-development-branch/` — bundled reference for the finish mode.
 - `constellation:code-review` / `code-review` — review a PR this skill opened (no direct coupling; pin reviewers to `gh pr diff --name-only` scope).
 - `constellation:verification-before-completion` — run before claiming a commit/PR is done; verify by running, not by reasoning.
+- `constellation:writing-plans` — its estimated-PR-size forecast is the trigger for the stack mode: a plan over 1,000 lines should ship as a stack rather than one PR.
 
 ## References
 
@@ -124,7 +232,11 @@ Non-negotiable safety carried from that skill — apply even if you set up a wor
 - `scripts/commit-msg.sh` — suggest type + scope + description from the staged diff.
 - `scripts/pr-body.sh [base]` — generate a PR body from commit history and diff stat.
 - `scripts/branch-check.sh <name>` — validate a branch name, return PASS/FAIL + suggestion.
+- `scripts/stack-check.sh [--remote]` — preflight before any `gh stack` operation; PASS/FAIL/INFO per check.
+
+Regression tests for the two validators: `scripts/test-branch-check.sh`, `scripts/test-stack-check.sh`. Both are plain bash and take no arguments.
 
 ## Assets
 
 - `assets/pr-template.md` — fallback PR body template (repo `PULL_REQUEST_TEMPLATE.md` wins when present).
+- `assets/stacked-pr-template.md` — per-layer PR body for a stack; applied with `gh pr edit` after `gh stack submit --auto`.
