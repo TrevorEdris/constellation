@@ -15,6 +15,17 @@ tags: []
 
 > Canonical PLAN v2 format. Machine-readable frontmatter + fixed section names so plans parse programmatically. Heading names below are canonical — do not vary them.
 
+## Brief
+> For the human reviewer. Max 120 words. Plain language: no code, no file names, no step numbers. Write it LAST, after the validator and reviewer loops settle. Living: rewrite it whenever the plan's outcome, changes, or decisions change.
+
+**Delivers:** <1-2 sentences: the user-visible outcome when this plan is done>
+
+**Changes:**
+- <3-5 bullets, grouped by area, in words a teammate outside the session would follow>
+
+**Decisions made for you:**
+- <fork> → <choice> — <why>   (write "None." when the planner resolved no forks)
+
 ## Target repo & files
 Explicit repos and every file to be touched (New / Modified). Exact paths, not vague areas.
 

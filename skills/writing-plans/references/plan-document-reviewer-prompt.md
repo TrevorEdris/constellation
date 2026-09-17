@@ -29,6 +29,7 @@ Task tool:
     | Buildability | Could a zero-context engineer follow each step verbatim without a judgment call? |
     | PLAN v2 conformance | Frontmatter present; canonical section headings unchanged; every step has exact path, code, command, expected output |
     | Traceability | Every Discovery finding maps to a step or is justified out of scope |
+    | Brief fidelity | `## Brief` is the first section and matches the plan body: Delivers is what the steps actually produce; every design fork resolved in the plan appears under "Decisions made for you"; nothing claimed that no step delivers |
 
     ## Calibration
 

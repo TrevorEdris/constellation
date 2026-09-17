@@ -114,6 +114,7 @@ Write to `.ai/sessions/YYYY-MM-DD_<TICKET>_<SLUG>/PLAN.md` (user preferences ove
   > **For the executor:** REQUIRED SUB-SKILL — use constellation:subagent-driven-development to run this plan step-by-step; for inline, no-subagent execution see that skill's bundled executing-plans reference. Steps use checkbox (`- [ ]`) syntax for tracking.
   ```
 
+- **Brief** — the first `##` section, written for the human approver, not the executor. Three labels only: **Delivers**, **Changes**, **Decisions made for you**. Max 120 words, plain language, no code, no file names, no step numbers. Leave the template placeholders in place until the plan body is final — see "Write the Brief last".
 - **Target repo & files** — explicit New/Modified list with exact paths (from your file-structure pass).
 - **Architecture decision** — only if a genuine fork exists; recommend one, mark the default.
 - **Structure (phased)** — the phase/dependency table; name the critical path.
@@ -147,6 +148,23 @@ Independent of the validator, dispatch ONE plan-document reviewer subagent to ca
 3. If **Approved**: proceed to hand-off.
 4. Cap the loop at 3 iterations; if it exceeds that, surface to the human. Reviewers are advisory — explain disagreements if you believe the feedback is wrong.
 
+## Write the Brief last
+
+The plan body is tuned for a zero-context executor. The human approving it needs the opposite: 30 seconds, plain words. Write `## Brief` only after the validator PASS and the reviewer loop have settled — a Brief written first describes the plan you intended, not the plan you wrote.
+
+- **Delivers** states the outcome a user or operator will notice, not the work performed.
+- **Changes** groups by area. If a bullet needs a file name to make sense, it is too low-level.
+- **Decisions made for you** lists every fork you resolved without asking — this is the approver's veto surface. Hiding a decision here to keep the Brief short is a defect. Write "None." only when it is true.
+- Re-run `constellation:plan-validator` after writing the Brief (Check 17 scores it).
+
+**Living section:** any later edit to the plan that changes its outcome, its change areas, or a resolved decision — including implementation notes, review-fix passes, and scope reversals appended during execution — REQUIRES rewriting the Brief in the same edit. The Brief always describes the plan as it stands now.
+
+| Excuse | Reality |
+|---|---|
+| "The steps are self-explanatory" | To an executor. The approver reads 120 words or skims 3,000. |
+| "I'll update the Brief at the end" | A stale Brief is worse than none — the human trusts it. |
+| "The decision was obvious" | Obvious to you. List it; the approver decides what is obvious. |
+
 ## Execution hand-off
 
 After the plan scores PASS and the reviewer approves, offer the execution choice:
@@ -173,7 +191,8 @@ The ONLY skills you invoke after writing-plans are plan-validator (during writin
 - [ ] Traceability table maps every Discovery finding to a step
 - [ ] Run `constellation:plan-validator` until score >= 70
 - [ ] Dispatch plan-document reviewer; resolve issues (cap 3 loops)
-- [ ] Present plan with score; wait for explicit approval
+- [ ] Write the `## Brief` LAST (Delivers / Changes / Decisions made for you, max 120 words); re-run plan-validator
+- [ ] Present plan with score; point the human at the Brief; wait for explicit approval
 - [ ] Offer execution hand-off (subagent-driven recommended)
 
 ## Notes
