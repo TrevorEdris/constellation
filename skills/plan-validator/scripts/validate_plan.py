@@ -619,6 +619,90 @@ def check_git_commit_plan(lines: list[str], report: ValidationReport) -> None:
         report.score -= 3
 
 
+BRIEF_HEADING = r"^##\s+brief\s*$"
+BRIEF_MAX_WORDS = 120
+BRIEF_LABELS = ("**Delivers:**", "**Changes:**", "**Decisions made for you:**")
+BRIEF_STEP_REF = re.compile(r"\(\d+\.\d+\)|\bstep\s+\d+(?:\.\d+)?\b", re.IGNORECASE)
+
+
+def check_brief(lines: list[str], report: ValidationReport) -> None:
+    """Check 17: Plan should open with a short, plain-language Brief for the human reviewer."""
+    start, end = find_section(lines, BRIEF_HEADING)
+    if start == 0:
+        report.issues.append(
+            Issue(
+                severity="warning",
+                category="brief",
+                message=(
+                    "No Brief section found. Plans should open with '## Brief' "
+                    "(Delivers / Changes / Decisions made for you) so a human can review in under a minute."
+                ),
+            )
+        )
+        report.score -= 5
+        return
+
+    # The Brief only helps if it is the first thing a human sees.
+    in_code_block = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_code_block = not in_code_block
+            continue
+        if in_code_block or not re.match(r"^##\s", stripped):
+            continue
+        if not re.match(BRIEF_HEADING, stripped, re.IGNORECASE):
+            report.issues.append(
+                Issue(
+                    severity="warning",
+                    category="brief",
+                    message="Brief must be the first section (first '##' heading) of the plan.",
+                    line=start,
+                )
+            )
+            report.score -= 3
+        break
+
+    # Blockquote lines are the template's guidance note, not Brief content.
+    body_lines = [ln for ln in lines[start:end] if not ln.strip().startswith(">")]
+    body = "\n".join(body_lines)
+
+    words = sum(1 for token in body.split() if re.search(r"\w", token))
+    if words > BRIEF_MAX_WORDS:
+        report.issues.append(
+            Issue(
+                severity="warning",
+                category="brief",
+                message=f"Brief is {words} words; the budget is {BRIEF_MAX_WORDS}. Cut it — this is the 30-second read.",
+                line=start,
+            )
+        )
+        report.score -= 5
+
+    missing = [label for label in BRIEF_LABELS if label not in body]
+    if missing:
+        report.issues.append(
+            Issue(
+                severity="warning",
+                category="brief",
+                message=f"Brief is missing required label(s): {', '.join(missing)}",
+                line=start,
+            )
+        )
+        report.score -= 5
+
+    if "`" in body or BRIEF_STEP_REF.search(body):
+        report.issues.append(
+            Issue(
+                severity="warning",
+                category="brief",
+                message="Brief must be plain language: no code, backticks, or step numbers.",
+                line=start,
+            )
+        )
+        report.score -= 3
+
+
 # ---------------------------------------------------------------------------
 # Report rendering
 # ---------------------------------------------------------------------------
@@ -730,6 +814,7 @@ def validate_plan(path: Path) -> ValidationReport:
     check_pr_size_estimate(lines, report)
     check_git_branch(lines, report)
     check_git_commit_plan(lines, report)
+    check_brief(lines, report)
 
     report.score = max(0, report.score)
     return report

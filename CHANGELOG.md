@@ -10,5 +10,6 @@ Initial release.
 - Session scaffolding now captures Claude Code's own session title automatically (Stop hook) instead of requiring the agent to invent a slug and run `new-session.sh` by hand.
 - PLAN v2 format with a scored `plan-validator` gate.
 - PLAN v2 forecasts PR size: writing-plans estimates the total line delta, warns and offers an `AskUserQuestion`-confirmed split above 1,000 lines, and `plan-validator` checks the `Estimated PR size` section.
+- PLAN v2 opens with a human-readable `## Brief` (Delivers / Changes / Decisions made for you, max 120 words, living); `plan-validator` Check 17 scores it and the plan reviewer checks it against the plan body.
 - 9 hooks: dangerous-command and secret guards, session-doc automation, and plan-validation / section-sign reminders.
 - Claude Code and Codex support, with catalog and bootstrap generation.

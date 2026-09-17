@@ -31,7 +31,7 @@ NO PLAN PRESENTED FOR APPROVAL WITHOUT A FRESH plan-validator PASS (>= 70)
 
 This validates the canonical PLAN v2 format defined by constellation:writing-plans (bundled at `skills/writing-plans/references/PLAN-TEMPLATE.md`). Beyond the script's score, three constellation requirements are HARD gates — a plan failing any of them is not PASS regardless of numeric score:
 
-1. **PLAN v2 frontmatter** — `schema: plan/v2` plus the canonical fixed section headings (Target repo & files, Estimated PR size, Structure (phased), Ordered steps, Risks & assumptions, Verification (aggregate), Traceability, Out of scope, Git strategy). Do not rename headings. The script's `check_pr_size_estimate` warns when the size section is missing, or when a >1,000-line estimate carries no large-PR warning or split analysis.
+1. **PLAN v2 frontmatter** — `schema: plan/v2` plus the canonical fixed section headings (Brief, Target repo & files, Estimated PR size, Structure (phased), Ordered steps, Risks & assumptions, Verification (aggregate), Traceability, Out of scope, Git strategy). Do not rename headings. The script's `check_pr_size_estimate` warns when the size section is missing, or when a >1,000-line estimate carries no large-PR warning or split analysis.
 2. **Traceability table present and populated** — a `## Traceability` section mapping every Discovery finding to a plan step. Findings with no step must be justified as out of scope. An empty or missing table fails the gate.
 3. **Record the score** — write the numeric result into the PLAN frontmatter `plan_validator_score:` field (and set `traceability_complete: true` once the table is populated). The plan is not done until its own frontmatter records the PASS.
 
@@ -105,7 +105,7 @@ Recording the result:
 
 ## Checks the script performs
 
-16 checks across structure, specificity, vagueness, scope, traceability, verification, and git strategy. Errors are blocking (target repos, file paths, ordered steps); warnings deduct points (vague language, missing risks/verification, oversized code blocks, missing per-step verification, missing branch/commit/PR plan). Run with `--json` for machine-readable output. Score starts at 100; PASS is >= 70 with zero errors.
+17 checks across structure, the human Brief, specificity, vagueness, scope, traceability, verification, and git strategy. Errors are blocking (target repos, file paths, ordered steps); warnings deduct points (vague language, missing risks/verification, oversized code blocks, missing per-step verification, missing branch/commit/PR plan, missing/oversized/non-plain Brief). Run with `--json` for machine-readable output. Score starts at 100; PASS is >= 70 with zero errors.
 
 ## Integration
 
