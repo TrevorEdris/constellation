@@ -1,0 +1,49 @@
+name: version-check
+
+# Any PR that changes shipped plugin files must bump the plugin version, and
+# plugin.json and marketplace.json must always agree on that version.
+# No `on.paths` filter: the check must report on every PR so it can be required.
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  version-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Require plugin + marketplace version bump
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          PLUGIN=.claude-plugin/plugin.json
+          MARKET=.claude-plugin/marketplace.json
+          MVER='.plugins[] | select(.name == "constellation") | .version'
+
+          head_p=$(jq -r .version "$PLUGIN")
+          head_m=$(jq -r "$MVER" "$MARKET")
+          if [ "$head_p" != "$head_m" ]; then
+            echo "::error::Version mismatch: $PLUGIN=$head_p, $MARKET=$head_m"
+            exit 1
+          fi
+
+          if ! git diff --name-only "$BASE"...HEAD | grep -qE '^(\.claude-plugin|agents|hooks|skills|scripts)/'; then
+            echo "No plugin files changed; skipping bump check."
+            exit 0
+          fi
+
+          base_p=$(git show "$BASE:$PLUGIN" | jq -r .version)
+          newest=$(printf '%s\n%s\n' "$base_p" "$head_p" | sort -V | tail -1)
+          if [ "$head_p" = "$base_p" ] || [ "$newest" != "$head_p" ]; then
+            echo "::error::Plugin files changed; bump version above $base_p in $PLUGIN and $MARKET (now $head_p)."
+            exit 1
+          fi
+          echo "Version bump OK: $base_p -> $head_p"
