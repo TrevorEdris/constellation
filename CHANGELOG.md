@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.3 — 2026-10-07
+
+- feat(plan-validator): render the approval card and point the PLAN hook at it
+
 ## 0.2.2 — 2026-10-07
 
 - feat(plan-validator): check plan/v3 delivery against the live remote
