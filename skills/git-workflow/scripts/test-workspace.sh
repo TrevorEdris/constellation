@@ -223,6 +223,23 @@ detect_in "$WT"
 assert_eq "CLEANUP" host "$(kv CLEANUP)"
 finish
 
+# The managed directories only count under the main checkout. A worktrees/ or
+# .claude/worktrees/ directory elsewhere belongs to whoever made it; reading it
+# as git-cleaned would let the agent remove a directory the host owns.
+begin "detect: worktrees dir outside the main checkout is host-owned"
+new_repo
+add_wt other/worktrees/o feat/o
+detect_in "$WT"
+assert_eq "worktrees/: ISOLATION" worktree "$(kv ISOLATION)"
+assert_eq "worktrees/: MAIN_ROOT" "$REPO" "$(kv MAIN_ROOT)"
+assert_eq "worktrees/: CLEANUP" host "$(kv CLEANUP)"
+add_wt other/.claude/worktrees/p feat/p
+detect_in "$WT"
+assert_eq ".claude/worktrees/: ISOLATION" worktree "$(kv ISOLATION)"
+assert_eq ".claude/worktrees/: MAIN_ROOT" "$REPO" "$(kv MAIN_ROOT)"
+assert_eq ".claude/worktrees/: CLEANUP" host "$(kv CLEANUP)"
+finish
+
 # Detached beats location: the path rule alone would say git.
 begin "detect: detached worktree"
 new_repo
@@ -389,6 +406,18 @@ for i in 1 2 3 4 5 6; do commit "$WT" "work $i"; done
 assert_eq "setup: (#4) is outside HEAD's last 5" 0 \
   "$(g -C "$WT" log -5 --format=%s | grep -c '(#4)')"
 detect_in "$WT"
+assert_eq "REMOTE" "" "$(kv REMOTE)"
+assert_eq "DELIVERY" pr "$(kv DELIVERY)"
+finish
+
+# With no main or master there is no BASE to scan, so HEAD's own subjects are
+# the only evidence. Dropping the HEAD scan would read this squash-merge repo as
+# local and permit the local merge the PR flow forbids.
+begin "detect: HEAD subjects count when BASE is empty"
+new_repo trunk
+commit "$REPO" "feat: x (#3)"
+detect_in "$REPO"
+assert_eq "BASE" "" "$(kv BASE)"
 assert_eq "REMOTE" "" "$(kv REMOTE)"
 assert_eq "DELIVERY" pr "$(kv DELIVERY)"
 finish
