@@ -30,6 +30,7 @@ from conftest import FIXTURES, git_env, v3_plan
 
 SCRIPT = Path(card.__file__).resolve()
 GOLDEN = FIXTURES / "v3-valid.card.txt"
+SKILL = SCRIPT.parents[2] / "writing-plans" / "SKILL.md"
 
 TIME_RE = re.compile(r"\(remote checked \d\d-\d\d \d\d:\d\d\)")
 MASKED_TIME = "(remote checked MM-DD HH:MM)"
@@ -102,6 +103,34 @@ def test_render_within_120_and_questions_by_60(tmp_path):
     assert last_question_end <= 60
     # The check time is counted as printed; without its 4 words the card would be 114
     assert (words, last_question_end) == (118, 58)
+
+
+def _skill_example_cards() -> list[str]:
+    """The text of every fenced block in writing-plans/SKILL.md that opens with a card's ask line."""
+    blocks, current = [], None
+    for line in SKILL.read_text(encoding="utf-8").splitlines():
+        if line.lstrip().startswith("```"):
+            if current is None:
+                current = []
+            else:
+                blocks.append(current)
+                current = None
+        elif current is not None:
+            current.append(line.strip())
+    return ["\n".join(block) + "\n" for block in blocks if block and block[0].startswith("**Approve ")]
+
+
+def test_skill_example_card_within_budget():
+    # The card the skill shows the agent as its model must itself fit the budget it teaches
+    cards = _skill_example_cards()
+    assert len(cards) == 1, "writing-plans/SKILL.md must show exactly one fenced example card"
+    example = cards[0]
+    positions = [example.find(label) for label in vp.CARD_LABELS]
+    assert -1 not in positions and positions == sorted(positions), "the example carries every card label, in order"
+    assert example.splitlines()[-1].startswith(card.FOOTER_PREFIX), "the example ends with the footer render prints"
+    words, last_question_end = card.card_word_stats(example)
+    assert words <= 120
+    assert last_question_end <= 60
 
 
 def test_ships_as_has_live_check_time(tmp_path):
