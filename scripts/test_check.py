@@ -130,8 +130,9 @@ def test_all_green_exits_zero(tree):
 
 def test_syntax_error_in_second_hook_fails(tree):
     # a.js is valid and sorts first: a single `node --check a.js b.js` would
-    # check only a.js and pass.
-    write(tree, "hooks/b.js", HOOK_BROKEN)
+    # check only a.js and pass. b.js sits one level down, like the real
+    # hooks/lib/session.js, so a search limited to hooks/*.js would miss it.
+    write(tree, "hooks/lib/b.js", HOOK_BROKEN)
 
     res = run_check(tree)
 
