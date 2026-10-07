@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.10 — 2026-10-07
+
+- fix(git-workflow): route merge, land and ship-to-main requests to the skill
+
 ## 0.3.9 — 2026-10-07
 
 - feat(ci): lint skill links, bundled-script calls and generated-file drift
