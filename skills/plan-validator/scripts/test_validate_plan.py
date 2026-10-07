@@ -252,9 +252,13 @@ def test_frontmatter_strips_inline_comment():
         "hash_inside: c#-port\n"
         "quoted: \"keep # this\"\n"
         "flow: [a, b] # note\n"
+        # The aligned form PLAN-TEMPLATE.md ships: many spaces before the '#'. Only the
+        # trailing-whitespace trim keeps those spaces out of the value.
+        "aligned: draft            # draft | approved\n"
         "delivery:\n"
         "  - repo: /work/a\n"
         "    branch: feat/a # note\n"
+        "    mode: pr            # pr | stack | local-only\n"
         "---\n"
     )
     data, _, problems = vp.parse_frontmatter(text)
@@ -262,11 +266,14 @@ def test_frontmatter_strips_inline_comment():
     assert data["hash_inside"] == "c#-port"
     assert data["quoted"] == "keep # this"
     assert data["flow"] == ["a", "b"]
-    assert data["delivery"] == [{"repo": "/work/a", "branch": "feat/a"}]
+    assert data["aligned"] == "draft"
+    assert data["delivery"] == [{"repo": "/work/a", "branch": "feat/a", "mode": "pr"}]
     assert [(p.code, p.line) for p in problems] == [
         ("inline-comment", 2),
         ("inline-comment", 5),
-        ("inline-comment", 8),
+        ("inline-comment", 6),
+        ("inline-comment", 9),
+        ("inline-comment", 10),
     ]
 
 
@@ -367,8 +374,17 @@ def test_frontmatter_block_list_item_keys_align_with_the_first_key():
     assert data["delivery"] == [{"repo": "/work/a"}, "plain"]
 
 
-def test_v3_inline_comment_is_error(tmp_path):
-    commented = _validate(tmp_path, V3_FM.format(status="draft # x") + PLAN_BODY)
+@pytest.mark.parametrize(
+    "commented_status",
+    [
+        "draft # x",
+        # the aligned form PLAN-TEMPLATE.md ships (12 spaces before the '#')
+        "draft            # draft | awaiting-approval | approved | in-progress | complete",
+    ],
+    ids=["one-space", "aligned-template"],
+)
+def test_v3_inline_comment_is_error(tmp_path, commented_status):
+    commented = _validate(tmp_path, V3_FM.format(status=commented_status) + PLAN_BODY)
     clean = _validate(tmp_path, V3_FM.format(status="draft") + PLAN_BODY)
     errs = [i for i in commented.errors if i.category == "schema"]
     assert len(errs) == 1
