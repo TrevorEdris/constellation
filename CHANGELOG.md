@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.4 — 2026-10-07
+
+- feat(plan-validator): classify chat replies and record approvals
+
 ## 0.2.3 — 2026-10-07
 
 - feat(plan-validator): render the approval card and point the PLAN hook at it
