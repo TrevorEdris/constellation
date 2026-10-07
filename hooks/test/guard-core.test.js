@@ -117,6 +117,14 @@ test('deny rules: the same words in harmless positions are not denied', () => {
   assert.equal(run('rm -rf .', { cwd: '/h/project' }), null);
   assert.equal(run('rm -f *', { cwd: '/h' }), null, 'not recursive');
   assert.equal(run('rm -rf build', { cwd: '/h' }), null);
+  // Every spelling of "recursive" counts: upper-case -R, a cluster holding it, and the long option.
+  assert.equal(run('rm -R *', { cwd: '/h' })?.id, 'rm-root-home');
+  assert.equal(run('rm -fR .', { cwd: '/h' })?.id, 'rm-root-home');
+  assert.equal(run('rm --recursive .', { cwd: '/h' })?.id, 'rm-root-home');
+  assert.equal(run('rm --recursive --force *', { cwd: '/h' })?.id, 'rm-root-home');
+  assert.equal(run('rm --force *', { cwd: '/h' }), null, 'a long option that is not --recursive');
+  assert.equal(run('rm -R *', { cwd: CWD }), null);
+  assert.equal(run('rm --recursive .', { cwd: CWD }), null);
   const rows = [
     'rm -rf ~/projects/x/build',
     'rm -rf /h/projects',
@@ -135,6 +143,18 @@ test('deny rules: the same words in harmless positions are not denied', () => {
     'mkfs.ext4 disk.img',
     'diskutil list',
     'diskutil info disk2',
+    // Only dd writes `of=`, only a path that starts at /dev is a device, and only diskutil erases.
+    'echo of=/dev/sda',
+    'dd of=build/dev/sda1.img',
+    'dd of=./dev/sdb if=img',
+    'echo x > ./dev/sdb',
+    'echo x > build/dev/sda1.img',
+    'echo x >> out/dev/disk2',
+    'grep eraseDisk notes.md',
+    'man diskutil eraseDisk',
+    'echo diskutil eraseDisk disk2',
+    'git log --grep=eraseDisk',
+    'echo mkfs.ext4 /dev/sdb1',
   ];
   for (const cmd of rows) assert.equal(run(cmd), null, cmd);
 });
@@ -256,6 +276,14 @@ test('read-secret: which words of a reader are paths', () => {
     ['cat certs/*.pem', 'private-key-file'],
     ['cat ~/.ssh/id_*', 'ssh-private-key'],
     ['cat ~/.ssh/id_*.pub', null],
+    // A brace word is a glob too: the alternatives are expanded and each one is classified.
+    ['cat ~/.ssh/{id_rsa,id_rsa.pub}', 'ssh-private-key'],
+    ['cat ~/.ssh/{id_ed25519}', 'ssh-private-key'],
+    ['cat {.env,x}', 'env-file'],
+    ['grep -c . {.env,x}', 'env-file'],
+    ['cat ~/.ssh/{id_rsa.pub,known_hosts}', null],
+    ['cat {a,b}.txt', null],
+    ['find . -exec cat {} +', null],
     ['cat src/*.ts', null],
     ['cat *', null],
     ['cat [a-z]*.md', null],
@@ -694,8 +722,11 @@ test('safety net A: a command word that is not a plain program name asks', () =>
     '@foo run',
     '+x run',
     '-x run',
-    '[ -f x ] && ls',
-    '[[ -f x ]] && ls',
+    // Only the exact words `[`, `[[` and `:` run no program. A word that merely starts like them is not plain.
+    '[x] run',
+    ':x run',
+    '*',
+    'ls; *',
     'ls; $X',
     'echo $(echo a b) | $X',
     'bash -c "$X"',
@@ -715,8 +746,28 @@ test('safety net A: a command word that is not a plain program name asks', () =>
     'ls', 'git status', 'python3 x.py', 'g++ -o x x.cc', 'x86_64-linux-gnu-gcc -c x.c', './scripts/x.sh', '/usr/bin/env FOO=1 ls', 'x=1y=2 ls',
     '~/bin/tool', '../tool', '.venv/bin/pytest', './node_modules/.bin/jest', '/bin/ls', 'a.out', './a.out', '. ./env.sh', 'source ~/.env.sh',
     'FOO=bar ./run.sh', 'ITEM1="5486f8c2" ./run.sh', 'env FOO=bar', 'GITHUB_TOKEN= gh pr list', 'sudo -u root ls', 'command -v git',
+    // `[`, `[[` and `:` run no program, so they are as plain as `test -f x`, which passes.
+    'test -f x', '[ -f x ] && ls', '[[ -f x ]] && ls', 'if [ -f x ]; then cat x; fi', '[ -d .git ] && git status',
+    '[[ -n $X ]] || ls', 'if [ -z "$X" ]; then ls; fi', ': > out.txt', 'while :; do ls; done', 'until [ -f done ]; do sleep 1; done',
+    // The default arm of a case (`*)`) is read as a segment that is only a glob.
+    'case $x in a) ls;; *) echo hi;; esac', 'case $x in a) ls;; ?) echo hi;; esac', "bash -c 'case $x in a) ls;; *) echo hi;; esac'",
   ];
   for (const cmd of plain) assert.equal(run(cmd), null, cmd);
+  // Nothing behind a `[` is hidden: a reader after `&&` or `||` is its own segment and `$( )` inside the test is a substitution.
+  assert.equal(run('[ -f x ] && cat ~/.ssh/id_rsa').pathId, 'ssh-private-key');
+  assert.equal(run('[ -f x ] || cat ~/.ssh/id_rsa').decision, 'deny');
+  assert.equal(run('[ -f $(cat ~/.ssh/id_rsa) ]').decision, 'deny');
+  assert.equal(run('[[ -f x ]] && cat .env').id, 'read-secret');
+  assert.equal(run('if [ -f x ]; then cat .env; fi').id, 'read-secret');
+  assert.equal(run('if [ -f x ]; then rm -rf ~; fi').id, 'rm-root-home');
+  assert.equal(run('case $x in a) cat .env;; *) echo hi;; esac').id, 'read-secret');
+  // The `*)` exemption is for a case statement only: a lone glob as a command asks.
+  assert.equal(run('*')?.id, 'unrecognized-command-word');
+  assert.equal(run('echo hi; *')?.id, 'unrecognized-command-word');
+  // ...and only for a bare `*` or `?`: any other word that is not plain still asks inside a case.
+  assert.equal(run('case $x in a) ls;; *) ./*.sh;; esac')?.id, 'unrecognized-command-word');
+  assert.equal(run('case $x in a) $CC y;; esac')?.id, 'unrecognized-command-word');
+  assert.equal(run('case $x in a) * y;; esac')?.id, 'unrecognized-command-word', 'a glob with arguments is a command');
   // A segment with no command at all has no command word to judge.
   for (const cmd of ['D=/tmp/x', 'A=1 B=2', '> out.txt', '2>/dev/null', '{ ls; }', '! ls', 'X=$(date)', 'if true; then ls; fi', 'for x in 1 2; do ls; done',
     'while true; do ls; done']) {

@@ -37,9 +37,9 @@
  *
  * Two safety nets cover what the parser does not model, so that a missed construct costs a
  * prompt and never a silent pass: a segment whose command word is not a plain program name
- * asks (`unrecognized-command-word`), and so does any command the parser reports as unparsed
- * (`unparsed-command`: too long, nested too deep, `env -S`, an option it cannot place). A deny
- * found in the part that was read still wins.
+ * asks (`unrecognized-command-word`; `[`, `[[` and `:` run no program and count as plain), and
+ * so does any command the parser reports as unparsed (`unparsed-command`: too long, nested too
+ * deep, `env -S`, an option it cannot place). A deny found in the part that was read still wins.
  *
  * The hook fails open: any exception is logged as ERROR and the output is `{}`. It always
  * exits 0. This module handles Bash only for now; other tools return null.
@@ -510,7 +510,8 @@ function readerWords(cmd, args) {
 
 /**
  * A reader with a secret argument, or any command with a secret `<` target. An argument with a
- * glob character is also read as a glob, so `cat .env*` is caught the way `cat .env.local` is.
+ * glob character (`*`, `?`, `[`, or a `{a,b}` group) is also read as a glob, so a wildcard or brace
+ * word is caught the way `.env.local` is.
  * A word that is a file on only some readings of the options (it might be the pattern or an
  * option's value) can ask but never deny, because a deny cannot be approved.
  */
@@ -520,7 +521,7 @@ function readSecret(seg, ctx) {
   for (const r of seg.redirects) if (r.op === '<') words.push({ word: r.target, certain: true });
   let best = null;
   for (const { word, certain } of words) {
-    const c = classifyPath(word, ctx.home) || (/[*?[]/.test(word) ? globTargetsSecret(word, ctx.home) : null);
+    const c = classifyPath(word, ctx.home) || (/[*?[{]/.test(word) ? globTargetsSecret(word, ctx.home) : null);
     if (c === null) continue;
     const tier = c.tier === 'deny' && !certain ? 'ask' : c.tier;
     if (best === null || (tier === 'deny' && best.tier !== 'deny')) best = { word, pathId: c.pathId, tier };
@@ -535,22 +536,30 @@ const PLAIN_NAME = /^[A-Za-z0-9_][A-Za-z0-9_.+-]*$/;
 const PLAIN_PATH_CHARS = /^[A-Za-z0-9_.+~/-]+$/;
 // A segment that is only the closing `}` of a group, or `!`, has no command to judge.
 const LONE_SYNTAX = new Set(['{', '}', '!']);
+// Words that run no program: the test builtins `[` and `[[`, and the null command `:`. Whatever is
+// inside a test is only its arguments, a `$( )` in it is a substitution of its own, and `&&` and
+// `||` start a new segment, so a reader behind one is still seen. `test -f x` passes the same way.
+const NO_PROGRAM = new Set(['[', '[[', ':']);
+// The parser reads the default arm of a case, `*)`, as a segment whose only word is `*`.
+const CASE_DEFAULT_ARM = /^[*?]+$/;
 
-/** A program name, or a path built from name characters plus `/`, `.` and `~`. */
+/** A program name, a path built from name characters plus `/`, `.` and `~`, or a word that runs no program. */
 function isPlain(word) {
-  return PLAIN_NAME.test(word) || (PLAIN_PATH_CHARS.test(word) && /[/.~]/.test(word));
+  return PLAIN_NAME.test(word) || (PLAIN_PATH_CHARS.test(word) && /[/.~]/.test(word)) || NO_PROGRAM.has(word);
 }
 
 /**
  * Safety net for what the parser does not model: `a[0]=1 cmd`, `{fd}>f cmd`, `$CC file`, an
  * empty or quoted-away command word. If the word that runs is not a plain program name, nothing
- * after it can be trusted, so it asks.
+ * after it can be trusted, so it asks. A lone `*` or `?` in a command that has a `case` is an arm
+ * pattern, not a command, so it passes; the price is that `case x in a) *;; esac` passes too.
  */
-function unrecognizedCommandWord(seg) {
+function unrecognizedCommandWord(seg, ctx) {
   const { cmd, args, word } = cmdOf(seg);
   if (word === null) return null;
   if (cmd === '' && args.length === 0 && ASSIGNMENT.test(word)) return null; // only assignments
   if (args.length === 0 && LONE_SYNTAX.has(word)) return null;
+  if (args.length === 0 && ctx.hasCase && CASE_DEFAULT_ARM.test(word)) return null;
   return isPlain(word) ? null : { reason: 'unrecognized command word' };
 }
 
@@ -627,6 +636,7 @@ function decide(payload, opts) {
     home,
     homeDir: typeof home === 'string' && posix.isAbsolute(home) ? tidy(home) : '',
     unparsed: parsed.unparsed,
+    hasCase: parsed.segments.some((seg) => cmdOf(seg).cmd === 'case'),
   };
   const critical = env.CONSTELLATION_GUARD === 'critical';
 
