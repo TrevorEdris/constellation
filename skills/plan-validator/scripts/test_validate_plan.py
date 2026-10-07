@@ -1,7 +1,8 @@
 """Tests for validate_plan.py: PR-size and Brief checks, frontmatter parsing,
 schema dispatch (v3 vs legacy), issue audience tags, placeholder rejection,
-PLAN v2 step parsing, Traceability rows, the v3 approval-card checks and the v3
-delivery checks (frontmatter list, Ships-as cross-check, live remote probe).
+PLAN v2 step parsing, Traceability rows, the v3 approval-card checks, the v3
+delivery checks (frontmatter list, Ships-as cross-check, live remote probe) and
+the shape of PLAN-TEMPLATE.md (the v3 head over the v2 body).
 
 Run from the repo root:
     PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q -p no:cacheprovider skills/plan-validator/scripts
@@ -20,7 +21,7 @@ from pathlib import Path
 import pytest
 
 import validate_plan as vp
-from conftest import git_env, make_repo, v3_plan
+from conftest import FIXTURES, git_env, make_repo, v3_plan
 
 SCRIPT = Path(vp.__file__).resolve()
 
@@ -2206,3 +2207,91 @@ def test_legacy_plan_gets_no_delivery_checks(tmp_path):
 
 def test_every_delivery_rule_has_a_test():
     assert [rule for rule, name in DELIVERY_RULES.items() if name not in globals()] == []
+
+
+# ---------------------------------------------------------------------------
+# PLAN-TEMPLATE.md: the v3 head over the v2 body
+#
+# These read the real template. The scaffold test also runs the real
+# scripts/new-session.sh, so a change to either file that breaks the pair fails here.
+# ---------------------------------------------------------------------------
+
+TEMPLATE = SCRIPT.parents[2] / "writing-plans" / "references" / "PLAN-TEMPLATE.md"
+NEW_SESSION = SCRIPT.parents[3] / "scripts" / "new-session.sh"
+# The one section the valid fixture lacks: a plan writes it only when a genuine fork exists.
+OPTIONAL_TEMPLATE_SECTIONS = ("Architecture decision",)
+AGENTIC_WORKERS = (
+    "> **For agentic workers:** REQUIRED SUB-SKILL: constellation:subagent-driven-development "
+    "(inline: its references/executing-plans). Run is answered on the card."
+)
+
+
+def _template_lines() -> list[str]:
+    return TEMPLATE.read_text(encoding="utf-8").splitlines()
+
+
+def _h2_titles(lines: list[str]) -> list[str]:
+    return [match.group(1).strip() for line in lines if (match := re.match(r"^## (.+)$", line))]
+
+
+def _scaffold(tmp_path: Path, slug: str) -> Path:
+    """Run the real new-session.sh into tmp_path and return the PLAN.md it fills from the template."""
+    env = {**os.environ, "SESSION_ROOT": str(tmp_path / "sessions"), "HOME": str(tmp_path / "home")}
+    proc = subprocess.run(["bash", str(NEW_SESSION), slug], capture_output=True, text=True, check=False, env=env)
+    assert proc.returncode == 0, proc.stderr
+    return Path(proc.stdout.strip().splitlines()[-1]) / "PLAN.md"
+
+
+def test_unfilled_template_fails_with_placeholder_error():
+    proc = _run_cli(TEMPLATE)
+    assert proc.returncode == 1
+    assert "[ERROR] [placeholder]" in proc.stdout
+
+
+def test_scaffolded_template_still_fails(tmp_path):
+    plan = _scaffold(tmp_path, "Scaffold-Check")
+    text = plan.read_text(encoding="utf-8")
+    # new-session.sh filled the fields it owns ...
+    assert "{{" not in text
+    assert re.search(r"^date: \d{4}-\d{2}-\d{2}$", text, re.M)
+    assert "slug: Scaffold-Check" in text.splitlines()
+    # ... and every other slot is still the author's to fill
+    report = vp.validate_plan(plan)
+    assert [i for i in report.errors if i.category == "placeholder"]
+    assert not report.passed
+
+
+def test_template_frontmatter_is_v3_without_comments():
+    text = TEMPLATE.read_text(encoding="utf-8")
+    fm = vp.parse_frontmatter(text)
+    assert vp.is_v3(fm)
+    assert fm.problems == []
+    assert not [line for line in text.splitlines()[: fm.end_line] if "#" in line]
+    assert set(fm.data) == {"schema", "date", "slug", "status", "delivery", "tags"}
+    # new-session.sh fills these two with sed
+    assert fm.data["date"] == "{{DATE}}"
+    assert fm.data["slug"] == "{{SLUG}}"
+    assert fm.data["status"] == "draft"
+    (item,) = fm.data["delivery"]
+    assert set(item) == set(vp.DELIVERY_KEYS)
+    assert item["mode"] in vp.DELIVERY_MODES
+
+
+def test_template_headings_match_valid_fixture():
+    template = _template_lines()
+    fixture = (FIXTURES / "v3-valid-PLAN.md").read_text(encoding="utf-8").splitlines()
+    assert [t for t in _h2_titles(template) if t not in OPTIONAL_TEMPLATE_SECTIONS] == _h2_titles(fixture)
+    assert vp.plan_title(template) is not None
+
+
+def test_template_head_has_the_card_brief_and_global_constraints():
+    lines = _template_lines()
+    card = vp.parse_card(lines)
+    assert list(card.fields) == list(vp.CARD_LABELS)
+    assert [q.is_run for q in card.questions] == [False, True]
+    assert [dline.tag for dline in vp.parse_dlines(lines).values()] == ["ask", "made"]
+    assert [did for did, _, _ in card.made] == ["D2"]
+    # the Brief ends at a rule; the hand-off line follows it and Global Constraints follows that
+    rule = lines.index("---", vp.parse_frontmatter("\n".join(lines)).end_line)
+    assert lines[rule + 1] == AGENTIC_WORKERS
+    assert lines.index("## Global Constraints") > rule + 1
