@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.3 — 2026-10-07
+
+- fix(session): announce the journal once per session and log compactions
+
 ## 0.3.2 — 2026-10-07
 
 - fix(session): adopt agent-made session dirs and PLAN-named dirs
