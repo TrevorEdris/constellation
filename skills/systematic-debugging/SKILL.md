@@ -65,7 +65,7 @@ Complete each phase before the next. Track them in TodoWrite.
    identify WHERE it breaks before touching code. See `references/defense-in-depth.md`.
 5. **Trace data flow upstream.** Where does the bad value originate? What passed it in? Keep tracing to
    the source. See `references/root-cause-tracing.md`. For "which test pollutes shared state?", use
-   `scripts/find-polluter.sh`.
+   `bash scripts/find-polluter.sh <file_to_check> <test_pattern>`.
 
 You have the root cause only when you can finish this sentence with specifics: "The bug occurs because
 [condition] causes [component] to [behavior] when [trigger]." Vague answers mean keep investigating.
@@ -202,7 +202,7 @@ monitoring for next time. But 95% of "no root cause" cases are incomplete invest
 - `references/condition-based-waiting.md` — replace flaky arbitrary timeouts with condition polling
 - `agents/systematic-debugger.md` — dispatchable read-only investigation subagent (invoke by name in Workflow scripts)
 - `references/systematic-debugger-subagent.md` — read-only investigation subagent dispatch template
-- `scripts/find-polluter.sh` — bisect tests to find which one pollutes shared state
+- `bash scripts/find-polluter.sh <file_to_check> <test_pattern>` — bisect tests to find which one pollutes shared state
 
 ## Related skills
 

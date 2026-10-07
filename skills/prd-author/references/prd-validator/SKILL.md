@@ -27,7 +27,7 @@ Reading the PRD and judging it "looks complete" is not validation. A score from 
 
 ```
 1. LOCATE  Find the PRD. No path given -> check ./PRD.md; if absent, ask the user.
-2. RUN     python scripts/validate_prd.py <path> --verbose
+2. RUN     python3 scripts/validate_prd.py <path> --verbose
            Draft / work-in-progress: add --draft (threshold drops 70 -> 50).
 3. READ    Full output: score, verdict, every ERROR, every WARNING.
 4. VERIFY  PASS (>= threshold, zero errors)?
@@ -36,7 +36,7 @@ Reading the PRD and judging it "looks complete" is not validation. A score from 
 5. ONLY THEN call the PRD ready / proceed to roadmap.
 ```
 
-Run from this skill's base directory so the relative `scripts/` path resolves (the script is bundled alongside this file at `scripts/validate_prd.py`). Exit code 0 = PASS, 1 = NEEDS WORK.
+Run from this skill's base directory so the relative `scripts/` path resolves (the script is bundled alongside this file; run it as `python3 scripts/validate_prd.py`). Exit code 0 = PASS, 1 = NEEDS WORK.
 
 ## Checks Performed (17)
 
@@ -69,7 +69,7 @@ These thoughts or words mean stop and run the gate:
 - "It passed last time" / "I validated an earlier draft" — stale run
 - "Close enough to hand off" with open ERRORs unresolved
 - "I'll just report a score" you did not get from the script
-- About to invoke prd-to-roadmap on a PRD you never validated this message
+- About to start the prd-to-roadmap stage on a PRD you never validated this message
 - "Skip the script, I know PRDs" — the script is the evidence, not your taste
 
 ## Excuse → Reality
@@ -112,7 +112,7 @@ When the PRD scores NEEDS WORK, make each ERROR a TodoWrite entry, fix them, the
 ## Integration
 
 - Called by constellation:prd-author — invoked automatically after a PRD is created or iterated. (REQUIRED SUB-SKILL for prd-author's completion gate.)
-- Gates constellation:prd-to-roadmap — that skill refuses to proceed unless the PRD passed this validator. Do not enter roadmap translation on an unvalidated PRD.
+- Gates the prd-to-roadmap stage (`references/prd-to-roadmap/SKILL.md` in `constellation:prd-author`) — that stage refuses to proceed unless the PRD passed this validator. Do not enter roadmap translation on an unvalidated PRD.
 - Tool portability (Codex tool names): see the plugin's `skills/_shared/platform/codex-tools.md`.
 
 ## The Bottom Line

@@ -187,8 +187,9 @@ feedback.
   mostly-independent tasks in one session with per-task review.
 - Pairs with constellation:systematic-debugging — confirm each domain is genuinely
   independent before splitting.
-- Routes work to whichever specialist skills the session exposes (code-review,
-  security-review, accessibility-audit, etc.).
+- Routes work to whichever specialist skills the session exposes (for example
+  `constellation:code-review`, `constellation:security-review`, or any other
+  installed skill).
 
 ## References
 

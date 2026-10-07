@@ -136,4 +136,4 @@ After all behaviors are implemented and all cycles complete:
 2. Report: total tests, pass count, fail count, any warnings.
 3. If coverage tooling is available, run it and report the delta.
 4. Walk `skills/test-driven-development/references/verification-checklist.md` and confirm each item.
-5. Suggest requesting code review (`constellation:requesting-code-review`) before committing.
+5. Suggest a code review (`constellation:code-review`; dispatch guide `references/requesting-code-review/SKILL.md`) before committing.

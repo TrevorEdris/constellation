@@ -63,10 +63,10 @@ Mark changes until the next validation pass clears them:
 - `[SPLIT into FR-XXX, FR-YYY]` — requirement split into multiple
 - `[MERGED into FR-XXX]` — requirement absorbed into another
 
-After running `constellation:prd-validator` and confirming PASS, remove the markers.
+After running the `references/prd-validator/SKILL.md` guide in `constellation:prd-author` and confirming PASS, remove the markers.
 
 ---
 
 ## Re-validation
 
-Always re-run `constellation:prd-validator` after any iteration. If the PRD previously passed and now fails, the iteration introduced a gap — address it before handing off.
+Always re-run the `references/prd-validator/SKILL.md` guide in `constellation:prd-author` after any iteration. If the PRD previously passed and now fails, the iteration introduced a gap — address it before handing off.

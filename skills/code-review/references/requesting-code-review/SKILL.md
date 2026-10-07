@@ -126,8 +126,7 @@ Untracked review findings get skipped — every time.
 
 - REQUIRED SUB-SKILL: constellation:code-review — the reviewer this skill
   dispatches; supplies the review framework and severity rubric.
-- Called by constellation:subagent-driven-development — review after each task,
-  and by constellation:executing-plans — review after each batch.
+- Called by constellation:subagent-driven-development — review after each task.
 - Pairs with constellation:receiving-code-review — how to triage and act on the
   feedback returned.
 - REQUIRED BACKGROUND: constellation:verification-before-completion — the
