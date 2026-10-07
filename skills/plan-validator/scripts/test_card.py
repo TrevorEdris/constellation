@@ -18,6 +18,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import NamedTuple
 
 import pytest
 
@@ -471,3 +472,213 @@ def test_render_cli_usage_error_exits_64(args):
     result = _run_cli(*args)
     assert (result.returncode, result.stdout) == (64, "")
     assert "usage:" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# Reply classifier: the G1 corpus, the hedge list, the reply grammar
+# ---------------------------------------------------------------------------
+
+CORPUS = FIXTURES / "g1-replies.txt"
+CORPUS_QUESTIONS = 4  # three questions and Run: the most a card holds
+# The dir name holds a HEDGE token (Remove): only stripping the path first lets this plan's own path approve
+PLAN_DIR = "2026-10-07_Add-Remove-Button"
+PLAN_PATH = f"/work/proj/.ai/sessions/{PLAN_DIR}/PLAN.md"
+OTHER_PLAN_PATH = "/work/proj/.ai/sessions/2026-10-08_Other-Plan/PLAN.md"
+
+# The 37 replies from the G1 study, and the labels they must keep (pinned here, not read from the fixture)
+G1_IDS = [f"A{n}" for n in range(1, 11)] + [f"S2-{n:02d}" for n in range(1, 28)]
+G1_AMBIGUOUS = {"A1", "A3", "A4", "S2-09", "S2-12", "S2-23"}
+NEGATIVES = {
+    **{cid: "change" for cid in ("C1", "C2", "C3", "C4", "C6", "C10", "N1", "N2", "N3")},
+    "C5": "ambiguous",
+}
+
+# Literal copies of the GC11 word lists, so deleting a word from card.py fails a test.
+# `won't` stands for the `\w+n't` rule.
+APPROVAL = ["go ahead", "looks good", "ship it", "approved", "approve", "lgtm", "go", "yes", "implement", "execute", "proceed", "begin", "start", "embark"]
+HEDGE = [
+    "not", "no", "never", "dont", "don't", "do not", "won't", "wait", "hold", "stop", "pause", "but", "except", "instead",
+    "rather", "however", "although", "though", "unless", "until", "yet", "actually", "nope", "nah", "why", "what", "how",
+    "change", "revise", "rework", "redo", "fix", "before", "first", "later", "without", "remove", "drop",
+]
+FILLER = [
+    "the", "a", "an", "this", "that", "it", "its", "plan", "plans", "with", "and", "then", "now", "please", "all", "every",
+    "default", "defaults", "to", "on", "of", "for", "as", "is", "i", "we", "you", "lets", "let's", "ok", "okay", "sure",
+    "thanks", "thank", "great", "implementation", "journey", "ahead", "rest", "everything", "else",
+]
+# Words that make a numbered answer ambiguous, whatever else the reply says
+UNSURE = ["but", "except", "instead", "rather", "however", "unless", "until", "wait", "hold", "not sure", "unsure", "maybe", "skip"]
+
+
+class _Row(NamedTuple):
+    expected: str
+    source: str
+    reply: str
+    note: str
+
+
+def _corpus() -> list:
+    rows = []
+    for number, line in enumerate(CORPUS.read_text(encoding="utf-8").splitlines(), 1):
+        if not line or line.startswith("#"):
+            continue
+        columns = line.split("\t")
+        assert len(columns) in (3, 4), f"{CORPUS.name} line {number}: want expected, source, reply[, note]"
+        rows.append(_Row(*columns, *([""] if len(columns) == 3 else [])))
+    return rows
+
+
+def _classify_row(row: _Row):
+    return card.classify_reply(row.reply.replace("{plan}", PLAN_PATH), CORPUS_QUESTIONS, PLAN_PATH)
+
+
+def test_corpus_has_37_g1_replies():
+    rows = _corpus()
+    assert len({row.source for row in rows}) == len(rows) == 47, "ids are unique; 37 G1 replies and 10 negatives"
+    g1 = {row.source: row.expected for row in rows if row.source in G1_IDS}
+    assert sorted(g1) == sorted(G1_IDS)
+    assert {source for source, expected in g1.items() if expected != "approve"} == G1_AMBIGUOUS
+    assert {expected for source, expected in g1.items() if source in G1_AMBIGUOUS} == {"ambiguous"}
+    assert sum(expected == "approve" for expected in g1.values()) == 31
+    assert {row.source: row.expected for row in rows if row.source not in G1_IDS} == NEGATIVES
+
+
+def test_corpus_zero_false_accepts():
+    # No reply the user did not mean as a plain yes may approve. The 16 are every row not labelled approve.
+    rows = [row for row in _corpus() if row.expected != "approve"]
+    assert len(rows) == 16
+    offenders = [f"{row.source}: {row.reply[:60]!r}" for row in rows if _classify_row(row).kind == "approve"]
+    assert offenders == [], "false accepts"
+
+
+def test_corpus_matches_expected_labels():
+    wrong = []
+    for row in _corpus():
+        result = _classify_row(row)
+        if result.kind != row.expected:
+            wrong.append(f"{row.source}: want {row.expected}, got {result.kind} ({result.reason})")
+    assert wrong == []
+
+
+@pytest.mark.parametrize("token", HEDGE)
+def test_every_hedge_token_blocks_approval(token):
+    # A hedge makes the reply a change request. An unlisted word would only make it ambiguous, so the
+    # kind is checked exactly: that is what fails when a token is deleted from card.py
+    result = card.classify_reply(f"go, {token}", 3)
+    assert result.kind == "change", result
+    assert result.answers == {}
+
+
+@pytest.mark.parametrize("phrase", APPROVAL)
+def test_every_approval_phrase_approves(phrase):
+    assert card.classify_reply(phrase, 3).kind == "approve"
+    assert card.classify_reply(phrase.upper() + ".", 3).kind == "approve"
+
+
+@pytest.mark.parametrize("word", FILLER)
+def test_every_filler_word_is_ignored(word):
+    # After a comma, so a filler word that also ends an approval phrase (go ahead) is read on its own
+    assert card.classify_reply(f"go, {word}", 3).kind == "approve"
+
+
+@pytest.mark.parametrize("word", UNSURE)
+def test_every_unsure_word_makes_an_answer_ambiguous(word):
+    result = card.classify_reply(f"2 {word}, go", 3)
+    assert (result.kind, result.answers) == ("ambiguous", {}), result
+
+
+def _approve(answers=None):
+    """The (kind, answers) pair of an approval, to unpack into a test_reply_grammar row."""
+    return ("approve", answers or {})
+
+
+@pytest.mark.parametrize(
+    ("reply", "questions", "kind", "answers"),
+    [
+        # Numbered answers
+        pytest.param("2 no, go", 3, *_approve({2: "no"}), id="answer-no"),
+        pytest.param("3 inline", 3, *_approve({3: "inline"}), id="answer-alone"),
+        pytest.param("2 PostgreSQL, go", 3, *_approve({2: "PostgreSQL"}), id="answer-keeps-case"),
+        pytest.param("3 inline.", 3, *_approve({3: "inline"}), id="answer-trailing-period"),
+        pytest.param("(2) no; 3: inline; go", 3, *_approve({2: "no", 3: "inline"}), id="leaders-and-semicolons"),
+        pytest.param("2) no\n3= inline\ngo", 3, *_approve({2: "no", 3: "inline"}), id="leaders-and-newlines"),
+        pytest.param(
+            "1. option 3, 2. option 3, 3. ... rest looks good, 4. option 1, 5. yes, 6. option 1",
+            6,
+            *_approve({1: "option 3", 2: "option 3", 3: "... rest looks good", 4: "option 1", 5: "yes", 6: "option 1"}),
+            id="dream-004-shape",
+        ),
+        pytest.param("2 PostgreSQL with pooled connections and replicas, go", 3, *_approve({2: "PostgreSQL with pooled connections and replicas"}), id="answer-of-6-words"),
+        pytest.param("2 PostgreSQL with pooled connections and read replicas, go", 3, "ambiguous", {}, id="answer-of-7-words"),
+        pytest.param("go 3 inline", 3, "ambiguous", {}, id="answer-after-go-is-text"),
+        pytest.param("4 yes, go", 3, "ambiguous", {}, id="answer-above-count"),
+        pytest.param("0 yes, go", 3, "ambiguous", {}, id="answer-below-one"),
+        pytest.param("2 no but only admins, go", 3, "ambiguous", {}, id="answer-with-but"),
+        pytest.param("2 maybe, go", 3, "ambiguous", {}, id="answer-maybe"),
+        pytest.param("2 not sure, go", 3, "ambiguous", {}, id="answer-not-sure"),
+        pytest.param("2 unsure, go", 3, "ambiguous", {}, id="answer-unsure"),
+        pytest.param("2 skip, go", 3, "ambiguous", {}, id="answer-skip"),
+        # Approval words only
+        pytest.param("approved, go ahead and implement", 3, *_approve(), id="approval-phrases"),
+        pytest.param("Plan LGTM. Proceed with implementation.", 3, *_approve(), id="approval-sentences"),
+        pytest.param("ok", 3, "ambiguous", {}, id="filler-only"),
+        pytest.param("", 3, "ambiguous", {}, id="empty"),
+        pytest.param("  \n ", 3, "ambiguous", {}, id="blank"),
+        pytest.param("go, nothing", 3, "ambiguous", {}, id="hedge-is-a-whole-word"),
+        pytest.param("go '", 3, *_approve(), id="lone-apostrophe-is-not-a-word"),
+        pytest.param("ship. it", 3, "ambiguous", {}, id="phrase-is-not-joined-across-a-period"),
+        # Hedges and questions
+        pytest.param("go?", 3, "change", {}, id="question-mark"),
+        pytest.param("GO, WAIT", 3, "change", {}, id="hedge-any-case"),
+        pytest.param("go, don’t", 3, "change", {}, id="curly-apostrophe"),
+        # Plan paths: stripped before the hedge scan
+        pytest.param("Implement plan {plan}", 3, *_approve(), id="own-path"),
+        pytest.param("Implement plan {plan}.", 3, *_approve(), id="own-path-then-period"),
+        pytest.param("Implement plan {plan}, wait", 3, "change", {}, id="own-path-then-hedge"),
+        pytest.param("Implement plan {dir}", 3, *_approve(), id="own-dir-name"),
+        pytest.param("Implement plan {other}", 3, "ambiguous", {}, id="other-path"),
+    ],
+)
+def test_reply_grammar(reply, questions, kind, answers):
+    reply = reply.replace("{plan}", PLAN_PATH).replace("{dir}", PLAN_DIR).replace("{other}", OTHER_PLAN_PATH)
+    result = card.classify_reply(reply, questions, PLAN_PATH)
+    assert (result.kind, result.answers) == (kind, answers), result
+    assert result.reason, "every result says why"
+
+
+def test_plan_path_is_matched_whatever_the_case():
+    shouted = f"IMPLEMENT PLAN {PLAN_PATH.upper()}"
+    assert card.classify_reply(shouted, 3, PLAN_PATH).kind == "approve"
+    assert card.classify_reply(shouted.lower(), 3, PLAN_PATH).kind == "approve"
+
+
+def test_tilde_form_of_the_plan_path_is_stripped(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    plan = tmp_path / "work" / PLAN_DIR / "PLAN.md"
+    assert card.classify_reply(f"Implement plan ~/work/{PLAN_DIR}/PLAN.md", 3, str(plan)).kind == "approve"
+    # A plan outside the home dir has no ~/ form, and its path is not the one named
+    assert card.classify_reply(f"Implement plan ~/work/{PLAN_DIR}/PLAN.md", 3, PLAN_PATH).kind == "ambiguous"
+
+
+def test_plan_md_is_stripped_without_a_plan_path():
+    assert card.classify_reply("Implement PLAN.md", 3).kind == "approve"
+
+
+@pytest.mark.parametrize(
+    ("reply", "plan_path"),
+    [
+        ("yesok", "/work/ok/PLAN.md"),
+        ("okyes", "/work/ok/PLAN.md"),
+        ("yesplan.md", None),
+        ("plan.mdyes", None),
+    ],
+)
+def test_a_name_inside_a_longer_word_is_not_stripped(reply, plan_path):
+    # Cutting the dir name or plan.md out of a longer word would leave a bare "yes" to approve
+    assert card.classify_reply(reply, 3, plan_path).kind == "ambiguous"
+
+
+def test_answers_are_returned_only_for_an_approval():
+    assert card.classify_reply("2 no, go", 3).answers == {2: "no"}
+    for reply in ("2 no, go, wait", "2 maybe, go", "2 no, but go", "2 no, go 3 inline"):
+        assert card.classify_reply(reply, 3).answers == {}, reply

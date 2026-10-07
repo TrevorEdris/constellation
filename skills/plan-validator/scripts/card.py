@@ -20,6 +20,9 @@ The card is the Brief, verbatim, between an ask line and a footer:
 The check time is when `render` re-probed the delivery repos with git. It is
 printed, never stored. sha7 is brief_sha7 of the Brief.
 
+classify_reply reads the user's chat reply to that card and decides whether it
+approves the plan, asks for a change, or is too unclear to act on.
+
 Exit codes:
     0  - the card was printed (or the plan needs no approval)
     1  - the plan is invalid, legacy or does not pass: the reasons are on stderr
@@ -29,12 +32,13 @@ Exit codes:
 import argparse
 import hashlib
 import os
+import re
 import shutil
 import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import NamedTuple, Optional
 
 from validate_plan import (
     CARD_PAST_APPROVAL_STATUSES,
@@ -219,6 +223,206 @@ def render(path, write: bool = True) -> tuple[str, str, int]:
         except OSError as exc:
             return "", f"ERROR [io] Cannot write {plan}: {exc.strerror or exc}\n", EXIT_REFUSED
     return "\n".join(out) + "\n", "", EXIT_OK
+
+
+# ---------------------------------------------------------------------------
+# The reply classifier
+# ---------------------------------------------------------------------------
+
+APPROVE = "approve"
+CHANGE = "change"
+AMBIGUOUS = "ambiguous"
+
+# The classifier only approves a reply made of approval phrases, filler and numbered answers, so a
+# word on none of these lists (a new instruction, a name, a qualifier) makes the reply ambiguous.
+# Every match is on whole tokens of the lowercased reply, with the curly apostrophe made straight.
+
+# A reply must hold one of these (or a numbered answer) to approve. Multi-word phrases come first.
+APPROVAL = (
+    "go ahead", "looks good", "ship it", "approved", "approve", "lgtm", "go", "yes",
+    "implement", "execute", "proceed", "begin", "start", "embark",
+)
+
+# Any of these in the text of a reply means the user is holding back or changing something: a change request.
+# "do not" is already caught by "not"; it is listed so this list reads as the GC11 list.
+HEDGE_WORDS = frozenset((
+    "not", "no", "never", "dont", "don't", "wait", "hold", "stop", "pause", "but", "except", "instead", "rather",
+    "however", "although", "though", "unless", "until", "yet", "actually", "nope", "nah", "why", "what", "how",
+    "change", "revise", "rework", "redo", "fix", "before", "first", "later", "without", "remove", "drop",
+))
+HEDGE_PHRASES = ("do not",)
+_CONTRACTION_RE = re.compile(r"\w+n't")  # won't, shouldn't, isn't: any negated contraction is a hedge
+
+# Words that may sit beside an approval without changing what it means.
+FILLER = frozenset((
+    "the", "a", "an", "this", "that", "it", "its", "plan", "plans", "with", "and", "then", "now", "please", "all",
+    "every", "default", "defaults", "to", "on", "of", "for", "as", "is", "i", "we", "you", "lets", "let's", "ok",
+    "okay", "sure", "thanks", "thank", "great", "implementation", "journey", "ahead", "rest", "everything", "else",
+))
+
+# A numbered answer holding one of these, or running past MAX_ANSWER_WORDS, is not a clean answer.
+UNSURE_WORDS = frozenset((
+    "but", "except", "instead", "rather", "however", "unless", "until", "wait", "hold", "unsure", "maybe", "skip",
+))
+UNSURE_PHRASES = ("not sure",)
+MAX_ANSWER_WORDS = 6
+
+_TOKEN_RE = re.compile(r"[\w']+")
+_CHUNK_SPLIT_RE = re.compile(r"[,;\n]")
+_SENTENCE_END_RE = re.compile(r"\.(?=\s|$)")
+# "2 no", "2. no", "(2) no", "2: no", "2= no": a question number, then its answer
+_ANSWER_RE = re.compile(r"^\(?(\d{1,2})[.):=]?\s+(\S.*?)\.?$")
+
+
+class Classification(NamedTuple):
+    """What a reply means. kind is approve, change or ambiguous; reason says why, for logs and test failures.
+
+    answers maps a question number to the user's answer, in the reply's own case. It is empty
+    unless kind is approve: a reply that is not an approval gives nothing to apply.
+    """
+
+    kind: str
+    answers: dict[int, str]
+    reason: str
+
+
+def _tokens(text: str) -> list[str]:
+    """The lowercased words of text: runs of word characters and apostrophes, with ’ made '.
+
+    A run of apostrophes alone is not a word and is dropped.
+    """
+    return [tok for tok in _TOKEN_RE.findall(text.lower().replace("’", "'")) if tok.strip("'")]
+
+
+def _phrase_at(tokens: list[str], start: int, phrase: str) -> bool:
+    """Whether the words of phrase are the tokens that begin at start."""
+    words = phrase.split()
+    return tokens[start : start + len(words)] == words
+
+
+def _first_hedge(tokens: list[str]) -> Optional[str]:
+    """The first hedge token or phrase in tokens, or None."""
+    for n, tok in enumerate(tokens):
+        if tok in HEDGE_WORDS or _CONTRACTION_RE.fullmatch(tok):
+            return tok
+        for phrase in HEDGE_PHRASES:
+            if _phrase_at(tokens, n, phrase):
+                return phrase
+    return None
+
+
+def _first_unsure(tokens: list[str]) -> Optional[str]:
+    """The first uncertainty word or phrase in tokens, or None."""
+    for n, tok in enumerate(tokens):
+        if tok in UNSURE_WORDS:
+            return tok
+        for phrase in UNSURE_PHRASES:
+            if _phrase_at(tokens, n, phrase):
+                return phrase
+    return None
+
+
+def _strip_approval(tokens: list[str]) -> tuple[bool, list[str]]:
+    """(whether an approval phrase was found, the tokens that are neither approval nor filler)."""
+    found = False
+    left = []
+    n = 0
+    while n < len(tokens):
+        phrase = next((p for p in APPROVAL if _phrase_at(tokens, n, p)), None)
+        if phrase:
+            found = True
+            n += len(phrase.split())
+            continue
+        if tokens[n] not in FILLER:
+            left.append(tokens[n])
+        n += 1
+    return found, left
+
+
+def _without_plan_path(reply: str, plan_path: Optional[str]) -> str:
+    """reply with the plan's path, its ~/ form, its directory's name and `plan.md` taken out, whatever their case.
+
+    Saying which plan to run ("Implement plan <path>") is not a qualifier, and a directory name such
+    as 2026-10-07_Add-Remove-Button would otherwise read as a hedge. The longest forms go first.
+    """
+    patterns = []
+    if plan_path:
+        path = str(plan_path)
+        patterns.append(re.escape(path))
+        home = os.path.expanduser("~").rstrip("/")
+        if home and path.startswith(home + "/"):
+            patterns.append(re.escape("~" + path[len(home) :]))
+        parent = os.path.basename(os.path.dirname(path))
+        if parent:
+            patterns.append(rf"(?<!\w){re.escape(parent)}(?!\w)")
+    patterns.append(r"(?<!\w)plan\.md(?!\w)")
+    for pattern in patterns:
+        reply = re.sub(pattern, " ", reply, flags=re.IGNORECASE)
+    return reply
+
+
+def classify_reply(reply: str, question_count: int, plan_path: Optional[str] = None) -> Classification:
+    """Decide whether a chat reply to the approval card approves the plan.
+
+    The rule is that approval must be unmistakable: anything unclear is ambiguous (the user is asked
+    to confirm) and anything held back or questioned is a change. A false approval ships a plan the
+    user did not accept; a false "ambiguous" costs one more word.
+
+    question_count is the number of numbered items on the card, Run included; "N answer" is an
+    answer only for N in 1..question_count. plan_path is the plan the card is for: a reply that
+    names it ("Implement plan <path>") still approves. Steps, the first to match wins:
+
+    1. an empty reply is ambiguous;
+    2. a "?" anywhere is a change;
+    3. the plan's path is taken out (see _without_plan_path);
+    4. the reply is cut at commas, semicolons and newlines into chunks; a chunk that is
+       "<number> <answer>" is a numbered answer, and every other chunk is cut again at sentence
+       ends into text (so "1. option 3" stays one answer);
+    5. a hedge word in the text is a change;
+    6. an answer longer than MAX_ANSWER_WORDS or holding an uncertainty word is ambiguous;
+    7. text left after approval phrases and filler are taken out is ambiguous;
+    8. no approval phrase and no answer is ambiguous;
+    9. otherwise the reply approves.
+    """
+    if not reply.strip():
+        return Classification(AMBIGUOUS, {}, "the reply is empty")
+    if "?" in reply:
+        return Classification(CHANGE, {}, "the reply asks a question")
+
+    answers: dict[int, str] = {}
+    text: list[list[str]] = []  # the tokens of each stretch of text
+    for chunk in _CHUNK_SPLIT_RE.split(_without_plan_path(reply, plan_path)):
+        chunk = chunk.strip()
+        match = _ANSWER_RE.match(chunk)
+        if match and 1 <= int(match.group(1)) <= question_count:
+            answers[int(match.group(1))] = match.group(2)  # as typed: the case is kept
+        else:
+            text.extend(_tokens(sentence) for sentence in _SENTENCE_END_RE.split(chunk))
+
+    for tokens in text:
+        hedge = _first_hedge(tokens)
+        if hedge:
+            return Classification(CHANGE, {}, f'the reply says "{hedge}"')
+
+    for number, answer in answers.items():
+        tokens = _tokens(answer)
+        if len(tokens) > MAX_ANSWER_WORDS:
+            return Classification(AMBIGUOUS, {}, f"answer {number} is longer than {MAX_ANSWER_WORDS} words")
+        unsure = _first_unsure(tokens)
+        if unsure:
+            return Classification(AMBIGUOUS, {}, f'answer {number} says "{unsure}"')
+
+    approved = False
+    left: list[str] = []
+    for tokens in text:
+        found, rest = _strip_approval(tokens)
+        approved = approved or found
+        left.extend(rest)
+    if left:
+        return Classification(AMBIGUOUS, {}, f"the reply says more than an approval: {' '.join(left)}")
+    if not approved and not answers:
+        return Classification(AMBIGUOUS, {}, "the reply has no approval phrase and no numbered answer")
+    return Classification(APPROVE, answers, "approval phrase" if approved else "numbered answers")
 
 
 # ---------------------------------------------------------------------------

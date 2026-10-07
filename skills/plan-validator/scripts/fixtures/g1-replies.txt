@@ -1,0 +1,55 @@
+# Replies for card.py classify_reply: what the user types after an approval card, and the label each must get.
+# Columns, tab-separated: expected, source, reply, then an optional note.
+#   expected: approve, change or ambiguous.
+#   source:   the reply's id in the G1 study of how the user approves plans. A = replies read from chat transcripts,
+#             S2 = replies logged in session notes, C = corrections the user made later, N = other replies the study quotes.
+# {plan} stands for the plan's path. Replies are verbatim unless a note says otherwise. C9 is left out: profanity.
+# A1-A10 and S2-01..S2-27 are the 37 replies given at an approval gate: 31 approve, 6 ambiguous.
+# The other 10 rows (C, N) are replies that must never approve.
+ambiguous	A1	I approve option C from your questions
+approve	A2	go
+ambiguous	A3	Use a dynamic workflow to orchestrate the implementation of Phase 0 according to the plans. Use the smallest sub-agents appropriate for the tasks. You, as the orchestrator, have permission to merge PRs after they've gone through an appropriate level of validation. After this dynamic workflow ends, I expect Phase 0 to be completed and on the main branch of the wishlist-go repo.
+ambiguous	A4	I accept all four ADRs. Use a dynamic workflow to orchestrate the implementation of Phase 1 according to the plans. Use the smallest sub-agents appropriate for the tasks. You, as the orchestrator, have permission to merge PRs after they've gone through an appropriate level of validation. After this dynamic workflow ends, I expect Phase 1 to be completed and on the main branch of the wishlist-go repo.	The study elides the delegation after the first sentence ("[same delegation text]"); rebuilt from A3 with Phase 1.
+approve	A5	approved
+approve	A6	Approved, begin
+approve	A7	implement
+approve	A8	plan LGTM, execute
+approve	A9	approved, go ahead and implement
+approve	A10	approved, go ahead and implement
+approve	S2-01	Proceed with the Journey
+approve	S2-02	Proceed with The Journey
+approve	S2-03	Embark on The Journey
+approve	S2-04	Plan looks good, implement
+approve	S2-05	Execute the plan.
+approve	S2-06	Implement the plan.
+approve	S2-07	Yes	Approved a revised plan.
+approve	S2-08	Approved plan. Proceed.
+ambiguous	S2-09	Go with Option A and move to the next phase.
+approve	S2-10	Plan LGTM. Proceed with implementation.
+approve	S2-11	implement
+ambiguous	S2-12	Plan LGTM. Confirmed both New Game paths (normal + debug fast-start) should start in rehab center.
+approve	S2-13	plan lgtm
+approve	S2-14	Implement plan
+approve	S2-15	Implement the plan
+approve	S2-16	Plan lgtm, begin.
+approve	S2-17	Implement plan
+approve	S2-18	implement {plan}	The log quotes an absolute plan path; {plan} stands for it.
+approve	S2-19	Implement plan {plan}	The log quotes a relative plan path; {plan} stands for it.
+approve	S2-20	Implement plan {plan}	The log quotes a relative plan path; {plan} stands for it.
+approve	S2-21	Implement plan {plan}	The log quotes a relative plan path; {plan} stands for it.
+approve	S2-22	Implement.
+ambiguous	S2-23	Begin Wave 1.
+approve	S2-24	Implement the plan
+approve	S2-25	Implement plan {plan}	The study elides the path ("Implement plan ...PLAN.md"); {plan} stands for it.
+approve	S2-26	Approved. Proceed.
+approve	S2-27	Implement
+change	C1	you merged to main _locally_? you didn't go with a PR-based approach
+change	C2	55 skills????? 23 agents 20 rules???? that's so much. I expected some to be cut based on my actual usage... I don't need bloat like infra-specific skills.	The study's "JFC bro," between "rules????" and "that's" is dropped.
+change	C3	Why do we need the install.sh script? Isn't it set up as a claude code plugin?
+change	C4	claude code marketplace json shouldn't be referencing local development and shouldn't be directly referencing superpowers or fellowship-of-the-workflows.
+ambiguous	C5	I see `IaC | CDK (TypeScript) app`. ... I want the backend to be built with Golang.	A correction with no negation and no question; the user's words are elided in the study ("...").
+change	C6	What is SAM? Why that over Terraform? I already have a terraform repo...	The study elides the end of the reply ("...").
+change	C10	I don't believe it's functional.
+change	N1	DO NOT open a PR upstream. DO NOT TOUCH UPSTREAM.	Quoted by the study outside its correction list.
+change	N2	What input do you need from me before we begin building this locally?	Quoted by the study outside its correction list.
+change	N3	don't implement yet, 2 should be yes	An example from the acceptance criteria, not a logged reply: a negation next to a numbered answer.
