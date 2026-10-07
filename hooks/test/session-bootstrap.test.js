@@ -504,5 +504,11 @@ test('scaffold failure surfaces systemMessage', () => {
   assert.ok(res.json.systemMessage.startsWith(MESSAGE_PREFIX), res.json.systemMessage);
   const reason = res.json.systemMessage.slice(MESSAGE_PREFIX.length);
   assert.ok(reason.trim().length > 0 && !reason.includes('\n'), `reason must be one non-empty line: ${JSON.stringify(reason)}`);
+  // The reason is the script's own first stderr line, not Node's wrapper
+  // ("Command failed: bash <script> <slug> <ticket> <id>"), which would hide the
+  // cause and echo the session id.
+  assert.ok(reason.startsWith('new-session.sh: '), `reason is not the script's stderr: ${JSON.stringify(reason)}`);
+  assert.match(reason, /cannot create session root/);
+  assert.ok(!reason.includes('Command failed'), `reason is Node's error wrapper: ${JSON.stringify(reason)}`);
   assert.equal(fs.readFileSync(blocker, 'utf8'), 'not a dir\n');
 });
