@@ -20,26 +20,43 @@
  * A segment is one simple command: the text between unquoted `; && || | |& &`, newline, `(`
  * and `)`. `{`, `}` and `!` stay ordinary words (a later layer strips them in command
  * position), so `{}`, `{a,b}` and `${X}` pass through untouched. Segments that carry no words,
- * redirects or substitutions are not reported.
+ * redirects or substitutions are not reported. A newline right after `|` or `|&` does not end
+ * the pipeline, so a command split over two lines (`a |` newline `b`) keeps one `pipeline`.
  *
  * Substitution bodies are not parsed here. Each one is found by scanning to its matching `)`
- * (honoring quotes, heredocs and nested parens), stored raw in `substs`, and replaced by an
- * empty string in its word; a later layer re-parses the bodies. `$((...))` is arithmetic and
- * is skipped, though a `$(...)` nested inside it is still reported.
+ * (honoring quotes, heredocs, nested parens and `case` patterns), stored raw in `substs`, and
+ * replaced by an empty string in its word; a later layer re-parses the bodies.
+ *
+ * Arithmetic. `$((...))` and a command-leading `((...))` are skipped, though a `$(...)` nested
+ * inside one is still reported. Bash calls `((` arithmetic only when the `)` that closes the
+ * second paren is immediately followed by another `)`; otherwise `$((cat x) | sh)` is a
+ * substitution and `((a); b)` is nested subshells. arithClose makes the same call with a
+ * look-ahead over quotes and parens, so neither reading can hide a command and a `<<` inside
+ * `((x=1<<2))` is not taken for a heredoc. The look-ahead has a total work budget of 16
+ * passes over the input; past it the `((` is read as parens or a substitution and `overflow`
+ * is set.
  *
  * scan never throws. Unterminated quotes, substitutions and heredocs close at end of input.
  * Substitutions nested more than MAX_NEST deep are not followed: the rest of the input becomes
  * that body and `overflow` is set so the caller can treat the command as unparsed.
  *
- * Known gaps, kept out on purpose: `${...}` is not parsed as a unit (so `${X:-a b}` splits on
- * the space), and `((...))` at the start of a command is read as two subshell parens.
+ * Known gaps, kept out on purpose:
+ *   - `${...}` is not parsed as a unit (so `${X:-a b}` splits on the space).
+ *   - `((` is arithmetic only where a command can start. After a keyword (`while ((`, `do ((`,
+ *     `for ((`) it is still read as two subshell parens, so a `<<` inside it opens a heredoc.
+ *   - `case` patterns are followed by a small state machine (`case WORD in`, then `)` ends a
+ *     pattern until the next `;;`, `;&`, `;;&` or `esac`). It does not follow extglob patterns
+ *     (`@(a|b)`), a `)` inside a bracket expression (`[)]`), or `in` on a line of its own.
  */
 
 const MAX_NEST = 16;
+// Reserved words after which a command can still start, so `then case x in` is a case command.
+const LEAD_WORDS = new Set(['if', 'then', 'elif', 'else', 'while', 'until', 'do', '{', '!', 'time']);
 
 function scan(cmd) {
   const src = typeof cmd === 'string' ? cmd : '';
-  const state = { overflow: false };
+  // `work` and `limit` meter the arithmetic look-ahead (see arithEnd).
+  const state = { overflow: false, work: 0, limit: 16 * src.length + 1024 };
   const { segments } = run(src, 0, 0, false, state);
   // run keeps a heredoc's segment alive until the body is read; drop it if nothing attached.
   return {
@@ -69,8 +86,39 @@ function run(src, start, depth, untilParen, st) {
   // What the next completed word is for after a redirect operator: {kind:'redir',op},
   // {kind:'dup',op} (>&WORD, <&WORD), {kind:'heredoc',strip} or {kind:'skip'} (<<<).
   let pending = null;
+  // The last separator was `|` or `|&`, so a newline next continues that pipeline.
+  let afterPipe = false;
+  // `case WORD in ... esac` tracking. `lead`: no command word yet in this segment (reserved
+  // words like `then` do not count). `caseWords`: words seen since `case` (3 = `case WORD in`).
+  // `cases`: open case commands; `pattern` is true between `in` / `;;` and a pattern's `)`.
+  let lead = true;
+  let caseWords = 0;
+  const cases = [];
 
   const addSubst = (body) => { seg.substs.push(body); };
+  const isEmpty = () => !inWord && !pending && !keepSeg
+    && !seg.words.length && !seg.redirects.length && !seg.substs.length;
+  // The innermost open case command, if it was opened at this paren level.
+  const caseHere = () => {
+    const k = cases[cases.length - 1];
+    return k && k.parens === parens ? k : null;
+  };
+
+  // A pattern's `)` must not close an enclosing `$(...)`, so the scanner has to know when it is
+  // between `case WORD in` and the pattern's `)`. `esac` in command position ends the case.
+  function noteWord() {
+    if (caseWords) {
+      if (++caseWords === 3) {
+        caseWords = 0;
+        if (!quoted && cur === 'in') cases.push({ parens, pattern: true });
+      }
+    } else if (lead) {
+      if (quoted) lead = false;
+      else if (cur === 'case') { caseWords = 1; lead = false; }
+      else if (cur === 'esac') { if (caseHere()) cases.pop(); lead = false; }
+      else if (!LEAD_WORDS.has(cur)) lead = false;
+    }
+  }
 
   function flushWord() {
     if (inWord) {
@@ -78,6 +126,7 @@ function run(src, start, depth, untilParen, st) {
       pending = null;
       if (!p) {
         seg.words.push(cur);
+        noteWord();
       } else if (p.kind === 'redir') {
         seg.redirects.push({ op: p.op, target: cur });
       } else if (p.kind === 'dup') {
@@ -100,6 +149,9 @@ function run(src, start, depth, untilParen, st) {
     if (!samePipeline) pipeline++;
     seg = { words: [], redirects: [], pipeline, substs: [] };
     keepSeg = false;
+    lead = true;
+    caseWords = 0;
+    afterPipe = samePipeline;
   }
 
   // Read the bodies of every pending heredoc, in order, starting at `pos` (just after a
@@ -192,7 +244,8 @@ function run(src, start, depth, untilParen, st) {
     if (c === ' ' || c === '\t') { flushWord(); i++; continue; }
 
     if (c === '\n') {
-      endSegment(false);
+      // Right after `|` or `|&` the next line is the next pipeline member, not a new pipeline.
+      endSegment(afterPipe && isEmpty());
       i = readHeredocBodies(i + 1);
       continue;
     }
@@ -204,7 +257,14 @@ function run(src, start, depth, untilParen, st) {
       continue;
     }
 
-    if (c === ';') { endSegment(false); i++; continue; }
+    if (c === ';') {
+      endSegment(false);
+      // `;;`, `;&` and `;;&` end a case arm: the next thing is a pattern list again.
+      const k = caseHere();
+      if (k && (src[i + 1] === ';' || src[i + 1] === '&')) k.pattern = true;
+      i++;
+      continue;
+    }
 
     if (c === '&') {
       if (src[i + 1] === '&') { endSegment(false); i += 2; continue; }
@@ -222,14 +282,31 @@ function run(src, start, depth, untilParen, st) {
 
     if (c === '|') {
       if (src[i + 1] === '|') { endSegment(false); i += 2; continue; }
+      const k = caseHere();
+      if (k && k.pattern) { flushWord(); i++; continue; } // `a|b)` separates case patterns
       endSegment(true);
       i += src[i + 1] === '&' ? 2 : 1;
       continue;
     }
 
-    if (c === '(') { endSegment(false); parens++; i++; continue; }
+    if (c === '(') {
+      const k = caseHere();
+      if (k && k.pattern) { flushWord(); i++; continue; } // optional `(` before a case pattern
+      if (src[i + 1] === '(' && isEmpty()) {
+        // `((` opening a command is arithmetic when it closes as `))`, else two subshell parens.
+        const end = arithEnd(src, i + 2, st);
+        if (end !== -1) { i = arithmetic(src, i + 2, end, depth, st, addSubst); continue; }
+      }
+      endSegment(false);
+      parens++;
+      i++;
+      continue;
+    }
 
     if (c === ')') {
+      flushWord(); // may be `esac`, which closes its case before we look at the `)`
+      const k = caseHere();
+      if (k && k.pattern) { endSegment(false); k.pattern = false; i++; continue; }
       if (untilParen && parens === 0) {
         endSegment(false);
         return { segments, end: i };
@@ -318,13 +395,17 @@ function dqText(text, i, stopAtQuote, depth, st, addSubst) {
 /**
  * If a `$(...)`, `$((...))` or backtick expansion starts at src[i], consume it and return the
  * index after it. Command-substitution bodies go to addSubst. Returns -1 when none starts here.
+ * `$((` is arithmetic only when arithEnd says it closes as `))`; otherwise it is a substitution
+ * whose body starts with a subshell paren, as in `$((cat x) | sh)`.
  */
 function expansion(src, i, depth, st, addSubst) {
   if (src[i] === '`') return backtick(src, i + 1, addSubst);
   if (src[i] === '$' && src[i + 1] === '(') {
-    return src[i + 2] === '('
-      ? arithmetic(src, i + 3, depth, st, addSubst)
-      : substitution(src, i + 2, depth, st, addSubst);
+    if (src[i + 2] === '(') {
+      const end = arithEnd(src, i + 3, st);
+      if (end !== -1) return arithmetic(src, i + 3, end, depth, st, addSubst);
+    }
+    return substitution(src, i + 2, depth, st, addSubst);
   }
   return -1;
 }
@@ -367,26 +448,82 @@ function backtick(src, i, addSubst) {
 }
 
 /**
- * Skip `$((...))` arithmetic; `i` is just after the `$((`. A `$(...)` or backtick inside it
- * still runs, so those are reported. Returns the index after the closing `))`.
+ * Skip arithmetic whose body starts at `i` (just after `$((` or a command-leading `((`) and
+ * ends at `end`, the index after its `))` from arithEnd. A `$(...)` or backtick inside it still
+ * runs, so those are reported. Returns the index after the arithmetic.
  */
-function arithmetic(src, i, depth, st, addSubst) {
+function arithmetic(src, i, end, depth, st, addSubst) {
   if (depth + 1 > MAX_NEST) {
     st.overflow = true;
     return src.length;
   }
-  const n = src.length;
-  let level = 2;
-  while (i < n && level > 0) {
+  const stop = end - 2;
+  while (i < stop) {
     if (src[i] === '$' || src[i] === '`') {
       const e = expansion(src, i, depth + 1, st, addSubst);
       if (e !== -1) { i = e; continue; }
     }
-    if (src[i] === '(') level++;
-    else if (src[i] === ')') level--;
     i++;
   }
-  return i;
+  // Resume at `end`, not where the last nested expansion stopped: an expansion that ran past the
+  // `))` (quotes make the two scans disagree) must not hide what follows. At worst the text
+  // between is read twice, which only over-reports.
+  return end;
+}
+
+/**
+ * Decide whether a `((` or `$((` whose body starts at `i` opens arithmetic. Returns the index
+ * after the closing `))`, or -1 when it does not (the text is a subshell or a command
+ * substitution that happens to start with a paren). Each call is charged to st.work; once the
+ * budget is spent it answers -1 and sets `overflow`, which keeps hostile input such as a long
+ * run of `(` linear instead of one full look-ahead per paren.
+ */
+function arithEnd(src, i, st) {
+  if (st.work > st.limit) {
+    st.overflow = true;
+    return -1;
+  }
+  const r = arithClose(src, i);
+  st.work += r.stop - i;
+  return r.end;
+}
+
+/**
+ * Look ahead from `i` for the `)` that closes the second paren of `((`. Quotes and `$'...'` are
+ * skipped whole, and parens nest, including `$(` inside double quotes. Backticks are skipped only
+ * inside double quotes, which is what bash does: a bare `` `echo )` `` closes the pair early. The
+ * `)` found at depth zero closes arithmetic only if the next character is also `)`. Returns
+ * {end, stop}: the index after `))` (or -1) and how far the look-ahead read.
+ */
+function arithClose(src, i) {
+  const n = src.length;
+  const open = []; // innermost last: '(' for a paren or `$(`, '"' for an open double quote
+  while (i < n) {
+    const c = src[i];
+    if (c === '\\') { i += 2; continue; }
+    if (open[open.length - 1] === '"') {
+      if (c === '"') open.pop();
+      else if (c === '`') { i = skipTo(src, i + 1, '`'); continue; }
+      else if (c === '$' && src[i + 1] === '(') { open.push('('); i++; }
+      i++;
+      continue;
+    }
+    if (c === "'") { const q = src.indexOf("'", i + 1); i = q === -1 ? n : q + 1; continue; }
+    if (c === '$' && src[i + 1] === "'") { i = skipTo(src, i + 2, "'"); continue; }
+    if (c === '"' || c === '(') open.push(c);
+    else if (c === ')') {
+      if (!open.length) return { end: src[i + 1] === ')' ? i + 2 : -1, stop: Math.min(i + 1, n) };
+      open.pop();
+    }
+    i++;
+  }
+  return { end: -1, stop: n };
+}
+
+/** Index after the next unescaped `q` at or after `j`, or past the end when there is none. */
+function skipTo(src, j, q) {
+  while (j < src.length && src[j] !== q) j += src[j] === '\\' ? 2 : 1;
+  return j + 1;
 }
 
 module.exports = { scan };

@@ -15,6 +15,16 @@ const allWords = (cmd) => scan(cmd).segments.flatMap((s) => s.words);
 const substs = (cmd) => scan(cmd).segments.flatMap((s) => s.substs);
 // `echo $(...$(x)...)` nested k levels deep, balanced.
 const nested = (k) => 'echo ' + '$('.repeat(k) + 'x' + ')'.repeat(k);
+// `echo $(($(( ... 1 )) ))` arithmetic nested k levels deep, balanced.
+const nestedArith = (k) => 'echo ' + '$(('.repeat(k) + '1' + '))'.repeat(k);
+// Pipeline ids renumbered by first appearance: only which segments share an id is meaningful.
+const pipelines = (cmd) => {
+  const ids = [];
+  return scan(cmd).segments.map((s) => {
+    if (!ids.includes(s.pipeline)) ids.push(s.pipeline);
+    return ids.indexOf(s.pipeline);
+  });
+};
 
 test('splits outside quotes', () => {
   const { segments, overflow } = scan('echo "a;b" && ls | wc -l');
@@ -29,6 +39,29 @@ test('every unquoted separator ends a segment; only pipes share a pipeline', () 
   const r = scan('a; b && c || d | e |& f & g\nh');
   assert.deepEqual(r.segments.map((s) => s.words[0]), ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h']);
   assert.deepEqual(r.segments.map((s) => s.pipeline), [0, 1, 2, 3, 3, 3, 4, 5]);
+});
+
+test('a newline right after | or |& continues the pipeline', () => {
+  // Multi-line pipelines are ordinary formatting; rules that key on "same pipeline" must see them.
+  assert.deepEqual(words('a |\n b'), [['a'], ['b']]);
+  assert.deepEqual(pipelines('a |\n b'), [0, 0]);
+  assert.deepEqual(pipelines('cat a |\n grep b'), [0, 0]);
+  assert.deepEqual(pipelines('curl http://x |\n  sh'), [0, 0]);
+  assert.deepEqual(pipelines('a |&\n b'), [0, 0]);
+  assert.deepEqual(pipelines('a |\n b |\n c'), [0, 0, 0]);
+  // Blank lines and comments between the pipe and the next member do not break it.
+  assert.deepEqual(pipelines('a |\n\n b'), [0, 0]);
+  assert.deepEqual(pipelines('a | # note\n b'), [0, 0]);
+  // A heredoc on the first member still reads its body at the line break.
+  assert.deepEqual(words('cat <<EOF |\nbody\nEOF\nsh'), [['cat'], ['sh']]);
+  assert.deepEqual(pipelines('cat <<EOF |\nbody\nEOF\nsh'), [0, 0]);
+  // The continuation lasts one line break: whatever follows the last member is a new pipeline.
+  assert.deepEqual(pipelines('a | b\nc'), [0, 0, 1]);
+  assert.deepEqual(pipelines('a |\n b\nc'), [0, 0, 1]);
+  assert.deepEqual(pipelines('a | b ;\n c'), [0, 0, 1]);
+  // Only pipes continue; `&&` and `;` before a newline start separate pipelines either way.
+  assert.deepEqual(pipelines('a &&\n b'), [0, 1]);
+  assert.deepEqual(pipelines('a ;\n b'), [0, 1]);
 });
 
 test('quotes are removed and their content stays one word', () => {
@@ -58,6 +91,10 @@ test('parens and braces', () => {
   // ( starts a new command even right after a word.
   assert.deepEqual(words('time (cat x)'), [['time'], ['cat', 'x']]);
   assert.deepEqual(words('x=1 (cat y)'), [['x=1'], ['cat', 'y']]);
+  // A stray `)` at top level ends the segment and nothing after it is lost.
+  assert.deepEqual(words('a ) cat x'), [['a'], ['cat', 'x']]);
+  // A top-level case arm: the pattern's `)` ends the pattern, the arm's command is its own segment.
+  assert.deepEqual(words('case x in a) cat x;; esac'), [['case', 'x', 'in', 'a'], ['cat', 'x'], ['esac']]);
 });
 
 test('escapes', () => {
@@ -67,6 +104,10 @@ test('escapes', () => {
   assert.deepEqual(words('echo a\\\nb'), [['echo', 'ab']]);
   assert.deepEqual(words('\\rm x'), [['rm', 'x']]);
   assert.deepEqual(words('echo a\\&b \\| \\( \\#'), [['echo', 'a&b', '|', '(', '#']]);
+  // A trailing lone backslash has nothing to escape and stays.
+  assert.deepEqual(words('echo a\\'), [['echo', 'a\\']]);
+  // A tab separates words like a space.
+  assert.deepEqual(words('cat\t.env'), [['cat', '.env']]);
 });
 
 test('redirects', () => {
@@ -83,6 +124,11 @@ test('redirects', () => {
   assert.deepEqual(s.redirects, [{ op: '>', target: '/dev/null' }]);
 
   s = scan('cmd &>log').segments[0];
+  assert.deepEqual(s.words, ['cmd']);
+  assert.deepEqual(s.redirects, [{ op: '>', target: 'log' }]);
+
+  // `&>` needs no space before it: `cmd` is still a word and the target is `log`.
+  s = scan('cmd&>log').segments[0];
   assert.deepEqual(s.words, ['cmd']);
   assert.deepEqual(s.redirects, [{ op: '>', target: 'log' }]);
 
@@ -109,9 +155,10 @@ test('redirect operators normalize to < > >>', () => {
 
 test('descriptor duplication takes no target', () => {
   for (const cmd of ['c >&2', 'c 2>&1', 'c 3<&0', 'c >&-', 'c 2>&-', 'c 1>&2-']) {
-    const s = scan(cmd).segments[0];
-    assert.deepEqual(s.words, ['c'], cmd);
-    assert.deepEqual(s.redirects, [], cmd);
+    const r = scan(cmd);
+    assert.equal(r.segments.length, 1, cmd);
+    assert.deepEqual(r.segments[0].words, ['c'], cmd);
+    assert.deepEqual(r.segments[0].redirects, [], cmd);
   }
 });
 
@@ -137,6 +184,8 @@ test('heredocs', () => {
   assert.deepEqual(r.segments[0].substs, ['cat ~/.ssh/id_rsa']);
 
   assert.deepEqual(allWords('cat <<< .env'), ['cat']);
+  // A here-string word is data, not a redirect target.
+  assert.deepEqual(scan('cat <<< .env').segments[0].redirects, []);
 });
 
 test('a heredoc with no command still reports its substitutions, and nothing else', () => {
@@ -202,12 +251,141 @@ test('substitution bodies honor quotes, parens, nesting and heredocs', () => {
   assert.deepEqual(substs('echo $( (a; b) | c )'), [' (a; b) | c ']);
   assert.deepEqual(substs('echo $(a $(b))'), ['a $(b)']);
   assert.deepEqual(substs('echo `echo \\`cat x\\``'), ['echo `cat x`']);
+  // Inside backticks `\$` and `\\` lose their backslash; any other backslash pair stays.
+  assert.deepEqual(substs('echo `a \\$x \\\\y \\z`'), ['a $x \\y \\z']);
   assert.deepEqual(substs('echo ${X:-$(cat y)}'), ['cat y']);
   assert.deepEqual(substs('echo $(( $(cat x) + 1 ))'), ['cat x']);
   assert.deepEqual(substs('echo $(( (1+2) * 3 )) $(b)'), ['b']);
   assert.deepEqual(substs('echo $(cat <<EOF\n)\nEOF\n)'), ['cat <<EOF\n)\nEOF\n']);
   // Words after the substitution are still parsed.
   assert.deepEqual(words('echo $(a; b) && ls'), [['echo', ''], ['ls']]);
+});
+
+test('arithmetic is skipped, and the text after it still parses', () => {
+  // The command after `;` must survive: an arithmetic body that ends early would swallow it.
+  assert.deepEqual(words('echo $((1+2)) ; cat x'), [['echo', ''], ['cat', 'x']]);
+  assert.deepEqual(words('echo $(( (1+2)*3 )); cat x'), [['echo', ''], ['cat', 'x']]);
+  assert.deepEqual(words('echo $(( 1 + (2 * (3 - 4)) )); cat x'), [['echo', ''], ['cat', 'x']]);
+  // Quotes inside the body hide their parens from the closing-paren count.
+  assert.deepEqual(words('echo $(( "a)" + 1 )); cat x'), [['echo', ''], ['cat', 'x']]);
+  assert.deepEqual(words("echo $(( 'a)' + 1 )); cat x"), [['echo', ''], ['cat', 'x']]);
+  assert.deepEqual(words('echo "$((1+2))" && cat x'), [['echo', ''], ['cat', 'x']]);
+  // A command substitution or backtick inside the body still runs.
+  assert.deepEqual(substs('echo $(( `cat y` + 1 ))'), ['cat y']);
+  assert.deepEqual(substs('echo $(( "$(cat y)" + 1 ))'), ['cat y']);
+  // Arithmetic nests like substitutions do: 16 levels are followed, a 17th sets overflow.
+  assert.equal(scan(nestedArith(16)).overflow, false);
+  assert.equal(scan(nestedArith(17)).overflow, true);
+});
+
+test('the arithmetic look-ahead reads quotes the way bash does', () => {
+  // Words alone cannot tell arithmetic from a substitution; `substs` can.
+  const arith = (cmd, inner = []) => {
+    assert.deepEqual(words(cmd), [['echo', ''], ['cat', 'x']], cmd);
+    assert.deepEqual(substs(cmd), inner, cmd);
+  };
+  // A `)` inside quotes does not close the second paren, so these stay arithmetic.
+  arith("echo $(( 'a)' + 1 )); cat x");
+  arith('echo $(( "a)" + 1 )); cat x');
+  arith("echo $(( $'a\\')' + 1 )); cat x");
+  arith('echo $(( 1 + \\) )); cat x');
+  // `$(` inside double quotes nests, quotes inside it nest again, and its body is reported.
+  arith('echo $(( "$(echo ")")" + 1 )); cat x', ['echo ")"']);
+  // Inside double quotes a backtick body is skipped whole, so its stray quote closes nothing.
+  arith('echo $(( "a`echo "`b" + 1 )); cat x', ['echo "']);
+  // Outside quotes bash does not skip a backtick body: its `)` closes the pair, `))` never
+  // follows, and the text is a substitution that starts with a subshell paren.
+  assert.deepEqual(substs('echo $(( 1 + `echo )` )); cat x'), ['( 1 + `echo )` )']);
+  // `$(` is live even inside single quotes in arithmetic (bash expands the body as if in double
+  // quotes). When it runs past the `))`, the text after the `))` must still be read.
+  assert.deepEqual(words("echo $(( '$(' )); cat x"), [['echo', ''], ['cat', 'x']]);
+});
+
+test('$(( is a substitution unless it closes as )), as bash decides', () => {
+  // `$((cat x) | sh)` and `$((cat x); y)` run `cat x`: a subshell paren right after `$(`.
+  assert.deepEqual(substs('echo $((cat x) | sh)'), ['(cat x) | sh']);
+  assert.deepEqual(substs('echo $((cat x); y)'), ['(cat x); y']);
+  assert.deepEqual(substs('echo "$((cat x) | sh)"'), ['(cat x) | sh']);
+  assert.deepEqual(substs('echo `echo $((cat x) | sh)`'), ['echo $((cat x) | sh)']);
+  // The substitution ends where bash ends it, so the rest of the command line is still parsed.
+  assert.deepEqual(words('echo $((cat x) | sh) && ls'), [['echo', ''], ['ls']]);
+  assert.deepEqual(words('echo $((cat x); y); cat z'), [['echo', ''], ['cat', 'z']]);
+  // `$((a) )` and `$((a)(b))` do not close as `))` either.
+  assert.deepEqual(substs('echo $((a) )'), ['(a) ']);
+  assert.deepEqual(substs('echo $((a)(b))'), ['(a)(b)']);
+  // An unterminated `$((` is read as a substitution, so nothing after it is hidden.
+  assert.deepEqual(substs('echo $((1+'), ['(1+']);
+});
+
+test('a command-leading (( )) is arithmetic; a << inside it opens no heredoc', () => {
+  // Read as two subshell parens, `<< 2` was a heredoc whose body swallowed every later line.
+  assert.deepEqual(words('((x=1<<2))\ncat x'), [['cat', 'x']]);
+  assert.deepEqual(words('(( n <<= 1 )); cat x'), [['cat', 'x']]);
+  assert.deepEqual(words('((i++)) && cat x'), [['cat', 'x']]);
+  assert.deepEqual(words('echo a; (( x )); cat x'), [['echo', 'a'], ['cat', 'x']]);
+  assert.deepEqual(words('(( (1+2)*3 ))\ncat x'), [['cat', 'x']]);
+  // Inside a substitution too: the heredoc must not eat the closing paren.
+  assert.deepEqual(words('echo $( ((x=1<<2)); cat y ) && ls'), [['echo', ''], ['ls']]);
+  // A substitution inside the body is still reported.
+  assert.deepEqual(substs('((x=$(cat y)))'), ['cat y']);
+  // Not arithmetic unless it closes as `))`: these are nested subshells and run their commands.
+  assert.deepEqual(words('((cat x); y)'), [['cat', 'x'], ['y']]);
+  assert.deepEqual(words('(( a ) )'), [['a']]);
+  assert.deepEqual(words('((cat x) | sh)').flat(), ['cat', 'x', 'sh']);
+  assert.deepEqual(words('((a))b'), [['b']]);
+  // Known gap (see the file header): only a `((` that starts a command is arithmetic. After a
+  // reserved word it is still two subshell parens, so no `<<` should appear in such a loop test.
+  assert.deepEqual(words('while ((x)); do cat y; done'), [['while'], ['x'], ['do', 'cat', 'y'], ['done']]);
+});
+
+test('a case pattern ) does not close the substitution around it', () => {
+  const inDouble = scan('echo "$(case x in a) cat .env;; esac)"');
+  assert.deepEqual(inDouble.segments.map((s) => s.words), [['echo', '']]);
+  assert.deepEqual(inDouble.segments[0].substs, ['case x in a) cat .env;; esac']);
+  const bare = scan('echo $(case x in a) cat .env;; esac)');
+  assert.deepEqual(bare.segments.map((s) => s.words), [['echo', '']]);
+  assert.deepEqual(bare.segments[0].substs, ['case x in a) cat .env;; esac']);
+  // The substitution still ends at the `)` after `esac`, so what follows is parsed normally.
+  assert.deepEqual(words('echo $(case x in a) y;; esac) && ls'), [['echo', ''], ['ls']]);
+  // Optional leading paren, alternatives, several arms and a default arm.
+  assert.deepEqual(substs('echo $(case x in (a|b) cat y;; *) cat z;; esac)').length, 1);
+  assert.deepEqual(words('echo $(case x in (a|b) cat y;; *) cat z;; esac); ls'), [['echo', ''], ['ls']]);
+  assert.deepEqual(words('echo $(case x in a|b) y;; c) z;; esac); ls'), [['echo', ''], ['ls']]);
+  // The last arm may omit `;;`, and `;&` / `;;&` end an arm like `;;`.
+  assert.deepEqual(words('echo $(case x in a) y\nesac); ls'), [['echo', ''], ['ls']]);
+  assert.deepEqual(words('echo $(case x in a) y;& b) z;;& c) w\nesac); ls'), [['echo', ''], ['ls']]);
+  // Patterns on their own lines, and a case after a reserved word.
+  assert.deepEqual(words('echo $(case x in\n a) y;;\n b) z;;\nesac); ls'), [['echo', ''], ['ls']]);
+  assert.deepEqual(words('echo $(if a; then case x in a) y;; esac; fi); ls'), [['echo', ''], ['ls']]);
+  // Nested cases and a subshell inside an arm.
+  assert.deepEqual(words('echo $(case a in x) case b in y) c;; esac;; z) (d; e);; esac); ls'), [['echo', ''], ['ls']]);
+  assert.deepEqual(words('echo $(( case a in b) c;; esac )); ls'), [['echo', ''], ['ls']]);
+  // A quoted `case` or `in` is not the keyword, so the first `)` closes the substitution.
+  assert.deepEqual(substs('echo $(\\case x in a) y)'), ['\\case x in a']);
+  assert.deepEqual(substs('echo $(case x "in" a) y)'), ['case x "in" a']);
+  // `case` that is not in command position is just a word.
+  assert.deepEqual(substs('echo $(echo case x in a) y)'), ['echo case x in a']);
+  // After a closed case the next `)` closes the substitution again.
+  assert.deepEqual(substs('echo $(case x in a) y;; esac; z)'), ['case x in a) y;; esac; z']);
+  // Every reserved word that can precede a command lets `case` start one.
+  for (const kw of ['if', 'elif', 'while', 'until', 'then', 'else', 'do', '{', '!', 'time']) {
+    assert.deepEqual(words(`echo $(${kw} case x in a) y;; esac; true); ls`), [['echo', ''], ['ls']], kw);
+  }
+  // A case inside a subshell inside a substitution: its pattern `)` is not the subshell's.
+  assert.deepEqual(substs('echo $( (case x in a) y;; esac) ); ls'), [' (case x in a) y;; esac) ']);
+});
+
+test('case patterns are words of the case segment; an arm is parsed normally', () => {
+  // `a|b)` separates patterns, it is not a pipe; `(a)` is an optional leading paren.
+  assert.deepEqual(words('case x in a|b) y;; esac'), [['case', 'x', 'in', 'a', 'b'], ['y'], ['esac']]);
+  assert.deepEqual(words('case x in (a) y;; esac'), [['case', 'x', 'in', 'a'], ['y'], ['esac']]);
+  // Inside an arm `|` is a pipe again and `(` opens a subshell.
+  assert.deepEqual(words('case x in a) cat x | grep y;; esac'), [['case', 'x', 'in', 'a'], ['cat', 'x'], ['grep', 'y'], ['esac']]);
+  assert.deepEqual(pipelines('case x in a) cat x | grep y;; esac'), [0, 1, 1, 2]);
+  assert.deepEqual(words('case x in a) (cd d; ls);; esac'), [['case', 'x', 'in', 'a'], ['cd', 'd'], ['ls'], ['esac']]);
+  // Known gap (see the file header, which also lists extglob patterns): `in` on its own line is
+  // not recognized, so the case is not tracked and a `)` at top level just ends a segment.
+  assert.deepEqual(words('case x\nin a) y;; esac'), [['case', 'x'], ['in', 'a'], ['y'], ['esac']]);
 });
 
 test('commit message', () => {
@@ -231,6 +409,8 @@ test('quote desync cannot hide a command', () => {
   // $'...' honors \' where plain single quotes do not.
   assert.deepEqual(words("echo $'it\\'s'; cat .env"), [['echo', "it's"], ['cat', '.env']]);
   assert.deepEqual(words("cat $'.env'"), [['cat', '.env']]);
+  // $'...' unescapes \\, \" and \' and keeps every other backslash pair (here `\n`) as written.
+  assert.deepEqual(words(String.raw`echo $'a\\b\"c\'d\n'`), [['echo', String.raw`a\b"c'd\n`]]);
   // $"..." is a plain double-quoted string.
   assert.deepEqual(words('echo $"a b"'), [['echo', 'a b']]);
 });
@@ -287,6 +467,17 @@ test('adversarial inputs return quickly and without recursion blowups', () => {
     '<<EOF\n'.repeat(15000),
     'cat <<A <<B <<C '.repeat(6000),
     "'$(".repeat(30000),
+    // Arithmetic look-ahead: every one of these starts a look-ahead that cannot succeed.
+    '(('.repeat(50000),
+    '((\n'.repeat(30000),
+    '((a) '.repeat(25000),
+    '$((a '.repeat(25000),
+    '"$(('.repeat(30000),
+    '$(( #"\n) ; x)\n'.repeat(7000),
+    // Case tracking and pipe continuation.
+    'case x in a) '.repeat(8000),
+    '$(case x in a) '.repeat(8000),
+    'a |\n'.repeat(30000),
   ];
   const started = Date.now();
   for (const cmd of inputs) {
@@ -294,6 +485,17 @@ test('adversarial inputs return quickly and without recursion blowups', () => {
     assert.ok(Array.isArray(r.segments));
   }
   assert.ok(Date.now() - started < 10000, 'scan must stay roughly linear on hostile input');
+});
+
+test('the arithmetic look-ahead is metered: hostile input sets overflow, a long real script does not', () => {
+  // Without a budget each `(` would rescan the rest of the input for a `))`.
+  assert.equal(scan('('.repeat(100000)).overflow, true);
+  const script = 'echo $((1+2)); ((x++)); (cat y); echo $((a) | sh)\n'.repeat(1500);
+  const r = scan(script);
+  assert.equal(r.overflow, false);
+  // Per line: `echo`, `cat y` and the `echo` that carries the `$((a) | sh)` substitution.
+  assert.equal(r.segments.length, 1500 * 3);
+  assert.equal(r.segments.flatMap((s) => s.substs).length, 1500);
 });
 
 test('segments always have the documented shape', () => {
