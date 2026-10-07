@@ -67,7 +67,10 @@ git check-ignore -q "$dir/<name>" && echo ignored || echo NOT-IGNORED
 If NOT ignored, fix it before creating anything:
 
 1. Run the branch check: `git branch --show-current`. On `main`, `master` or `develop`, ask before committing; continue only on a yes.
-2. Append `$dir/` to `.gitignore`, stage only `.gitignore`, and commit it (`chore: ignore $dir/`).
+2. Append `$dir/` to `.gitignore` and commit that file alone. The `-- .gitignore` pathspec matters: a plain `git commit` would also commit anything you already staged. With it, other staged files stay staged and out of this commit.
+   ```bash
+   git add .gitignore && git commit -m "chore: ignore $dir/" -- .gitignore
+   ```
 3. Run the probe again; it must print `ignored`.
 
 Why: an unignored worktree directory pollutes `git status` and can be committed into the repository by accident.
