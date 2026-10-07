@@ -1,0 +1,765 @@
+'use strict';
+// Tests for hooks/guard.js, the tiered PreToolUse guard. It reads a Bash command the way the
+// shell does (hooks/lib/shell-words.js) and answers one of three things: nothing (the command is
+// not its business), `ask` (the user must approve) or `deny` (never approved from a prompt).
+// This file covers the core: the deny tier (rm of / or home or a system dir, writes and formats of
+// a disk, the fork bomb, reading a private key), how hits combine (deny beats ask, then position,
+// then table order), the `read-secret` rule and the path classifier behind it, the two safety
+// nets for text the parser does not fully read (unparsed commands and non-plain command words),
+// the CONSTELLATION_GUARD / CONSTELLATION_GUARD_ASK switches, the conversion of an ask into a
+// deny when nobody can answer (subagents, `claude -p`), and the spawned hook end to end.
+// Every test drives the real decide() or the real `node hooks/guard.js`.
+//
+// Corpus tables stay inline in this file: `node --test` runs any non-test .js under hooks/test/.
+
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { spawnSync } = require('node:child_process');
+const { decide, classifyPath, globTargetsSecret, toOutput, RULES } = require('../guard.js');
+
+const GUARD = path.join(__dirname, '..', 'guard.js');
+const HOME = '/h';
+// A real directory outside any git repo, so a later rule that probes `cwd` stays silent here.
+const CWD = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'guard-core-cwd-')));
+test.after(() => fs.rmSync(CWD, { recursive: true, force: true }));
+
+const shq = (s) => "'" + s.replace(/'/g, "'\\''") + "'";
+
+// decide() on a Bash payload. `env` is always explicit: nothing leaks in from the test process.
+function run(command, { env = {}, payload = {}, cwd = CWD, home = HOME } = {}) {
+  const p = { tool_name: 'Bash', tool_input: { command }, cwd, session_id: 's1', ...payload };
+  return decide(p, { env, home });
+}
+
+// The fixed ends of the reason templates (PLAN G5). The middle is the rule's own sentence.
+const ASK_TAIL = '. Needs your approval (CONSTELLATION_GUARD=critical skips non-critical checks).';
+const DENY_TAIL = '. This cannot be approved from a prompt; do not rephrase or split the command to get past it.';
+
+test('deny tier: each command is denied by its rule', () => {
+  const rows = {
+    'rm-root-home': ['rm -rf ~', 'rm -rf "$HOME"', 'sudo rm -rf /', 'rm -rf /*', "bash -c 'rm -rf ~/'", 'rm -rf \\\n~'],
+    'rm-system-dir': ['rm -rf /etc/'],
+    'disk-write': ['dd if=/dev/zero of=/dev/disk2'],
+    'disk-format': ['mkfs.ext4 /dev/sdb1'],
+    'fork-bomb': [':(){ :|:& };:'],
+    'read-secret': [
+      'cat ~/.ssh/id_ed25519',
+      'echo `cat ~/.aws/credentials`',
+      'cat ~/.aws/credentials | sed s/a/b/',
+      'for x in 1; do cat ~/.ssh/id_rsa; done',
+      'cat <<EOF\n$(cat ~/.ssh/id_rsa)\nEOF',
+    ],
+  };
+  for (const [id, cmds] of Object.entries(rows)) {
+    for (const cmd of cmds) {
+      const d = run(cmd);
+      assert.equal(d?.decision, 'deny', cmd);
+      assert.equal(d.id, id, cmd);
+      assert.ok(d.reason.startsWith(`constellation-guard [${id}] blocked: `), d.reason);
+      assert.ok(d.reason.endsWith(DENY_TAIL), d.reason);
+    }
+  }
+});
+
+test('deny rules: other spellings of the same dangerous commands', () => {
+  const rows = [
+    // [rule id, command]
+    ['rm-root-home', 'rm -rf $HOME/'],
+    ['rm-root-home', 'rm -rf ${HOME}/*'],
+    ['rm-root-home', 'rm -r -f -- ~'],
+    ['rm-root-home', 'rm -rf /tmp/x ~'],
+    ['rm-root-home', '/bin/rm -rf ~'],
+    ['rm-root-home', 'rm -rf //'],
+    ['rm-root-home', 'rm -rf /usr/..'],
+    ['rm-root-home', 'rm -Rf /h/*'],
+    ['rm-root-home', 'rm -f ~/*'],
+    ['rm-root-home', 'echo hi; rm -rf ~'],
+    ['rm-root-home', 'ls && sudo -u root rm -rf /'],
+    ['rm-system-dir', 'rm -rf /bin'],
+    ['rm-system-dir', 'rm -rf /usr/*'],
+    ['rm-system-dir', 'rm -rf /System/'],
+    ['rm-system-dir', 'rm -rf /Users'],
+    ['rm-system-dir', 'rm -rf /var /tmp/x'],
+    ['disk-write', 'echo x > /dev/sda'],
+    ['disk-write', 'cat img >> /dev/rdisk3'],
+    ['disk-write', 'sudo dd if=img of=/dev/nvme0n1 bs=1m'],
+    ['disk-write', 'dd of=/dev/mmcblk0 if=img'],
+    ['disk-format', 'diskutil eraseDisk JHFS+ X disk2'],
+    ['disk-format', 'diskutil eraseVolume HFS+ X /Volumes/Y'],
+    ['disk-format', 'diskutil partitionDisk disk2 GPT JHFS+ X 0b'],
+    ['disk-format', 'diskutil zeroDisk disk2'],
+    ['disk-format', 'diskutil randomDisk 1 disk2'],
+    ['disk-format', 'diskutil erasedisk JHFS+ X disk2'],
+    ['disk-format', 'newfs_msdos -F 32 /dev/disk2'],
+    ['disk-format', 'sudo mke2fs -t ext4 /dev/sdb1'],
+    ['disk-format', 'mkfs -t ext4 /dev/sdb1'],
+    ['fork-bomb', "bash -c ':(){ :|:& };:'"],
+    ['fork-bomb', 'x() { :; }; :() {   : | :  &  }  ;  :'],
+  ];
+  for (const [id, cmd] of rows) {
+    const d = run(cmd);
+    assert.equal(d?.decision, 'deny', cmd);
+    assert.equal(d.id, id, cmd);
+  }
+});
+
+test('deny rules: the same words in harmless positions are not denied', () => {
+  // `rm -rf .` and `rm -rf *` only reach the home directory when the cwd is home.
+  assert.equal(run('rm -rf .', { cwd: '/h' })?.id, 'rm-root-home');
+  assert.equal(run('rm -rf *', { cwd: '/h/' })?.id, 'rm-root-home');
+  assert.equal(run('rm -rf ./', { cwd: '/h' })?.id, 'rm-root-home');
+  assert.equal(run('rm -rf ./*', { cwd: '/h' })?.id, 'rm-root-home');
+  assert.equal(run('rm -rf .', { cwd: CWD }), null);
+  assert.equal(run('rm -rf *', { cwd: CWD }), null);
+  assert.equal(run('rm -rf .', { cwd: '/h/project' }), null);
+  assert.equal(run('rm -f *', { cwd: '/h' }), null, 'not recursive');
+  assert.equal(run('rm -rf build', { cwd: '/h' }), null);
+  const rows = [
+    'rm -rf ~/projects/x/build',
+    'rm -rf /h/projects',
+    'rm -rf /tmp/x',
+    'rm -rf /private/tmp/x',
+    'rm -rf /usr/local/lib/foo',
+    'rm -rf /Users/u/p/build',
+    'rm -rf $D',
+    'rm -rf "$HOME"/x',
+    'echo rm -rf ~',
+    'ls ~',
+    'dd if=/dev/zero of=out.img bs=1m count=1',
+    'dd if=/dev/disk2 of=backup.img',
+    'echo x > /dev/null',
+    'cat a > /dev/stdout',
+    'mkfs.ext4 disk.img',
+    'diskutil list',
+    'diskutil info disk2',
+  ];
+  for (const cmd of rows) assert.equal(run(cmd), null, cmd);
+});
+
+test('the fork bomb is the one raw-text rule: it matches the command text, whatever the spacing', () => {
+  assert.equal(run(':()   {  : | :  &  }  ;  :')?.id, 'fork-bomb');
+  assert.equal(run('echo start\n:(){ :|:& };:\necho end')?.id, 'fork-bomb');
+});
+
+test('not denied: look-alikes of the deny tier return null', () => {
+  const rows = [
+    'rm -f /var/folders/0t/a/T/s.json',
+    'rm -rf /usr/local/lib/foo',
+    'cat ~/.ssh/id_ed25519.pub',
+    "env -i PATH=/usr/bin:/bin HOME=$HOME bash -c 'rm -rf /Users/u/p/build'",
+  ];
+  for (const cmd of rows) assert.equal(run(cmd), null, cmd);
+});
+
+test('read-secret asks (never denies) for ask-tier paths', () => {
+  const rows = [
+    // [command, pathId]
+    ['cat .env', 'env-file'],
+    ['cat test/fixtures/fake.key', 'private-key-file'],
+    ['grep KEY .env.local', 'env-file'],
+    ['cat ~/.aws/config', 'aws-config'],
+    ['ls | xargs -I{} cat {}/.env', 'env-file'],
+    ['export $(cat .env | xargs)', 'env-file'],
+    ['bash -c "cat .env"', 'env-file'],
+    ['( cat .env )', 'env-file'],
+  ];
+  for (const [cmd, pathId] of rows) {
+    const d = run(cmd);
+    assert.equal(d?.decision, 'ask', cmd);
+    assert.equal(d.id, 'read-secret', cmd);
+    assert.equal(d.pathId, pathId, cmd);
+    assert.ok(d.reason.startsWith('constellation-guard [read-secret] '), d.reason);
+    assert.ok(d.reason.endsWith(ASK_TAIL), d.reason);
+  }
+});
+
+test('read-secret: which words of a reader are paths', () => {
+  const rows = [
+    // [command, expected pathId or null]
+    // grep, rg, sed, awk and jq take their pattern (or script, or filter) first.
+    ['grep .env src', null],
+    ['grep -rn .env src', null],
+    ['rg -n .env .', null],
+    // After `--` a word that looks like an option is a word: here the pattern.
+    ['grep -- --file=.env x', null],
+    ['jq .env config.json', null],
+    ["sed -n '/.env/p' notes.txt", null],
+    ['awk /.env/ notes.txt', null],
+    ['grep -e foo .env', 'env-file'],
+    ['grep --regexp=foo .env', 'env-file'],
+    ['grep -f pats .env', 'env-file'],
+    ['grep --file=.env x', 'env-file'],
+    ['grep -ie foo .env', 'env-file'],
+    ['sed -e p .env', 'env-file'],
+    ["sed -i '' s/a/b/ .env", 'env-file'],
+    ['sed -n p .env', 'env-file'],
+    ['jq -f prog.jq .env', 'env-file'],
+    ["awk '{print}' .env", 'env-file'],
+    ['awk -f prog.awk .env', 'env-file'],
+    ['rg foo -- .env', 'env-file'],
+    ['grep foo -- .env', 'env-file'],
+    // The other readers take every word as a path.
+    ['cat -n .env', 'env-file'],
+    ['head -5 .env.local', 'env-file'],
+    ['tail -f .env', 'env-file'],
+    ['less .env', 'env-file'],
+    ['bat .env', 'env-file'],
+    ['base64 .env', 'env-file'],
+    ['strings server.pem', 'private-key-file'],
+    ['xxd cert.p12', 'private-key-file'],
+    ['diff .env .env.production', 'env-file'],
+    ['diff a.txt .env', 'env-file'],
+    ['sort .env', 'env-file'],
+    ['cut -d= -f2 .env', 'env-file'],
+    ['yq .a .env', 'env-file'],
+    ['cat secrets.json', 'secrets-file'],
+    ['cat .aws', 'secret-dir'],
+    ['grep -r token ~/.ssh', 'secret-dir'],
+    ['cat ~/.ssh/*', 'secret-dir'],
+    // A glob argument is read as a glob too.
+    ['cat .env*', 'env-file'],
+    ['grep foo .env*', 'env-file'],
+    ['cat certs/*.pem', 'private-key-file'],
+    ['cat ~/.ssh/id_*', 'ssh-private-key'],
+    ['cat ~/.ssh/id_*.pub', null],
+    ['cat src/*.ts', null],
+    ['cat *', null],
+    ['cat [a-z]*.md', null],
+    ['cat /h/.config/gcloud/credentials.db', 'gcloud-creds'],
+    // A command that is not a reader does not read.
+    ['ls .env', null],
+    ['file .env', null],
+    ['echo .env', null],
+    ['wc -l .env', null],
+    ['cd .ssh', null],
+    // Any command reading a secret through `<` does.
+    ['wc -l < .env', 'env-file'],
+    ['tr a b < .env.local', 'env-file'],
+    ['wc -l < .env.example', null],
+    ['cat < .env.sh', null],
+  ];
+  for (const [cmd, pathId] of rows) {
+    const d = run(cmd);
+    if (pathId === null) assert.equal(d, null, cmd);
+    else {
+      assert.equal(d?.id, 'read-secret', cmd);
+      assert.equal(d.pathId, pathId, cmd);
+    }
+  }
+  const d = run('sort < ~/.ssh/id_rsa');
+  assert.equal(d.decision, 'deny');
+  assert.equal(d.pathId, 'ssh-private-key');
+});
+
+test('precedence: deny beats ask, then the lowest position wins, then table order', () => {
+  const deny = run('cat .env; cat ~/.ssh/id_rsa');
+  assert.equal(deny.decision, 'deny');
+  assert.equal(deny.pathId, 'ssh-private-key');
+  const denyFirst = run('cat ~/.ssh/id_rsa; cat .env');
+  assert.equal(denyFirst.decision, 'deny');
+  assert.equal(denyFirst.pathId, 'ssh-private-key');
+
+  const ask = run('cat .env; cat .env.local');
+  assert.equal(ask.decision, 'ask');
+  assert.match(ask.reason, /reading \.env \(env-file\)/);
+  assert.doesNotMatch(ask.reason, /\.env\.local/);
+  const later = run('cat .env.local; cat .env');
+  assert.match(later.reason, /reading \.env\.local /);
+
+  // A deny from a different rule still beats an earlier ask, wherever it hides.
+  assert.equal(run('cat .env && rm -rf ~').id, 'rm-root-home');
+  assert.equal(run('cat .env; echo $(rm -rf /)').id, 'rm-root-home');
+  assert.equal(run("cat .env; bash -c 'cat ~/.aws/credentials'").pathId, 'aws-credentials');
+  // Same tier, same segment: the rule that comes first in the table wins.
+  const same = run('mkfs.ext4 /dev/sdb1 > /dev/sda');
+  assert.equal(same.id, 'disk-write');
+  assert.ok(RULES.findIndex((r) => r.id === 'disk-write') < RULES.findIndex((r) => r.id === 'disk-format'));
+});
+
+test('classifier units: classifyPath', () => {
+  assert.deepEqual(classifyPath('.env', HOME), { pathId: 'env-file', tier: 'ask' });
+  assert.equal(classifyPath('.env.sh', HOME), null);
+  assert.equal(classifyPath('.env.example', HOME), null);
+  assert.equal(classifyPath('id_ed25519.pub', HOME), null);
+  assert.deepEqual(classifyPath('/h/.ssh', HOME), { pathId: 'secret-dir', tier: 'ask' });
+
+  // Deny tier, with ~, $HOME and ${HOME} expanded first.
+  const ssh = { pathId: 'ssh-private-key', tier: 'deny' };
+  for (const p of ['id_rsa', 'id_dsa', 'id_ecdsa', 'id_ed25519', 'id_ed25519_sk', 'id_ecdsa_sk', '/x/y/id_rsa', '~/.ssh/id_ed25519',
+    '$HOME/.ssh/id_rsa', '${HOME}/.ssh/id_rsa', '/h/.ssh/id_custom', '.ssh/id_work', '/h/.ssh/id_rsa.bak', '/h/.ssh/./id_rsa', '/h/.ssh//id_rsa']) {
+    assert.deepEqual(classifyPath(p, HOME), ssh, p);
+  }
+  for (const p of ['/h/.ssh/id_rsa.pub', '/h/.ssh/id_custom.pub', 'id_rsa.pub', 'id_rsa_old', 'my_id_rsa', '/p/id_rsa.txt', 'id_x']) {
+    assert.equal(classifyPath(p, HOME), null, p);
+  }
+  const aws = { pathId: 'aws-credentials', tier: 'deny' };
+  for (const p of ['~/.aws/credentials', '$HOME/.aws/credentials', '${HOME}/.aws/credentials', '/h/.aws/credentials', '.aws/credentials']) {
+    assert.deepEqual(classifyPath(p, HOME), aws, p);
+  }
+  assert.equal(classifyPath('/h/.aws/credentials.bak', HOME), null);
+
+  // Ask tier.
+  for (const p of ['.env', '.env.local', '.env.production', '/p/.env', '~/proj/.env.test', '.env.local.bak', './.env', 'a/../.env']) {
+    assert.deepEqual(classifyPath(p, HOME), { pathId: 'env-file', tier: 'ask' }, p);
+  }
+  for (const p of ['.env.example', '.env.sample', '.env.template', '.env.schema', '.env.defaults', '.env.dist', '.env.sh', '.env.md',
+    '.env.local.example', 'process.env.ts', 'foo.env', 'env', '.environment', '.env.', '~/.env.sh']) {
+    assert.equal(classifyPath(p, HOME), null, p);
+  }
+  const ask = (pathId) => ({ pathId, tier: 'ask' });
+  const rows = [
+    ['server.pem', 'private-key-file'], ['tls.KEY', 'private-key-file'], ['a/b.p12', 'private-key-file'], ['c.pfx', 'private-key-file'],
+    ['store.jks', 'private-key-file'], ['x.keystore', 'private-key-file'], ['test/fixtures/fake.key', 'private-key-file'],
+    ['secrets.json', 'secrets-file'], ['secret.yaml', 'secrets-file'], ['credentials.toml', 'secrets-file'], ['credential.yml', 'secrets-file'],
+    ['/p/Secrets.JSON', 'secrets-file'],
+    ['~/.ssh', 'secret-dir'], ['/h/.ssh/', 'secret-dir'], ['/h/.ssh/*', 'secret-dir'], ['.aws', 'secret-dir'], ['/h/.aws/', 'secret-dir'],
+    ['.envrc', 'envrc'], ['/p/.envrc', 'envrc'],
+    ['/h/.ssh/authorized_keys', 'ssh-authorized-keys'],
+    ['/h/.aws/config', 'aws-config'],
+    ['/h/.kube/config', 'kube-config'],
+    ['/p/service-account.json', 'service-account'], ['/p/gcp_serviceaccount-prod.json', 'service-account'],
+    ['/h/.config/gcloud/credentials.db', 'gcloud-creds'], ['/h/.config/gcloud/application_default_credentials.json', 'gcloud-creds'],
+    ['/h/.azure/accessTokens.json', 'azure-creds'], ['/h/.azure/credentials', 'azure-creds'],
+    ['/h/.docker/config.json', 'docker-config'],
+    ['/h/.netrc', 'netrc'], ['/h/.npmrc', 'npmrc'], ['/h/.pypirc', 'pypirc'],
+    ['/h/.gem/credentials', 'gem-credentials'],
+    ['/h/.vault-token', 'vault-token'], ['vault-token', 'vault-token'],
+    ['/etc/apache2/.htpasswd', 'htpasswd'], ['htpasswd', 'htpasswd'],
+    ['/h/.pgpass', 'pgpass'], ['/h/.my.cnf', 'my-cnf'],
+  ];
+  for (const [p, pathId] of rows) assert.deepEqual(classifyPath(p, HOME), ask(pathId), p);
+
+  // A path longer than any file system allows is not classified (and costs no time to skip).
+  assert.equal(classifyPath('a/'.repeat(2100) + '.env', HOME), null);
+  assert.deepEqual(classifyPath('a/'.repeat(1000) + '.env', HOME), { pathId: 'env-file', tier: 'ask' });
+  const slow = process.hrtime.bigint();
+  assert.equal(run('cat ' + 'serviceaccount'.repeat(4500)), null);
+  assert.ok(Number(process.hrtime.bigint() - slow) / 1e6 < 1000, 'one huge word must not take a second');
+
+  for (const p of ['', undefined, null, 42, 'README.md', 'src/index.js', '/h/.claude.json', '/h/.sshd', '/h/.awsome', 'a.pem.txt', '-', '.']) {
+    assert.equal(classifyPath(p, HOME), null, String(p));
+  }
+});
+
+test('classifier units: globTargetsSecret', () => {
+  for (const g of ['.env*', '.env.*', '**/*.pem', '*.key', '.envrc', 'id_rsa*', '**/.env', 'src/**/.env.*', '*.{pem,key}', '{.env,x}', '*.ts,*.pem', '.env, x']) {
+    assert.ok(globTargetsSecret(g, HOME), g);
+  }
+  assert.deepEqual(globTargetsSecret('.env*', HOME), { pathId: 'env-file', tier: 'ask' });
+  assert.deepEqual(globTargetsSecret('.env.*', HOME), { pathId: 'env-file', tier: 'ask' });
+  assert.deepEqual(globTargetsSecret('**/*.pem', HOME), { pathId: 'private-key-file', tier: 'ask' });
+  assert.deepEqual(globTargetsSecret('id_rsa*', HOME), { pathId: 'ssh-private-key', tier: 'deny' });
+  assert.equal(globTargetsSecret('{.env,id_rsa}', HOME).tier, 'deny', 'a deny alternative wins');
+  for (const g of ['*.ts', '**/*.ts', '*', '**', 'src/**', '*.{ts,tsx}', '.env.example', '.environment*', '', undefined, null]) {
+    assert.equal(globTargetsSecret(g, HOME), null, String(g));
+  }
+});
+
+test('unparsed: input the parser could not read asks, and hits in the read part still count', () => {
+  const big = 'echo ' + 'a'.repeat(65 * 1024);
+  const four = "bash -c " + shq("bash -c " + shq("bash -c " + shq("bash -c 'echo hi'")));
+  for (const cmd of [big, four, "env -S 'echo hi'", 'env -a x -S "cat y"']) {
+    const d = run(cmd);
+    assert.equal(d?.decision, 'ask', cmd.slice(0, 40));
+    assert.equal(d.id, 'unparsed-command', cmd.slice(0, 40));
+    assert.equal(run(cmd, { env: { CONSTELLATION_GUARD: 'critical' } }), null, cmd.slice(0, 40));
+  }
+  assert.match(run(big).reason, /could not .*read.*\(size\)/);
+  assert.match(run(four).reason, /\(depth\)/);
+  assert.match(run("env -S 'echo hi'").reason, /\(env -S\)/);
+
+  // A deny in the part that was read still denies, with or without padding behind it.
+  assert.equal(run('rm -rf ~;' + ' '.repeat(65 * 1024)).id, 'rm-root-home');
+  assert.equal(run('rm -rf ~; echo ' + 'a'.repeat(65 * 1024)).decision, 'deny');
+  assert.equal(run('cat ~/.ssh/id_rsa\n' + '#'.repeat(65 * 1024)).decision, 'deny');
+  // The unread part of 65 KiB of comments could hold a command: ask even with no segment at all.
+  const comment = run('# ' + 'x'.repeat(65 * 1024) + '\nrm -rf ~');
+  assert.equal(comment.id, 'unparsed-command');
+  // A read secret and an unread tail: both ask, and the read-secret rule (earlier in the table) names it.
+  assert.equal(run('cat .env\n' + '#'.repeat(65 * 1024)).id, 'read-secret');
+  // Within the limits nothing is unparsed.
+  assert.equal(run('echo ' + 'a'.repeat(60 * 1024)), null);
+  assert.equal(run("bash -c 'bash -c \"bash -c \\\"echo hi\\\"\"'"), null);
+});
+
+test('env: CONSTELLATION_GUARD=critical keeps only the deny tier', () => {
+  const critical = { CONSTELLATION_GUARD: 'critical' };
+  assert.equal(run('cat .env', { env: critical }), null);
+  assert.equal(run('cat ~/.aws/config', { env: critical }), null);
+  assert.equal(run('cat ~/.ssh/id_rsa', { env: critical }).decision, 'deny');
+  assert.equal(run('rm -rf ~', { env: critical }).id, 'rm-root-home');
+  assert.equal(run('a[0]=1 ls', { env: critical }), null);
+  // Every other value runs every rule.
+  for (const v of ['off', 'high', 'all', '', 'strict', 'CRITICAL', ' critical']) {
+    const d = run('cat .env', { env: { CONSTELLATION_GUARD: v } });
+    assert.equal(d?.decision, 'ask', JSON.stringify(v));
+  }
+  assert.equal(run('cat .env', { env: { CONSTELLATION_GUARD: undefined } }).decision, 'ask');
+});
+
+test('env: CONSTELLATION_GUARD_ASK=deny turns an ask into a deny with the fallback text', () => {
+  const env = { CONSTELLATION_GUARD_ASK: 'deny' };
+  const d = run('cat .env', { env });
+  assert.equal(d.decision, 'deny');
+  assert.equal(d.id, 'read-secret');
+  assert.equal(d.pathId, 'env-file');
+  assert.match(d.reason, /CONSTELLATION_GUARD=critical/);
+  assert.match(d.reason, /^constellation-guard \[read-secret\] .+\. Denied because CONSTELLATION_GUARD_ASK=deny; ask the user to run it, or to restart with CONSTELLATION_GUARD=critical to skip non-critical checks\.$/);
+  // It leaves a real deny alone, and any other value leaves an ask alone.
+  assert.doesNotMatch(run('cat ~/.ssh/id_rsa', { env }).reason, /ASK=deny/);
+  assert.equal(run('cat .env', { env: { CONSTELLATION_GUARD_ASK: 'ask' } }).decision, 'ask');
+  assert.equal(run('cat .env', { env: { CONSTELLATION_GUARD_ASK: 'DENY' } }).decision, 'ask');
+  // With the critical tier on as well, the ask never exists, so nothing is converted.
+  assert.equal(run('cat .env', { env: { ...env, CONSTELLATION_GUARD: 'critical' } }), null);
+});
+
+test('env is read on every call, never cached', () => {
+  assert.equal(run('cat .env', { env: { CONSTELLATION_GUARD: 'critical' } }), null);
+  assert.equal(run('cat .env', { env: {} }).decision, 'ask');
+  assert.equal(run('cat .env', { env: { CONSTELLATION_GUARD_ASK: 'deny' } }).decision, 'deny');
+  assert.equal(run('cat .env', { env: {} }).decision, 'ask');
+});
+
+test('non-interactive: an ask becomes a deny when nobody can answer it', () => {
+  const sub = run('cat .env', { payload: { agent_id: 'a1' } });
+  assert.equal(sub.decision, 'deny');
+  assert.equal(sub.id, 'read-secret');
+  assert.equal(sub.pathId, 'env-file');
+  assert.match(sub.reason, /^constellation-guard \[read-secret\] .+\. Subagents cannot ask, so this was denied; report the exact command to your controller instead of working around it\.$/);
+
+  const headless = run('cat .env', { env: { CLAUDE_CODE_ENTRYPOINT: 'sdk-cli' } });
+  assert.equal(headless.decision, 'deny');
+  assert.match(headless.reason, /^constellation-guard \[read-secret\] .+\. Headless runs cannot ask, so this was denied; report the exact command instead of working around it\.$/);
+
+  // SDK apps can answer through a permission callback, and the desktop app has a user.
+  for (const v of ['sdk-ts', 'sdk-py', 'claude-desktop', 'cli', 'SDK-CLI', 'sdk-cli ', 'sdk-cli-x', '']) {
+    assert.equal(run('cat .env', { env: { CLAUDE_CODE_ENTRYPOINT: v } }).decision, 'ask', JSON.stringify(v));
+  }
+  // agent_id counts only when set.
+  for (const v of [undefined, '', null]) assert.equal(run('cat .env', { payload: { agent_id: v } }).decision, 'ask', String(v));
+
+  // A deny keeps the deny template: it is not an ask that was converted.
+  const hard = run('cat ~/.ssh/id_rsa', { payload: { agent_id: 'a1' } });
+  assert.equal(hard.decision, 'deny');
+  assert.match(hard.reason, /blocked: .+ This cannot be approved from a prompt/);
+  assert.doesNotMatch(hard.reason, /Subagents cannot ask/);
+  const hardHeadless = run('rm -rf ~', { env: { CLAUDE_CODE_ENTRYPOINT: 'sdk-cli' } });
+  assert.match(hardHeadless.reason, /^constellation-guard \[rm-root-home\] blocked: .+\. This cannot be approved/);
+
+  // Order: subagent, then headless, then the ASK=deny fallback.
+  assert.match(run('cat .env', { payload: { agent_id: 'a1' }, env: { CLAUDE_CODE_ENTRYPOINT: 'sdk-cli', CONSTELLATION_GUARD_ASK: 'deny' } }).reason, /Subagents cannot ask/);
+  assert.match(run('cat .env', { env: { CLAUDE_CODE_ENTRYPOINT: 'sdk-cli', CONSTELLATION_GUARD_ASK: 'deny' } }).reason, /Headless runs cannot ask/);
+  assert.match(run('cat .env', { env: { CONSTELLATION_GUARD_ASK: 'deny' } }).reason, /Denied because CONSTELLATION_GUARD_ASK=deny/);
+
+  // The critical tier still removes the ask first, so a subagent is not blocked on it.
+  assert.equal(run('cat .env', { payload: { agent_id: 'a1' }, env: { CONSTELLATION_GUARD: 'critical' } }), null);
+});
+
+test('reasons never contain the plugin namespace prefix that the skill lint flags', () => {
+  const cmds = ['cat .env', 'cat ~/.ssh/id_rsa', 'rm -rf ~', 'a[0]=1 ls', "env -S 'x'", 'dd of=/dev/sda'];
+  const variants = [{}, { payload: { agent_id: 'a' } }, { env: { CLAUDE_CODE_ENTRYPOINT: 'sdk-cli' } }, { env: { CONSTELLATION_GUARD_ASK: 'deny' } }];
+  for (const cmd of cmds) {
+    for (const v of variants) {
+      const d = run(cmd, v);
+      assert.ok(d.reason.startsWith('constellation-guard ['), cmd);
+      assert.ok(!d.reason.includes('constellation' + ':'), cmd);
+    }
+  }
+});
+
+test('safety net A: a command word that is not a plain program name asks', () => {
+  const asks = [
+    'a[0]=1 cat ~/.ssh/id_rsa',
+    'a[0]=1 ls',
+    '{fd}>f ls',
+    '$CC -o x y.c',
+    '"$HOME/bin/tool" arg',
+    '${TOOL} --run',
+    '$(echo ls) -l',
+    '"" x',
+    'FOO=bar "" x',
+    './build/*.sh',
+    'rm\\ x',
+    '@foo run',
+    '+x run',
+    '-x run',
+    '[ -f x ] && ls',
+    '[[ -f x ]] && ls',
+    'ls; $X',
+    'echo $(echo a b) | $X',
+    'bash -c "$X"',
+    "bash -c 'a[0]=1 ls'",
+    'find . -exec {} \\;',
+    'echo x | xargs -I% %',
+  ];
+  for (const cmd of asks) {
+    const d = run(cmd);
+    assert.equal(d?.decision, 'ask', cmd);
+    assert.equal(d.id, 'unrecognized-command-word', cmd);
+    assert.match(d.reason, /^constellation-guard \[unrecognized-command-word\] unrecognized command word\./, cmd);
+    assert.equal(run(cmd, { env: { CONSTELLATION_GUARD: 'critical' } }), null, cmd);
+  }
+  // Plain: names, and paths made of name characters plus / . ~
+  const plain = [
+    'ls', 'git status', 'python3 x.py', 'g++ -o x x.cc', 'x86_64-linux-gnu-gcc -c x.c', './scripts/x.sh', '/usr/bin/env FOO=1 ls', 'x=1y=2 ls',
+    '~/bin/tool', '../tool', '.venv/bin/pytest', './node_modules/.bin/jest', '/bin/ls', 'a.out', './a.out', '. ./env.sh', 'source ~/.env.sh',
+    'FOO=bar ./run.sh', 'ITEM1="5486f8c2" ./run.sh', 'env FOO=bar', 'GITHUB_TOKEN= gh pr list', 'sudo -u root ls', 'command -v git',
+  ];
+  for (const cmd of plain) assert.equal(run(cmd), null, cmd);
+  // A segment with no command at all has no command word to judge.
+  for (const cmd of ['D=/tmp/x', 'A=1 B=2', '> out.txt', '2>/dev/null', '{ ls; }', '! ls', 'X=$(date)', 'if true; then ls; fi', 'for x in 1 2; do ls; done',
+    'while true; do ls; done']) {
+    assert.equal(run(cmd), null, cmd);
+  }
+  // A deny still wins over a net-A ask, wherever the ask is.
+  assert.equal(run('a[0]=1 ls; rm -rf ~').id, 'rm-root-home');
+  assert.equal(run('$X; cat ~/.ssh/id_rsa').pathId, 'ssh-private-key');
+  assert.equal(run('a[0]=1 ls; cat .env').id, 'unrecognized-command-word', 'same tier: the lower position wins');
+});
+
+test('harmless commands pass: 33 real commands that today\'s guards often block', () => {
+  // Sources: the hook logs, the old-guard false positives found while planning, and the check run.
+  const corpus = [
+    'git diff HEAD~1 -- hooks/x.js',
+    'git diff HEAD~1 -- hooks/protect-secrets.js',
+    'source ~/.env.sh && make build',
+    'source ~/.env.sh && make -j$(sysctl -n hw.ncpu) 2>&1 | tail -5',
+    'find skills -name SKILL.md | xargs grep -l CATALOG',
+    'rm -rf node_modules && ls',
+    'git log --oneline | head -5 && grep -rn Object.keys src',
+    'cat -n hooks/protect-secrets.js',
+    'cat .claude-plugin/plugin.json | head -20; git log -1 -- hooks/protect-secrets.js',
+    'cat .env.example | head -5',
+    'head -40 src/process.env.ts',
+    "find . -name '*.md' -exec grep -l category {} +",
+    'find skills -type f -exec cat {} + | wc -w',
+    'git ls-files | xargs wc -l',
+    'lsof -ti:5174 | xargs kill',
+    'rm -f /tmp/x.log; cd ~',
+    'rm -rf dist && node -e "console.log(process.env.HOME)"',
+    'printenv PATH',
+    'echo "tokens: $TOKEN_COUNT"',
+    'echo ${CLAUDE_CODE_OAUTH_TOKEN:+SET}',
+    'GITHUB_TOKEN= gh pr list',
+    'D=/tmp/x; rm -rf $D',
+    "cat > /tmp/b.md <<'EOF'\nreads .env and id_rsa\nEOF",
+    "sed -i '' 's/git reset --hard/x/' notes.md",
+    'git push --force-with-lease origin feat/x',
+    'git branch -d feat/x',
+    'git worktree remove .worktrees/x',
+    'git clean -n',
+    'chmod -R 755 build',
+    "curl -X POST https://api.example.com -d '{\"a\":1}'",
+    'grep -rn "API_KEY" src',
+    'ITEM1="5486f8c2" ./run.sh',
+    "cat ~/.claude.json | jq '.mcpServers | keys'",
+  ];
+  assert.equal(corpus.length, 33);
+  assert.equal(new Set(corpus).size, 33);
+  for (const cmd of corpus) {
+    assert.equal(run(cmd), null, cmd);
+    // The same commands are also silent for a subagent and for `claude -p`: nothing to convert.
+    assert.equal(run(cmd, { payload: { agent_id: 'a1' } }), null, cmd);
+    assert.equal(run(cmd, { env: { CLAUDE_CODE_ENTRYPOINT: 'sdk-cli', CONSTELLATION_GUARD_ASK: 'deny' } }), null, cmd);
+  }
+});
+
+test('decide never throws on shell-shaped garbage and always answers null, ask or deny', () => {
+  // Seeded, so a failure reproduces: random runs of pieces that stress quoting, nesting,
+  // substitutions, heredocs, prefixes and secret names.
+  let seed = 20261007;
+  const rand = (n) => {
+    seed = (seed + 0x6d2b79f5) | 0;
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return (((t ^ (t >>> 14)) >>> 0) % n);
+  };
+  const pieces = ['cat', 'rm', '-rf', '~', '$HOME', '/', '/*', '.env', '~/.ssh/id_rsa', '"', "'", '`', '$(', ')', '(', '{', '}', ';', '&&', '|', '&',
+    '<', '>', '>>', '<<EOF', '\n', 'EOF', '\\', 'bash -c', 'sudo', 'env -S', 'xargs', 'find . -exec', '{}', '+', 'a[0]=1', 'X=1', ' ', ' ', ' ',
+    'grep', 'sed', '-e', '--', 'dd of=/dev/sda', 'mkfs.ext4 /dev/sdb1', '*.pem', '#', '$((', '))', 'eval', String.fromCharCode(233), String.fromCharCode(0)];
+  const decisions = new Set();
+  for (let n = 0; n < 4000; n++) {
+    let cmd = '';
+    for (let k = 1 + rand(14); k > 0; k--) cmd += pieces[rand(pieces.length)] + (rand(3) === 0 ? '' : ' ');
+    const d = run(cmd, { payload: rand(4) === 0 ? { agent_id: 'a' } : {}, env: rand(5) === 0 ? { CONSTELLATION_GUARD: 'critical' } : {} });
+    if (d !== null) {
+      assert.ok(d.decision === 'ask' || d.decision === 'deny', JSON.stringify(cmd));
+      assert.equal(typeof d.id, 'string', JSON.stringify(cmd));
+      assert.ok(d.reason.startsWith(`constellation-guard [${d.id}] `), JSON.stringify(cmd));
+    }
+    decisions.add(d && d.decision);
+  }
+  assert.ok(decisions.has(null) && decisions.has('ask') && decisions.has('deny'), 'the fuzz reached every outcome');
+});
+
+test('decide ignores what is not a Bash command and never throws on odd payloads', () => {
+  const odd = [
+    {},
+    { tool_name: 'Bash' },
+    { tool_name: 'Bash', tool_input: null },
+    { tool_name: 'Bash', tool_input: { command: 42 } },
+    { tool_name: 'Bash', tool_input: { command: '' } },
+    { tool_name: 'Bash', tool_input: { command: ['rm', '-rf', '~'] } },
+    { tool_name: 'Glob', tool_input: { pattern: '.env' } },
+    { tool_name: 'mcp__x__y', tool_input: { command: 'rm -rf ~' } },
+    { tool_name: 'Bash', tool_input: { command: 'ls' }, cwd: 42 },
+    { tool_name: 'Bash', tool_input: { command: 'ls' }, cwd: null },
+  ];
+  for (const p of odd) assert.equal(decide(p, { env: {}, home: HOME }), null, JSON.stringify(p));
+  // No options at all: env and home default to the process's.
+  assert.equal(decide({ tool_name: 'Bash', tool_input: { command: 'ls' } }), null);
+  assert.equal(decide(null), null);
+  assert.equal(decide(undefined), null);
+  // Without a usable home or cwd, only the home rules go quiet.
+  assert.equal(decide({ tool_name: 'Bash', tool_input: { command: 'rm -rf /' } }, { env: {}, home: '' }).id, 'rm-root-home');
+  assert.equal(decide({ tool_name: 'Bash', tool_input: { command: 'rm -rf ~' } }, { env: {}, home: '' }), null);
+  assert.equal(decide({ tool_name: 'Bash', tool_input: { command: 'rm -rf .' }, cwd: '' }, { env: {}, home: '' }), null);
+});
+
+test('toOutput: the hook JSON for a decision, and {} for none', () => {
+  assert.deepEqual(toOutput(null), {});
+  assert.deepEqual(toOutput(undefined), {});
+  const d = run('cat .env');
+  assert.deepEqual(toOutput(d), {
+    hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'ask', permissionDecisionReason: d.reason },
+  });
+  assert.equal(toOutput(run('rm -rf ~')).hookSpecificOutput.permissionDecision, 'deny');
+  // No decision ever turns into allow or defer, which would skip the user's own prompts.
+  for (const cmd of ['cat .env', 'rm -rf ~', 'a[0]=1 ls', 'cat ~/.aws/config']) {
+    for (const v of [{}, { payload: { agent_id: 'a' } }, { env: { CONSTELLATION_GUARD_ASK: 'deny' } }]) {
+      assert.ok(['ask', 'deny'].includes(toOutput(run(cmd, v)).hookSpecificOutput.permissionDecision));
+    }
+  }
+});
+
+test('RULES: a table of {id, tier, test} with unique ids and the documented rules', () => {
+  assert.ok(Array.isArray(RULES));
+  for (const r of RULES) {
+    assert.equal(typeof r.id, 'string');
+    assert.ok(['deny', 'ask'].includes(r.tier), r.id);
+    assert.equal(typeof r.test, 'function', r.id);
+  }
+  const ids = RULES.map((r) => r.id);
+  assert.equal(new Set(ids).size, ids.length);
+  const tiers = Object.fromEntries(RULES.map((r) => [r.id, r.tier]));
+  for (const id of ['rm-root-home', 'rm-system-dir', 'disk-write', 'disk-format', 'fork-bomb']) assert.equal(tiers[id], 'deny', id);
+  for (const id of ['read-secret', 'unparsed-command', 'unrecognized-command-word']) assert.equal(tiers[id], 'ask', id);
+  // Deny rules come first, so a tie inside one segment goes to the more dangerous rule.
+  const lastDeny = Math.max(...['rm-root-home', 'rm-system-dir', 'disk-write', 'disk-format', 'fork-bomb'].map((id) => ids.indexOf(id)));
+  assert.ok(lastDeny < ids.indexOf('read-secret'));
+});
+
+// -- The spawned hook --------------------------------------------------------------------------
+
+// Run `node hooks/guard.js` the way Claude Code does: JSON on stdin, JSON on stdout. The child gets
+// an explicit env with temp HOME, log dir and session root, and none of the switches under test.
+function spawnGuard(input, { env = {} } = {}) {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'guard-core-e2e-')));
+  const dirs = { home: path.join(root, 'home'), log: path.join(root, 'logs'), sessions: path.join(root, 'sessions') };
+  fs.mkdirSync(dirs.home);
+  const r = spawnSync(process.execPath, [GUARD], {
+    input: typeof input === 'string' ? input : JSON.stringify(input),
+    encoding: 'utf8',
+    env: { PATH: process.env.PATH, HOME: dirs.home, CONSTELLATION_GUARD_LOG_DIR: dirs.log, SESSION_ROOT: dirs.sessions, ...env },
+    timeout: 20000,
+  });
+  const logs = fs.existsSync(dirs.log) ? fs.readdirSync(dirs.log) : [];
+  const lines = logs.flatMap((f) => fs.readFileSync(path.join(dirs.log, f), 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)));
+  const out = { ...r, logs, lines, dirs, root, claudeDir: fs.existsSync(path.join(dirs.home, '.claude')) };
+  fs.rmSync(root, { recursive: true, force: true });
+  return out;
+}
+
+const bashPayload = (command, extra = {}) => ({
+  tool_name: 'Bash', tool_input: { command }, cwd: CWD, session_id: 'sess-1', permission_mode: 'default', ...extra,
+});
+
+test('e2e: an ask for cat .env is printed and logged once, without touching HOME', () => {
+  const r = spawnGuard(bashPayload('cat .env'));
+  assert.equal(r.status, 0, r.stderr);
+  const out = JSON.parse(r.stdout);
+  assert.equal(out.hookSpecificOutput.hookEventName, 'PreToolUse');
+  assert.equal(out.hookSpecificOutput.permissionDecision, 'ask');
+  assert.ok(out.hookSpecificOutput.permissionDecisionReason.startsWith('constellation-guard [read-secret]'));
+  assert.equal(r.logs.length, 1);
+  assert.match(r.logs[0], /^\d{4}-\d{2}-\d{2}\.jsonl$/);
+  assert.equal(r.lines.length, 1);
+  const [line] = r.lines;
+  assert.equal(line.hook, 'constellation-guard');
+  assert.equal(line.decision, 'ask');
+  assert.equal(line.id, 'read-secret');
+  assert.equal(line.pathId, 'env-file');
+  assert.equal(line.tool, 'Bash');
+  assert.equal(line.target, 'cat .env');
+  assert.equal(line.session_id, 'sess-1');
+  assert.equal(line.cwd, CWD);
+  assert.equal(line.permission_mode, 'default');
+  assert.match(line.ts, /^\d{4}-\d{2}-\d{2}T/);
+  assert.equal(r.claudeDir, false, 'the temp HOME gained a .claude directory');
+});
+
+test('e2e: a deny is printed and logged with the subagent id', () => {
+  const r = spawnGuard(bashPayload('rm -rf ~', { agent_id: 'agent-7' }));
+  assert.equal(r.status, 0);
+  const out = JSON.parse(r.stdout).hookSpecificOutput;
+  assert.equal(out.permissionDecision, 'deny');
+  assert.match(out.permissionDecisionReason, /^constellation-guard \[rm-root-home\] blocked: /);
+  assert.equal(r.lines.length, 1);
+  assert.equal(r.lines[0].decision, 'deny');
+  assert.equal(r.lines[0].agent_id, 'agent-7');
+  assert.equal(r.lines[0].pathId, undefined);
+});
+
+test('e2e: the child reads its own env on each run (headless, fallback, critical)', () => {
+  const headless = JSON.parse(spawnGuard(bashPayload('cat .env'), { env: { CLAUDE_CODE_ENTRYPOINT: 'sdk-cli' } }).stdout).hookSpecificOutput;
+  assert.equal(headless.permissionDecision, 'deny');
+  assert.match(headless.permissionDecisionReason, /Headless runs cannot ask/);
+  const fallback = JSON.parse(spawnGuard(bashPayload('cat .env'), { env: { CONSTELLATION_GUARD_ASK: 'deny' } }).stdout).hookSpecificOutput;
+  assert.match(fallback.permissionDecisionReason, /CONSTELLATION_GUARD_ASK=deny/);
+  const critical = spawnGuard(bashPayload('cat .env'), { env: { CONSTELLATION_GUARD: 'critical' } });
+  assert.equal(critical.stdout.trim(), '{}');
+  assert.equal(critical.lines.length, 0);
+  const still = JSON.parse(spawnGuard(bashPayload('cat ~/.ssh/id_rsa'), { env: { CONSTELLATION_GUARD: 'critical' } }).stdout).hookSpecificOutput;
+  assert.equal(still.permissionDecision, 'deny');
+});
+
+test('e2e: the home rules use the child\'s own HOME', () => {
+  const r = spawnGuard(bashPayload('cat ~/.ssh/id_rsa'));
+  assert.equal(JSON.parse(r.stdout).hookSpecificOutput.permissionDecision, 'deny');
+  assert.equal(r.lines[0].pathId, 'ssh-private-key');
+});
+
+test('e2e: a benign command prints {} and writes no log line', () => {
+  const r = spawnGuard(bashPayload('git status && ls -la'));
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(JSON.parse(r.stdout), {});
+  assert.deepEqual(r.logs, []);
+  assert.equal(r.claudeDir, false);
+});
+
+test('e2e: input that is not a decision prints {} and exits 0, failing open', () => {
+  const inputs = ['', 'not json', '{"tool_name":', 'null', '42', '[]', '"cat .env"', JSON.stringify({ tool_name: 'Bash' }),
+    JSON.stringify({ tool_name: 'Read', tool_input: { file_path: '/h/.env' } })];
+  for (const input of inputs) {
+    const r = spawnGuard(input);
+    assert.equal(r.status, 0, JSON.stringify(input));
+    assert.deepEqual(JSON.parse(r.stdout), {}, JSON.stringify(input));
+    assert.doesNotMatch(r.stdout, /permissionDecision/);
+  }
+  // An exception is logged as ERROR (and only that): the garbage input produced no decision.
+  const bad = spawnGuard('not json');
+  assert.equal(bad.lines.length, 1);
+  assert.equal(bad.lines[0].level, 'ERROR');
+  assert.equal(bad.lines[0].hook, 'constellation-guard');
+  assert.equal(typeof bad.lines[0].error, 'string');
+  assert.equal(bad.lines[0].decision, undefined);
+});
+
+test('e2e: the log target is cut to 200 characters', () => {
+  const r = spawnGuard(bashPayload('cat .env ' + 'x'.repeat(500)));
+  assert.equal(r.lines.length, 1);
+  assert.equal(r.lines[0].target.length, 200);
+});
