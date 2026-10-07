@@ -327,6 +327,15 @@ test('env -S runs its string through the shell', () => {
     ['env -S cat -- .env', 'cat', ['--', '.env']],
     ["sudo env -S cat '$HOME/.aws/credentials'", 'cat', ['$HOME/.aws/credentials']],
     ["env --split-string=cat 'it'\\''s'", 'cat', ["it's"]],
+    // Only the first -S names the string; real env hands a later -S (or --split-string=x) to the
+    // child as a plain word, so `env -S cat -S x f` runs `cat -S x f` and `f` must stay visible.
+    ['env -S echo -S x y', 'echo', ['-S', 'x', 'y']],
+    ['env -S cat -S x ~/.ssh/id_rsa', 'cat', ['-S', 'x', '~/.ssh/id_rsa']],
+    ['env -S cat --split-string=x .env', 'cat', ['--split-string=x', '.env']],
+    // A STR that starts with env options is read by env itself: `env -S '-i cat' .env` runs `cat .env`.
+    ["env -S '-i cat' .env", 'cat', ['.env']],
+    ["env -S' -i cat' .env", 'cat', ['.env']],
+    ["env --split-string='-u FOO cat' .env", 'cat', ['.env']],
   ]) {
     const child = only(cmd, name);
     assert.equal(child.via, 'shell-c', cmd);

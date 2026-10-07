@@ -667,10 +667,15 @@ function hiddenCommands(words) {
   if (cmd === 'env') {
     // env splices the words after STR into the split string (`env -S 'echo a' b` runs `echo a b`), so
     // the child text is STR plus every word after it, each quoted to stay one literal word. The
-    // words start right after STR, not after env's options: `env -S cat -u f` hands `-u f` to cat.
+    // words start right after STR, not after env's options: `env -S cat -u f` hands `-u f` to cat,
+    // and so does a second -S (`env -S cat -S x f` runs `cat -S x f`): only the first -S counts.
     const o = readOptions(args, 0, PREFIXES.get('env'));
-    if (o.values.S === undefined) return [];
-    return [{ via: 'shell-c', src: [o.values.S].concat(args.slice(o.ends.S).map(singleQuote)).join(' ') }];
+    const str = o.values.S;
+    if (str === undefined) return [];
+    // env reads options at the start of STR itself (`env -S '-i cat' f` runs `cat f`, and leading
+    // blanks are skipped first), so STR gets an `env` of its own to strip them.
+    const head = /^\s*-/.test(str) ? 'env ' + str : str;
+    return [{ via: 'shell-c', src: [head].concat(args.slice(o.ends.S).map(singleQuote)).join(' ') }];
   }
   if (cmd === 'xargs') {
     const rest = args.slice(readOptions(args, 0, XARGS).next);
@@ -771,7 +776,8 @@ const singleQuote = (w) => "'" + w.replace(/'/g, "'\\''") + "'";
  * Read the options that start at words[i]. Returns the index of the first word that is not an
  * option (after an optional `--`) and the values taken, keyed by the option's letter. Short
  * options may be clustered (`-Eu root`); a valued one takes the rest of its cluster (`-uroot`) or
- * else the next word. `ends` holds, per valued option, the index just past its (last) value.
+ * else the next word. When an option repeats, the first value is the one kept; `ends` holds, per
+ * valued option, the index just past that first value.
  */
 function readOptions(words, i, spec) {
   const values = {};
@@ -785,17 +791,20 @@ function readOptions(words, i, spec) {
       const eq = w.indexOf('=');
       const name = eq === -1 ? w.slice(2) : w.slice(2, eq);
       if (Object.hasOwn(spec.long, name)) {
-        if (eq !== -1) values[spec.long[name]] = w.slice(eq + 1);
-        else if (i < words.length) values[spec.long[name]] = words[i++];
-        if (values[spec.long[name]] !== undefined) ends[spec.long[name]] = i;
+        let v;
+        if (eq !== -1) v = w.slice(eq + 1);
+        else if (i < words.length) v = words[i++];
+        const key = spec.long[name];
+        if (v !== undefined && values[key] === undefined) { values[key] = v; ends[key] = i; }
       }
       continue;
     }
     for (let k = 1; k < w.length; k++) {
       if (!spec.short.includes(w[k])) continue;
-      if (k + 1 < w.length) values[w[k]] = w.slice(k + 1);
-      else if (i < words.length) values[w[k]] = words[i++];
-      if (values[w[k]] !== undefined) ends[w[k]] = i;
+      let v;
+      if (k + 1 < w.length) v = w.slice(k + 1);
+      else if (i < words.length) v = words[i++];
+      if (v !== undefined && values[w[k]] === undefined) { values[w[k]] = v; ends[w[k]] = i; }
       break;
     }
   }
