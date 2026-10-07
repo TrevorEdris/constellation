@@ -123,6 +123,36 @@ test('duplicate session_id takes newest SESSION.md mtime', () => {
   assert.equal(resolveSessionDir(root, { sessionId: 'id1' }), a);
 });
 
+test('scan matches only an exact top-level session_id', () => {
+  const root = makeTmp();
+  const decoys = new Date('2026-10-06T09:00:00Z');
+  const real = new Date('2026-10-06T08:00:00Z');
+
+  // Every decoy mentions id1 inside the first 4096 bytes, so only the parsed
+  // top-level session_id can keep it out. Each is newer than the real dir will
+  // be, so an accepted decoy would also win on mtime.
+  const decoy = (name, text) => {
+    const dir = path.join(root, name);
+    fs.mkdirSync(dir);
+    const file = path.join(dir, 'SESSION.md');
+    fs.writeFileSync(file, text);
+    fs.utimesSync(file, decoys, decoys);
+  };
+  // The id appears in the body, but the session_id belongs to another session.
+  decoy('2026-10-06_body-mention', '---\nschema: v1\nsession_id: other\n---\n\n# Session\n\nResumed from id1\n');
+  // The id appears as a nested key; the top-level session_id is another one.
+  decoy('2026-10-06_nested', [
+    '---', 'schema: v1', 'session_id: zzz', 'delivery:', '  - repo: /x', '    session_id: id1', '---', '', '# Session', '',
+  ].join('\n'));
+  // The wanted id is a prefix of this one.
+  decoy('2026-10-06_longer-id', '---\nschema: v1\nsession_id: id10\n---\n\n# Session\n');
+
+  assert.equal(resolveSessionDir(root, { sessionId: 'id1' }), null);
+
+  const owner = makeSessionDir(root, '2026-10-06_owner', { id: 'id1', mtime: real });
+  assert.equal(resolveSessionDir(root, { sessionId: 'id1' }), owner);
+});
+
 test('legacy .active file or dir is ignored and preserved', () => {
   const root = makeTmp();
   makeSessionDir(root, '2026-10-06_decoy', { id: 'someone-else' });
