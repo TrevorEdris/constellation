@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.1 — 2026-10-07
+
+- feat(plan-validator): check the plan/v3 card Brief
+
 ## 0.2.0 — 2026-10-07
 
 - fix(plan-validator): parse frontmatter and flag placeholders and unverified steps
