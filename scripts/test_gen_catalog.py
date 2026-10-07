@@ -355,6 +355,33 @@ def test_interpreted_scripts_pass(tmp_path):
     assert_clean(run(root, "--check"))
 
 
+def test_prefixed_bare_scripts_flagged(tmp_path):
+    """C5 binds every path-prefix form by name; each must be flagged when no interpreter leads."""
+    root = make_tree(tmp_path)
+    add_scripts(root)
+    write(root, DOC, (
+        "Spans:\n"
+        "`${CLAUDE_PLUGIN_ROOT}/skills/alpha/scripts/y.py`\n"
+        "`$CLAUDE_PLUGIN_ROOT/skills/alpha/scripts/y.py`\n"
+        "`./scripts/x.sh`\n"
+        "\n"
+        "```\n"
+        "../scripts/x.sh\n"
+        "~/scripts/x.sh\n"
+        "/abs/skills/alpha/scripts/z.cjs\n"
+        "```\n"
+    ))
+    assert_fails(
+        run(root, "--check"),
+        bare(DOC, 2, "${CLAUDE_PLUGIN_ROOT}/skills/alpha/scripts/y.py", "python3"),
+        bare(DOC, 3, "$CLAUDE_PLUGIN_ROOT/skills/alpha/scripts/y.py", "python3"),
+        bare(DOC, 4, "./scripts/x.sh", "bash"),
+        bare(DOC, 7, "../scripts/x.sh", "bash"),
+        bare(DOC, 8, "~/scripts/x.sh", "bash"),
+        bare(DOC, 9, "/abs/skills/alpha/scripts/z.cjs", "node"),
+    )
+
+
 def test_placeholder_prefixed_script_with_interpreter_passes(tmp_path):
     root = make_tree(tmp_path)
     write(root, DOC, (
