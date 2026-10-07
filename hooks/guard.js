@@ -537,8 +537,10 @@ const PLAIN_PATH_CHARS = /^[A-Za-z0-9_.+~/-]+$/;
 // A segment that is only the closing `}` of a group, or `!`, has no command to judge.
 const LONE_SYNTAX = new Set(['{', '}', '!']);
 // Words that run no program: the test builtins `[` and `[[`, and the null command `:`. Whatever is
-// inside a test is only its arguments, a `$( )` in it is a substitution of its own, and `&&` and
-// `||` start a new segment, so a reader behind one is still seen. `test -f x` passes the same way.
+// inside a test is only its arguments, and a `$( )` in it is a substitution of its own. A `&&` or
+// `||` after the test starts a new segment, so a reader behind one is still seen. One inside `[[ ]]`
+// splits the test itself; testContinuations finds the pieces so that net A does not ask about them.
+// `test -f x` passes the same way.
 const NO_PROGRAM = new Set(['[', '[[', ':']);
 // The parser reads the default arm of a case, `*)`, as a segment whose only word is `*`.
 const CASE_DEFAULT_ARM = /^[*?]+$/;
@@ -549,12 +551,36 @@ function isPlain(word) {
 }
 
 /**
+ * The segments that are the rest of a `[[ ... ]]` test. The parser splits `[[ -f x && -d y ]]` at
+ * its inner `&&` (or `||`), so the second half, `-d y ]]`, shows a test operand where a command
+ * word should be. A test opens at a segment whose command word is `[[` and closes at the first
+ * segment of the same body (same parent) that ends in `]]`; the segments in between are returned.
+ * Only net A skips them: every other rule still sees them, and a `$( )` in the test is a segment
+ * of a body of its own, so it is not one of them.
+ */
+function testContinuations(segments) {
+  const cont = new Set();
+  const open = new Set(); // the parents of the bodies that are inside a test
+  for (const seg of segments) {
+    const ends = seg.words[seg.words.length - 1] === ']]';
+    if (open.has(seg.parent)) {
+      cont.add(seg);
+      if (ends) open.delete(seg.parent);
+    } else if (!ends && cmdOf(seg).word === '[[') {
+      open.add(seg.parent);
+    }
+  }
+  return cont;
+}
+
+/**
  * Safety net for what the parser does not model: `a[0]=1 cmd`, `{fd}>f cmd`, `$CC file`, an
  * empty or quoted-away command word. If the word that runs is not a plain program name, nothing
  * after it can be trusted, so it asks. A lone `*` or `?` in a command that has a `case` is an arm
  * pattern, not a command, so it passes; the price is that `case x in a) *;; esac` passes too.
  */
 function unrecognizedCommandWord(seg, ctx) {
+  if (ctx.testRest.has(seg)) return null;
   const { cmd, args, word } = cmdOf(seg);
   if (word === null) return null;
   if (cmd === '' && args.length === 0 && ASSIGNMENT.test(word)) return null; // only assignments
@@ -637,6 +663,7 @@ function decide(payload, opts) {
     homeDir: typeof home === 'string' && posix.isAbsolute(home) ? tidy(home) : '',
     unparsed: parsed.unparsed,
     hasCase: parsed.segments.some((seg) => cmdOf(seg).cmd === 'case'),
+    testRest: testContinuations(parsed.segments),
   };
   const critical = env.CONSTELLATION_GUARD === 'critical';
 

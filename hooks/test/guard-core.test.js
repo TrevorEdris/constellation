@@ -155,6 +155,14 @@ test('deny rules: the same words in harmless positions are not denied', () => {
     'echo diskutil eraseDisk disk2',
     'git log --grep=eraseDisk',
     'echo mkfs.ext4 /dev/sdb1',
+    // A system directory is only dangerous as the target of rm, so naming one to another command is fine.
+    'ls /usr',
+    'cd /etc',
+    'echo /var',
+    'du -sh /opt',
+    'stat /opt',
+    'find /usr/local -name x',
+    'ls -la /Users /home',
   ];
   for (const cmd of rows) assert.equal(run(cmd), null, cmd);
 });
@@ -221,6 +229,27 @@ test('read-secret asks (never denies) for ask-tier paths', () => {
     assert.equal(d.pathId, pathId, cmd);
     assert.ok(d.reason.startsWith('constellation-guard [read-secret] '), d.reason);
     assert.ok(d.reason.endsWith(ASK_TAIL), d.reason);
+  }
+});
+
+test('read-secret: every reader denies a deny-tier path and asks for an ask-tier one', () => {
+  const readers = ['cat', 'tac', 'less', 'more', 'head', 'tail', 'bat', 'batcat', 'view', 'nl', 'strings', 'xxd', 'hexdump', 'od', 'base64',
+    'grep', 'egrep', 'fgrep', 'rg', 'ag', 'awk', 'gawk', 'sed', 'cut', 'sort', 'uniq', 'diff', 'cmp', 'jq', 'yq'];
+  // These take a pattern, script or filter first, so the file comes after it.
+  const takesPattern = new Set(['grep', 'egrep', 'fgrep', 'rg', 'ag', 'sed', 'awk', 'gawk', 'jq']);
+  assert.equal(new Set(readers).size, readers.length, 'no name twice');
+  for (const name of readers) {
+    const lead = takesPattern.has(name) ? 'x ' : '';
+    const deny = run(`${name} ${lead}~/.ssh/id_rsa`);
+    assert.equal(deny?.decision, 'deny', name);
+    assert.equal(deny.id, 'read-secret', name);
+    assert.equal(deny.pathId, 'ssh-private-key', name);
+    const ask = run(`${name} ${lead}.env`);
+    assert.equal(ask?.decision, 'ask', name);
+    assert.equal(ask.id, 'read-secret', name);
+    assert.equal(ask.pathId, 'env-file', name);
+    // A reader's name is only a reader as the command word.
+    assert.equal(run(`echo ${name} ~/.ssh/id_rsa`), null, name);
   }
 });
 
@@ -464,6 +493,19 @@ test('precedence: deny beats ask, then the lowest position wins, then table orde
   const denyFirst = run('cat ~/.ssh/id_rsa; cat .env');
   assert.equal(denyFirst.decision, 'deny');
   assert.equal(denyFirst.pathId, 'ssh-private-key');
+  // Inside one segment too: an approved prompt must never read a key that sits beside an ask-tier file.
+  for (const [cmd, pathId] of [
+    ['cat .env ~/.ssh/id_rsa', 'ssh-private-key'],
+    ['cat ~/.ssh/id_rsa .env', 'ssh-private-key'],
+    ['grep KEY .env ~/.aws/credentials', 'aws-credentials'],
+    ['grep KEY ~/.aws/credentials .env', 'aws-credentials'],
+    ['cat .env < ~/.ssh/id_rsa', 'ssh-private-key'],
+  ]) {
+    const d = run(cmd);
+    assert.equal(d?.decision, 'deny', cmd);
+    assert.equal(d.id, 'read-secret', cmd);
+    assert.equal(d.pathId, pathId, cmd);
+  }
 
   const ask = run('cat .env; cat .env.local');
   assert.equal(ask.decision, 'ask');
@@ -749,6 +791,13 @@ test('safety net A: a command word that is not a plain program name asks', () =>
     // `[`, `[[` and `:` run no program, so they are as plain as `test -f x`, which passes.
     'test -f x', '[ -f x ] && ls', '[[ -f x ]] && ls', 'if [ -f x ]; then cat x; fi', '[ -d .git ] && git status',
     '[[ -n $X ]] || ls', 'if [ -z "$X" ]; then ls; fi', ': > out.txt', 'while :; do ls; done', 'until [ -f done ]; do sleep 1; done',
+    // The parser splits `[[ a && b ]]` at the inner `&&` or `||`; the rest of the test is not a command either.
+    '[[ -f x && -d y ]] && echo ok', '[[ -z "$X" || "$X" = foo ]]', 'if [[ $(uname) == Darwin && -f /etc/x ]]; then ls; fi',
+    'while [[ $i -lt 3 && -f x ]]; do ls; done', '[[ -f x && ! -d y ]]', '[[ -f x || -d y || -e z ]] && ls', '[[ ( -f x || -d y ) && -f z ]]',
+    '[[ -f x && ( -d y || -d z ) ]]', "bash -c '[[ -f x && -d y ]]'", '[[ $( [[ a && b ]] ) == x && -f y ]]',
+    '[[ -f x && -d y ]]; [[ -f x && -d y ]]', 'case $x in a) [[ -f x && -d y ]] && ls;; esac',
+    // The same checks written the other ways always passed.
+    '[[ -f x ]]', '[ -f x -a -d y ]', '[ a ] && [ b ]', '(( a && b ))',
     // The default arm of a case (`*)`) is read as a segment that is only a glob.
     'case $x in a) ls;; *) echo hi;; esac', 'case $x in a) ls;; ?) echo hi;; esac', "bash -c 'case $x in a) ls;; *) echo hi;; esac'",
   ];
@@ -761,6 +810,24 @@ test('safety net A: a command word that is not a plain program name asks', () =>
   assert.equal(run('if [ -f x ]; then cat .env; fi').id, 'read-secret');
   assert.equal(run('if [ -f x ]; then rm -rf ~; fi').id, 'rm-root-home');
   assert.equal(run('case $x in a) cat .env;; *) echo hi;; esac').id, 'read-secret');
+  // ...and the same inside `[[ a && b ]]`: only net A skips the rest of the test, every other rule still reads it.
+  assert.equal(run('[[ -f x && -d y ]] && cat .env').id, 'read-secret');
+  assert.equal(run('[[ -f x && -d y ]] && rm -rf ~').id, 'rm-root-home');
+  assert.equal(run('[[ -f x && $(cat ~/.ssh/id_rsa) = y ]]').pathId, 'ssh-private-key');
+  assert.equal(run('[[ -f x && -d $(rm -rf ~) ]]').id, 'rm-root-home');
+  // A command in a `$( )` inside the test is a segment of its own and net A still judges it.
+  assert.equal(run('[[ -f x && $(a[0]=1 ls) = y ]]')?.id, 'unrecognized-command-word');
+  assert.equal(run('[[ $(a[0]=1 ls) = y && -f x ]]')?.id, 'unrecognized-command-word');
+  // The rest of a test ends at its `]]`: what follows is judged as before.
+  assert.equal(run('[[ -f x && -d y ]] && a[0]=1 ls')?.id, 'unrecognized-command-word');
+  assert.equal(run('[[ -f x && -d y ]]; $X')?.id, 'unrecognized-command-word');
+  assert.equal(run('[[ -f x && -d y ]] && $X')?.id, 'unrecognized-command-word');
+  assert.equal(run('if [[ -f x && -d y ]]; then $X; fi')?.id, 'unrecognized-command-word');
+  assert.equal(run('[[ a && b ]] && [[ c && d ]] && $X')?.id, 'unrecognized-command-word');
+  // A test operand is only exempt behind a `[[`: on its own it is a command word that is not plain.
+  assert.equal(run('echo hi && $X ]]')?.id, 'unrecognized-command-word');
+  assert.equal(run('[ -f x ] && $X ]]')?.id, 'unrecognized-command-word');
+  assert.equal(run('$X [[ -f x && -d y ]]')?.id, 'unrecognized-command-word');
   // The `*)` exemption is for a case statement only: a lone glob as a command asks.
   assert.equal(run('*')?.id, 'unrecognized-command-word');
   assert.equal(run('echo hi; *')?.id, 'unrecognized-command-word');
