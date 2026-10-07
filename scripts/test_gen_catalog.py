@@ -551,6 +551,7 @@ def test_agent_files_are_linted(tmp_path):
 
 HEADER_MESSAGE = f'table header must be exactly "{UPSTREAM_HEADER}"'
 SHA_MESSAGE = "must be a bare 7 to 40 character hex commit for origin"
+ROW_MESSAGE = "row does not match | `path` | origin | upstream path | synced | notes |"
 
 
 def test_missing_upstream_file(tmp_path):
@@ -628,6 +629,22 @@ def test_header_row_missing(tmp_path):
     for header in (None, "| Constellation path | Origin | Upstream | Synced | Notes |"):
         write_upstream(root, upstream_row("skills/alpha/"), header=header)
         assert_fails(run(root, "--check"), f"UPSTREAM.md:1: upstream-bad-row: {HEADER_MESSAGE}")
+
+
+def test_non_skill_row_with_unparsable_shape(tmp_path):
+    """A table line the row regex rejects is its own violation, not a silent skip.
+
+    Skill rows fail anyway through upstream-missing-row; only a non-skill row (here agents/)
+    would otherwise slip through.
+    """
+    root = make_tree(tmp_path)
+    for bad in (
+        "| `agents/` | fotw | `agents/` |  | Carried. |",  # empty Synced cell
+        "| `agents/` | superpowers | `agents/` | 7e51643 v5.0.5 | Carried. |",  # two-word Synced
+        "| agents/ghost/ | fotw | `agents/` | - | Carried. |",  # path not backticked
+    ):
+        write_upstream(root, upstream_row("skills/alpha/"), bad)
+        assert_fails(run(root, "--check"), f"UPSTREAM.md:{FIRST_ROW + 1}: upstream-bad-row: {ROW_MESSAGE}")
 
 
 def test_missing_row_reports_at_line_1_when_header_missing(tmp_path):

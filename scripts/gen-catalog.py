@@ -18,8 +18,8 @@ Every violation prints as <relpath>:<line>: <rule>: <message>. Lints (constellat
   - bare-script: a code span or fence line that starts with a bundled scripts/<name>.(sh|py|js|cjs)
     path, or runs one with the wrong interpreter, must name bash/sh, python3 or node first
   - upstream-missing / upstream-missing-row / upstream-bad-row: UPSTREAM.md exists, has the
-    exact table header, gives every top-level skill a row, and every row has an existing path,
-    a known origin and a Synced cell that fits it
+    exact table header, gives every top-level skill a row, and every table line below the header
+    is a well-formed row with an existing path, a known origin and a Synced cell that fits it
 Adding a skill = drop skills/<name>/SKILL.md; the catalog auto-registers it. No manifest edit.
 """
 import argparse
@@ -68,6 +68,9 @@ SCRIPT_LINT_EXEMPT = {"skills/brainstorming/references/visual-companion.md"}
 # UPSTREAM.md provenance table. A row is | `path` | origin | upstream path | synced | notes |
 UPSTREAM_HEADER = "| Constellation path | Origin | Upstream path | Synced | Notes |"
 UPSTREAM_ROW = re.compile(r"^\|\s*`([^`]+)`\s*\|\s*([a-z+]+)\s*\|[^|]*\|\s*(\S+)\s*\|")
+# The divider under the header, e.g. | --- | :-: |; the only table line that is not a row.
+UPSTREAM_DIVIDER = re.compile(r"^\|[\s:|-]+$")
+UPSTREAM_ROW_SHAPE = "row does not match | `path` | origin | upstream path | synced | notes |"
 UPSTREAM_ORIGINS = ("superpowers", "superpowers+fotw", "fotw", "constellation")
 COMMIT = re.compile(r"^[0-9a-f]{7,40}$")
 
@@ -319,7 +322,8 @@ def lint_upstream(root, skills):
     """Check UPSTREAM.md: the table header, each row, and a row for every top-level skill.
 
     A missing or changed header is one violation at line 1. Skills without a row are reported at
-    the header line, or at line 1 when there is no header.
+    the header line, or at line 1 when there is no header. Below the header, a table line that is
+    neither the divider nor a well-formed row is a violation too, so a malformed row cannot hide.
     """
     path = root / "UPSTREAM.md"
     if not path.is_file():
@@ -328,6 +332,8 @@ def lint_upstream(root, skills):
     lines = path.read_text(encoding="utf-8", errors="ignore").split("\n")
     out = []
     header_line = next((n for n, line in enumerate(lines, 1) if line.rstrip() == UPSTREAM_HEADER), None)
+    # Without a header there is no table to hold lines to, so only the one header violation shows.
+    table_start = header_line
     if header_line is None:
         header_line = 1
         out.append(("UPSTREAM.md", 1, "upstream-bad-row",
@@ -339,6 +345,9 @@ def lint_upstream(root, skills):
             covered.add(m.group(1))
             out += [("UPSTREAM.md", n, "upstream-bad-row", msg)
                     for msg in upstream_row_problems(root, *m.groups())]
+        elif (table_start is not None and n > table_start and line.startswith("|")
+              and not UPSTREAM_DIVIDER.match(line)):
+            out.append(("UPSTREAM.md", n, "upstream-bad-row", UPSTREAM_ROW_SHAPE))
     for name, _, _ in skills:
         if f"skills/{name}/" not in covered:
             out.append(("UPSTREAM.md", header_line, "upstream-missing-row",
