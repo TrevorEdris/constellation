@@ -9,6 +9,7 @@ Run from the repo root:
 
 import inspect
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -1898,6 +1899,39 @@ def test_delivery_repo_path_error(tmp_path, repo_value, reason, probe):
     assert reason in errors[0].message
 
 
+@pytest.mark.parametrize("probe", [True, False], ids=["probe", "no-probe"])
+def test_delivery_repo_unreadable_is_a_finding_not_a_crash(tmp_path, probe):
+    # Path.exists() only swallows "no such file" errors; a directory the user cannot search raises
+    locked = tmp_path / "locked"
+    (locked / "repo").mkdir(parents=True)
+    locked.chmod(0o000)
+    try:
+        if os.access(locked, os.X_OK):
+            pytest.skip("a directory cannot be made unsearchable for this user (running as root?)")
+        report = _delivery_report(tmp_path, probe=probe, **{"repo: {repo}": f"repo: {locked}/repo"})
+        errors = _fires_only(report, "delivery_repo_path", "delivery")
+        assert "cannot be read" in errors[0].message and f"{locked}/repo" in errors[0].message
+        assert "Permission denied" in errors[0].message  # why, from the operating system
+    finally:
+        locked.chmod(0o755)
+
+
+@pytest.mark.parametrize("probe", [True, False], ids=["probe", "no-probe"])
+def test_delivery_repo_name_too_long_is_a_finding_not_a_crash(tmp_path, probe):
+    report = _delivery_report(tmp_path, probe=probe, **{"repo: {repo}": "repo: {repo}/" + "x" * 5000})
+    errors = _fires_only(report, "delivery_repo_path", "delivery")
+    assert "cannot be read" in errors[0].message and "too long" in errors[0].message
+
+
+@pytest.mark.parametrize("prs", ["9" * 5000, "10000"], ids=["5000-digits", "five-digits"])
+@pytest.mark.parametrize("probe", [True, False], ids=["probe", "no-probe"])
+def test_delivery_prs_too_large_is_a_finding_not_a_crash(tmp_path, prs, probe):
+    # int() refuses a string of more than 4300 digits, so the size has to be bounded before it is converted
+    errors = _fires_only(_delivery_report(tmp_path, probe=probe, **{"prs: 1": f"prs: {prs}"}), "delivery_prs", "delivery")
+    assert "9999" in errors[0].message
+    assert len(errors[0].message) < 200  # does not echo 5000 digits back
+
+
 @pytest.mark.parametrize(
     "edit",
     [
@@ -1938,18 +1972,20 @@ def test_delivery_prs_defaults_by_mode(tmp_path):
 # live probe
 
 
+@pytest.mark.parametrize("edit", [{}, STACK_2], ids=["pr", "stack"])
 @pytest.mark.parametrize("remote", ["upstream", None], ids=["other-remote", "no-remote"])
-def test_delivery_remote_absent_error(tmp_path, remote):
-    errors = _fires_only(_delivery_report(tmp_path / "on", remote=remote), "delivery_remote_absent", "delivery")
+def test_delivery_remote_absent_error(tmp_path, remote, edit):
+    errors = _fires_only(_delivery_report(tmp_path / "on", remote=remote, **edit), "delivery_remote_absent", "delivery")
     message = errors[0].message
     assert "origin" in message and str(tmp_path / "on" / "repo") in message
     assert (remote or "no remote") in message  # what the repo has instead
     # only the probe can know what the repo's remotes are
-    _assert_no_delivery_findings(_delivery_report(tmp_path / "off", probe=False, remote=remote))
+    _assert_no_delivery_findings(_delivery_report(tmp_path / "off", probe=False, remote=remote, **edit))
 
 
-def test_delivery_remote_must_be_among_several(tmp_path):
-    plan = v3_plan(tmp_path, remote="upstream")
+@pytest.mark.parametrize("edit", [{}, STACK_2], ids=["pr", "stack"])
+def test_delivery_remote_must_be_among_several(tmp_path, edit):
+    plan = v3_plan(tmp_path, remote="upstream", **edit)
     _add_remote(tmp_path / "repo", "origin")
     _assert_no_delivery_findings(vp.validate_plan(plan))
 

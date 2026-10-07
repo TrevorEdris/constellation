@@ -1701,7 +1701,8 @@ _LOCAL_ONLY_PHRASE_RE = re.compile(
 )
 _LOCAL_WORD_RE = re.compile(r"\blocal\b", re.IGNORECASE)
 _SIZE_PRS_RE = re.compile(r"(\d+) PRs?\b")
-_WHOLE_NUMBER_RE = re.compile(r"\d+")
+# At most 4 digits: no plan ships 10,000 PRs, and int() refuses a string of more than 4300 digits
+_WHOLE_NUMBER_RE = re.compile(r"\d{1,4}")
 
 
 class RemoteState(NamedTuple):
@@ -1823,10 +1824,19 @@ def _read_delivery_item(
         path = Path(repo)
         if not path.is_absolute():
             fail("delivery_repo_path", f"repo '{repo}' is not an absolute path.")
-        elif not path.exists():
-            fail("delivery_repo_path", f"repo '{repo}' does not exist.")
-        elif not path.is_dir():
-            fail("delivery_repo_path", f"repo '{repo}' is not a directory.")
+        else:
+            try:
+                # exists() and is_dir() raise for a path the file system refuses to look at (an
+                # unsearchable parent, a name that is too long), not only for one that is missing
+                exists = path.exists()
+                is_dir = exists and path.is_dir()
+            except OSError as exc:
+                fail("delivery_repo_path", f"repo '{repo}' cannot be read: {exc.strerror or exc}.")
+            else:
+                if not exists:
+                    fail("delivery_repo_path", f"repo '{repo}' does not exist.")
+                elif not is_dir:
+                    fail("delivery_repo_path", f"repo '{repo}' is not a directory.")
 
     if text("remote") == "none" and mode in ("pr", "stack"):
         fail("delivery_remote_absent", f"mode {mode} pushes to a remote, so 'remote: none' cannot be right; name one (git remote -v lists them).")
@@ -1837,7 +1847,8 @@ def _read_delivery_item(
         if mode == "stack":
             fail("delivery_prs", "a stack must say how many PRs it has: 'prs: N', with N at least 2.")
     elif not (isinstance(prs, str) and _WHOLE_NUMBER_RE.fullmatch(prs)):
-        fail("delivery_prs", f"prs must be a whole number, not {prs!r}.")
+        shown = repr(prs) if len(repr(prs)) <= 40 else repr(prs)[:37] + "..."
+        fail("delivery_prs", f"prs must be a whole number from 0 to 9999, not {shown}.")
     else:
         count = int(prs)
         if mode == "stack" and count < 2:
