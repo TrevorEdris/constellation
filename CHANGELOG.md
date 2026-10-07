@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.4 — 2026-10-07
+
+- fix(git-workflow): accept hyphens, feat/ and ticket IDs in branch-check
+
 ## 0.3.3 — 2026-10-07
 
 - fix(session): announce the journal once per session and log compactions
