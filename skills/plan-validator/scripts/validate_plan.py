@@ -17,15 +17,21 @@ errors for card, delivery, placeholder and step findings. Every other plan is
 legacy: the same checks as before, new checks as warnings, plus one `legacy`
 warning. No new check changes the score, so a legacy plan's PASS/NEEDS WORK
 status never changes because of the v3 work.
+
+A v3 plan lists where its work ships in a `delivery:` block list. That list is
+checked against the card's Ships-as and Size lines and, unless the probe is
+off, against what git says about each repo (its remotes and recent commits).
 """
 
 import argparse
 import json
+import os
 import re
+import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, NamedTuple, Optional
+from typing import Any, Callable, NamedTuple, Optional
 
 
 # ---------------------------------------------------------------------------
@@ -1665,6 +1671,317 @@ def check_card(lines: list[str], report: ValidationReport) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Delivery (plan/v3)
+#
+# A v3 plan's frontmatter lists where its work ships: one block-list item per
+# repo. check_delivery reads the list, checks the card's Ships-as and Size
+# lines against it, and scans the prose for wording that says "local only".
+# With probe=True it also looks at each repo with git, so a plan cannot name a
+# remote that is not there or say "no PR" about a repo whose history shows PRs
+# (G1-03). Every finding is an error with category "delivery" and a stable
+# `rule` id, and none touches the score.
+# ---------------------------------------------------------------------------
+
+DELIVERY_KEYS = ("repo", "mode", "branch", "base", "remote", "prs")
+DELIVERY_MODES = ("pr", "stack", "local-only")
+# S1's session parser reads frontmatter flat, so a delivery key with one of these names
+# would be taken for the plan's own.
+DELIVERY_RESERVED_KEYS = ("status", "schema", "session_id")
+PROBE_TIMEOUT_SECONDS = 5
+_PROBE_ENV_DROPPED = ("GIT_DIR", "GIT_INDEX_FILE", "GIT_WORK_TREE")
+_NOT_A_WORK_TREE = "not a git work tree"  # starts RemoteState.error when git ran and refused the directory
+
+_PR_SUBJECT_RE = re.compile(r"\(#\d+\)")
+_LOCAL_ONLY_PHRASE_RE = re.compile(
+    r"\bno PRs?\b(?!\s+(?:template|title|body|description|number|comment))"
+    r"|\blocal[- ]only\b"
+    r"|\bno remote\b(?=\s*(?:$|[,.;)]|exists|configured|repo))"
+    r"|\bmerged?\s+(?:\S+\s+){0,3}?locally\b",
+    re.IGNORECASE,
+)
+_LOCAL_WORD_RE = re.compile(r"\blocal\b", re.IGNORECASE)
+_SIZE_PRS_RE = re.compile(r"(\d+) PRs?\b")
+_WHOLE_NUMBER_RE = re.compile(r"\d+")
+
+
+class RemoteState(NamedTuple):
+    """What git says about a delivery repo.
+
+    remotes: the remote names from `git remote -v`, in order.
+    pr_subjects: the subjects among the last 5 commits that carry a PR number, like `feat: x (#12)`.
+    error: why git could not read the repo, else None. "not a git work tree: ..." when git ran and
+        refused the directory; "could not run git: ..." when git is missing or timed out.
+    """
+
+    remotes: list[str]
+    pr_subjects: list[str]
+    error: Optional[str] = None
+
+
+class _Delivery(NamedTuple):
+    """One `delivery` item that passed every check that needs no git. line is its 1-indexed file line."""
+
+    repo: str
+    mode: str
+    branch: str
+    base: str
+    remote: str
+    prs: int
+    line: int
+
+
+def _run_git(repo: str, *args: str) -> "subprocess.CompletedProcess[str]":
+    """`git -C repo <args>` with a timeout, without the GIT_* variables that would point git at another repo."""
+    env = {key: value for key, value in os.environ.items() if key not in _PROBE_ENV_DROPPED}
+    return subprocess.run(
+        ["git", "-C", repo, *args],
+        capture_output=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=PROBE_TIMEOUT_SECONDS,
+        env=env,
+        check=False,
+    )
+
+
+def probe_remote(repo: "str | Path") -> RemoteState:
+    """Ask git, live, which remotes a delivery repo has and whether its recent commits came through PRs.
+
+    Runs `git -C repo remote -v` and `git -C repo log -5 --format=%s`, each with a 5 s timeout and with
+    GIT_DIR, GIT_INDEX_FILE and GIT_WORK_TREE removed, so a caller's repo (a git hook's, say) is never
+    the one probed. A repo with no commits makes `git log` exit 128; that is an empty history, so
+    pr_subjects is [] and error stays None.
+    """
+    path = str(repo)
+    try:
+        listing = _run_git(path, "remote", "-v")
+        if listing.returncode != 0:
+            reason = (listing.stderr.strip().splitlines() or ["no message"])[0]
+            return RemoteState([], [], f"{_NOT_A_WORK_TREE}: {reason}")
+        log = _run_git(path, "log", "-5", "--format=%s")
+    except (OSError, subprocess.SubprocessError) as exc:
+        return RemoteState([], [], f"could not run git: {exc}")
+
+    remotes = list(dict.fromkeys(line.split()[0] for line in listing.stdout.splitlines() if line.split()))
+    if log.returncode == 128:
+        return RemoteState(remotes, [], None)
+    if log.returncode != 0:
+        reason = (log.stderr.strip().splitlines() or ["no message"])[0]
+        return RemoteState(remotes, [], f"git log failed: {reason}")
+    return RemoteState(remotes, [s for s in log.stdout.splitlines() if _PR_SUBJECT_RE.search(s)], None)
+
+
+def _delivery_lines(lines: list[str], end_line: int) -> tuple[int, list[int]]:
+    """1-indexed lines of the frontmatter's `delivery:` key and of each `- ` item under it; (0, []) when absent."""
+    key = next((idx for idx in range(1, max(end_line - 1, 1)) if lines[idx].startswith("delivery:")), None)
+    if key is None:
+        return 0, []
+    items: list[int] = []
+    for idx in range(key + 1, end_line - 1):
+        if _DASH_RE.match(lines[idx].rstrip()):
+            items.append(idx + 1)
+        elif lines[idx].strip() and not lines[idx][0].isspace() and not lines[idx].startswith("#"):
+            break  # the next top-level key
+    return key + 1, items
+
+
+def _read_delivery_item(
+    item: dict[str, Any], n: int, line: int, error: Callable[[str, str, int], None]
+) -> Optional[_Delivery]:
+    """Check one `delivery` item for everything that needs no git; None when anything is wrong.
+
+    Reports every problem it finds in the item through error(rule, message, line), so one run
+    shows them all.
+    """
+    problems = 0
+
+    def fail(rule: str, message: str) -> None:
+        nonlocal problems
+        problems += 1
+        error(rule, f"Delivery item {n}: {message}", line)
+
+    def text(key: str) -> str:
+        value = item.get(key)
+        return value.strip() if isinstance(value, str) else ""
+
+    unknown = [key for key in item if key not in DELIVERY_KEYS]
+    if unknown:
+        hint = ""
+        if any(key in DELIVERY_RESERVED_KEYS for key in unknown):
+            hint = " The session parser reads frontmatter flat, so it would take that key for the plan's own."
+        fail("delivery_unknown_key", f"unknown key {', '.join(repr(k) for k in unknown)}; use only {', '.join(DELIVERY_KEYS)}.{hint}")
+    missing = [key for key in DELIVERY_KEYS if key != "prs" and not text(key)]
+    if missing:
+        fail("delivery_missing_key", f"missing or empty {', '.join(repr(k) for k in missing)}.")
+
+    mode = text("mode")
+    if mode and mode not in DELIVERY_MODES:
+        fail("delivery_bad_mode", f"mode '{mode}' is not one of {', '.join(DELIVERY_MODES)}.")
+
+    repo = text("repo")
+    if repo:
+        path = Path(repo)
+        if not path.is_absolute():
+            fail("delivery_repo_path", f"repo '{repo}' is not an absolute path.")
+        elif not path.exists():
+            fail("delivery_repo_path", f"repo '{repo}' does not exist.")
+        elif not path.is_dir():
+            fail("delivery_repo_path", f"repo '{repo}' is not a directory.")
+
+    if text("remote") == "none" and mode in ("pr", "stack"):
+        fail("delivery_remote_absent", f"mode {mode} pushes to a remote, so 'remote: none' cannot be right; name one (git remote -v lists them).")
+
+    prs = item.get("prs")
+    count = 1 if mode == "pr" else 0
+    if prs is None:
+        if mode == "stack":
+            fail("delivery_prs", "a stack must say how many PRs it has: 'prs: N', with N at least 2.")
+    elif not (isinstance(prs, str) and _WHOLE_NUMBER_RE.fullmatch(prs)):
+        fail("delivery_prs", f"prs must be a whole number, not {prs!r}.")
+    else:
+        count = int(prs)
+        if mode == "stack" and count < 2:
+            fail("delivery_prs", f"a stack's prs must be at least 2, not {count}; use mode: pr for one PR.")
+
+    if problems:
+        return None
+    return _Delivery(repo, mode, text("branch"), text("base"), text("remote"), count, line)
+
+
+def _ships_phrase(delivery: _Delivery) -> str:
+    """The text the card's Ships-as line must contain for this delivery."""
+    if delivery.mode == "pr":
+        return f"1 PR, {delivery.branch} → {delivery.remote}/{delivery.base}"
+    if delivery.mode == "stack":
+        return f"{delivery.prs}-PR stack, {delivery.branch} → {delivery.remote}/{delivery.base}"
+    return f"local only, no PR, {delivery.branch}"
+
+
+def _local_only_phrase_hits(lines: list[str], body_start: int) -> list[tuple[int, str]]:
+    """(1-indexed line, matched text) for each body line that reads as local-only wording.
+
+    Fenced code blocks and inline code spans are ignored. The frontmatter is data and is not scanned.
+    """
+    body = lines[body_start:]
+    fenced = _fence_mask(body)
+    texts = _mask_code_spans(body, fenced, " ")
+    hits = []
+    for idx, text in enumerate(texts):
+        match = None if fenced[idx] else _LOCAL_ONLY_PHRASE_RE.search(text)
+        if match:
+            hits.append((body_start + idx + 1, match.group()))
+    return hits
+
+
+def check_delivery(lines: list[str], report: ValidationReport, probe: bool = True) -> None:
+    """Check a `plan/v3` plan's `delivery` list, the card lines that describe it, and the local-only wording.
+
+    - The list must be a block list of items with exactly the keys repo, mode, branch, base, remote and prs.
+    - The card's Ships-as line must contain each delivery's phrase (`_ships_phrase`), and Size's PR count
+      must equal the sum of the deliveries' prs.
+    - Prose that reads as local-only needs a delivery with mode: local-only (G1-03).
+    - With probe=True each repo is read with git: it must be a git work tree (a local-only delivery with
+      remote: none may be a plain directory), a pr or stack remote must exist in it, and a local-only
+      delivery in a repo that has a remote or PR-style commits needs a numbered question that says "local".
+    """
+
+    def error(rule: str, message: str, line: int = 0) -> None:
+        report.issues.append(Issue(severity="error", category="delivery", message=message, line=line, rule=rule))
+
+    fm = parse_frontmatter("\n".join(lines))
+    key_line, item_lines = _delivery_lines(lines, fm.end_line)
+    raw = fm.data.get("delivery")
+    items: list[dict[str, Any]] = []
+    if not raw:
+        error(
+            "delivery_missing",
+            "No 'delivery:' list in the frontmatter. List each repo as a block item: "
+            "'- repo: <absolute path>' with mode, branch, base, remote and prs.",
+        )
+    elif not isinstance(raw, list) or not all(isinstance(item, dict) for item in raw):
+        error(
+            "delivery_flow_style",
+            "delivery must be a block-style list: one '- repo: <absolute path>' item per repo, "
+            "each followed by its mode, branch, base, remote and prs lines.",
+            key_line,
+        )
+    else:
+        items = raw
+
+    deliveries = [
+        found
+        for n, item in enumerate(items, 1)
+        if (found := _read_delivery_item(item, n, item_lines[n - 1] if n <= len(item_lines) else key_line, error))
+    ]
+    card = parse_card(lines)
+
+    if probe:
+        asked_local = any(_LOCAL_WORD_RE.search(q.text) for q in card.questions if not q.is_run)
+        for found in deliveries:
+            state = probe_remote(found.repo)
+            if state.error:
+                # A plain directory is fine for local-only with remote: none; a git that cannot run is not
+                plain_dir = found.mode == "local-only" and found.remote == "none" and state.error.startswith(_NOT_A_WORK_TREE)
+                if not plain_dir:
+                    error(
+                        "delivery_repo_not_git",
+                        f"Delivery repo {found.repo}: {state.error}. A delivery needs a git work tree; "
+                        "only mode: local-only with remote: none may point at a plain directory.",
+                        found.line,
+                    )
+            elif found.mode != "local-only":
+                if found.remote not in state.remotes:
+                    have = f"it has {', '.join(state.remotes)}" if state.remotes else "it has no remote"
+                    error(
+                        "delivery_remote_absent",
+                        f"Delivery repo {found.repo} has no remote named '{found.remote}' ({have}). "
+                        "Name a remote that git remote -v lists.",
+                        found.line,
+                    )
+            elif (state.remotes or state.pr_subjects) and not asked_local:
+                seen = [f"remote {', '.join(state.remotes)}"] if state.remotes else []
+                seen += [f"commits that came through PRs, like '{state.pr_subjects[0]}'"] if state.pr_subjects else []
+                error(
+                    "local_only_without_question",
+                    f"Delivery repo {found.repo} ships local only, but it has {' and '.join(seen)}. "
+                    "A repo that can reach a PR needs the user's say-so: ask it as a numbered question that "
+                    "says 'local' (with its [ask] D-line), for example 'Keep this local only, no PR?'.",
+                    found.line,
+                )
+
+    if deliveries and len(deliveries) == len(items):
+        ships = card.fields.get(SHIPS_LABEL)
+        if ships:
+            for found in deliveries:
+                phrase = _ships_phrase(found)
+                # Not inside a longer name: "feat/share" is not "feat/share-link", "2-PR" is not "12-PR"
+                if not re.search(rf"(?<![\w-]){re.escape(phrase)}(?![\w/-])", ships.text):
+                    error(
+                        "ships_as_mismatch",
+                        f"Ships as must say '{phrase}' for {found.repo}; it says '{ships.text}'.",
+                        ships.line,
+                    )
+        size = card.fields.get(SIZE_LABEL)
+        counted = _SIZE_PRS_RE.search(size.text) if size else None
+        total = sum(found.prs for found in deliveries)
+        if size and counted and int(counted.group(1)) != total:
+            error(
+                "size_pr_count_mismatch",
+                f"Size says {counted.group()} but the deliveries' prs add up to {total}.",
+                size.line,
+            )
+
+    if not any(item.get("mode") == "local-only" for item in items):
+        for line_no, phrase in _local_only_phrase_hits(lines, fm.end_line):
+            error(
+                "local_only_phrase",
+                f"The plan says '{phrase}' but no delivery has mode: local-only. If this work ships without a PR, "
+                "set 'mode: local-only' (and 'remote: none') on that delivery; otherwise reword the line.",
+                line_no,
+            )
+
+
+# ---------------------------------------------------------------------------
 # Report rendering
 # ---------------------------------------------------------------------------
 
@@ -1733,8 +2050,8 @@ def render_json(report: ValidationReport) -> str:
 def validate_plan(path: Path, probe: bool = True) -> ValidationReport:
     """Run all checks on a plan file and return the aggregated report.
 
-    probe: reserved for the live git-remote probe of v3 delivery repos, which
-    arrives with the delivery checks. No check reads it yet.
+    probe: whether check_delivery reads each v3 delivery repo with git (the CLI
+    default). The static delivery checks run either way; legacy plans never probe.
     """
     report = ValidationReport(path=str(path))
 
@@ -1785,6 +2102,7 @@ def validate_plan(path: Path, probe: bool = True) -> ValidationReport:
     check_git_commit_plan(lines, report)
     if is_v3(fm):
         check_card(lines, report)
+        check_delivery(lines, report, probe)
     else:
         check_brief(lines, report)
     check_placeholders(lines, report)
