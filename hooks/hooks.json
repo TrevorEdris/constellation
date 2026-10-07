@@ -6,12 +6,6 @@
         "hooks": [
           { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/session-start.js\"", "async": false }
         ]
-      },
-      {
-        "matcher": "compact",
-        "hooks": [
-          { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/post-compact-logger.js\"" }
-        ]
       }
     ],
     "UserPromptSubmit": [
@@ -27,6 +21,14 @@
         "matcher": "",
         "hooks": [
           { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/context-snapshot.js\"" }
+        ]
+      }
+    ],
+    "PostCompact": [
+      {
+        "matcher": "",
+        "hooks": [
+          { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/post-compact-logger.js\"" }
         ]
       }
     ],
