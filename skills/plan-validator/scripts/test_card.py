@@ -1,7 +1,8 @@
-"""Tests for card.py render: the approval card printed for a plan/v3 PLAN.md.
+"""Tests for card.py: render (the approval card printed for a plan/v3 PLAN.md), the reply
+classifier, and approve (what the user's reply does to the plan and the session log).
 
-Every test drives the real render path on a real plan file, with real git repos
-under tmp_path for the delivery probe. The golden card is
+Every test drives the real render or approve path on a real plan file, with real git
+repos under tmp_path for the delivery probe. The golden card is
 fixtures/v3-valid.card.txt: the card the valid v3 fixture must render to, with
 `{plan}` standing for the plan's path and the check time masked.
 
@@ -12,11 +13,12 @@ Run from the repo root:
 import hashlib
 import os
 import re
+import shlex
 import stat
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import NamedTuple
 
@@ -743,3 +745,592 @@ def test_answers_are_returned_only_for_an_approval():
     assert card.classify_reply("2 no, go", 3).answers == {2: "no"}
     for reply in ("2 no, go, wait", "2 maybe, go", "2 no, but go", "2 no, go 3 inline"):
         assert card.classify_reply(reply, 3).answers == {}, reply
+
+
+# ---------------------------------------------------------------------------
+# approve: the user's reply decides; the log records it; an approval rewrites the plan
+# ---------------------------------------------------------------------------
+
+SESSION = (
+    "# Session: Wishlist sharing\n"
+    "\n"
+    "## Goal\n"
+    "Let a user share a wishlist by link.\n"
+    "\n"
+    "## Decisions\n"
+    "\n"
+    "- **2026-10-06** — Chose hashed tokens.\n"
+    "\n"
+    "## Status\n"
+    "Plan awaiting approval.\n"
+)
+CONFIRM = f'Not sure that approves "{TITLE}". Reply go to approve as is, or tell me what to change.\n'
+
+# The plan lines an approval can touch, as the fixture writes them
+D1_ASK = "- D1 [ask] Share links expire? Default: after 30 days. Why: limits leaked links. If wrong: one config value.\n"
+D2_ASK = "- D2 [ask] Link viewers see claimed items? Default: no. Why: protects the surprise invariant. If wrong: one flag.\n"
+Q2 = "2. Link viewers see claimed items? → **no** (protects the surprise invariant; if wrong: one flag)\n"
+Q3 = "3. Run → **subagent-driven** (5 independent tasks; or inline)\n"
+STATUS_AWAITING = "status: awaiting-approval\n"
+STATUS_APPROVED = "status: approved\n"
+
+LOGGED_RE = re.compile(r"\*\*(\d{4}-\d{2}-\d{2})\*\* — (?=Approved|Change requested|Reply needing)")
+
+
+def _you(line: str, answer: str) -> str:
+    """line with its [ask] tag or its **bold** default replaced by the user's answer."""
+    if "[ask]" in line:
+        return line.replace("[ask]", f"[you: {answer}]")
+    return re.sub(r"\*\*(.+?)\*\*", lambda m: f"**you: {answer}**", line, count=1)
+
+
+def _awaiting(tmp_path, **replace) -> Path:
+    """A valid v3 plan whose card has been rendered, so its status is awaiting-approval."""
+    plan = v3_plan(tmp_path, **replace)
+    assert card.render(plan)[2] == 0
+    return plan
+
+
+def _session(tmp_path, text=SESSION) -> Path:
+    path = tmp_path / "SESSION.md"
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def _decide(plan, reply, session):
+    """card.approve, with the dates on either side of the call: ((stdout, code), those dates)."""
+    before = date.today().isoformat()
+    result = card.approve(plan, reply, session)
+    return result, {before, date.today().isoformat()}
+
+
+def _masked(text: str, days: set) -> str:
+    """text with the date of each entry approve wrote replaced by DATE, after checking it is today's."""
+    found = set(LOGGED_RE.findall(text))
+    assert found <= days, f"entry dated {found}, today is {days}"
+    return LOGGED_RE.sub("**DATE** — ", text)
+
+
+def _entry(head: str, plan, *reply_lines: str, suffix: str = "") -> str:
+    """The log entry for a reply on the fixture card (sha 37e114a), dated DATE."""
+    quoted = "".join(f"  > {line}\n" for line in reply_lines)
+    return f"- **DATE** — {head} 37e114a ({plan}){suffix}\n{quoted}"
+
+
+def _changed(before: bytes, after: bytes) -> list:
+    """(was, now) for each line that differs; the files must have the same number of lines."""
+    old, new = before.splitlines(keepends=True), after.splitlines(keepends=True)
+    assert len(old) == len(new)
+    return [(was.decode(), now.decode()) for was, now in zip(old, new) if was != now]
+
+
+def _plan_card(plan):
+    return vp.parse_card(plan.read_text(encoding="utf-8").splitlines())
+
+
+# --- approve: what an approval writes ---
+
+
+def test_go_approves_and_resolves_asks_to_defaults(tmp_path):
+    plan = _awaiting(tmp_path)
+    session = _session(tmp_path)
+    before = plan.read_bytes()
+
+    (out, code), days = _decide(plan, "go", session)
+
+    assert (out, code) == (f'approved: "{TITLE}" (card 37e114a); logged to {session}\n', 0)
+    # Only the status and the two [ask] lines change: no Brief line, since nothing was answered
+    assert _changed(before, plan.read_bytes()) == [
+        (STATUS_AWAITING, STATUS_APPROVED),
+        (D1_ASK, _you(D1_ASK, "after 30 days")),
+        (D2_ASK, _you(D2_ASK, "no")),
+    ]
+    entry = _entry("Approved card", plan, "go")
+    assert _masked(session.read_text(encoding="utf-8"), days) == SESSION.replace("\n## Status\n", entry + "\n## Status\n")
+
+
+def test_numbered_answer_rewrites_brief_and_dline(tmp_path):
+    plan = _awaiting(tmp_path)
+    session = _session(tmp_path)
+    before = plan.read_bytes()
+
+    (out, code), days = _decide(plan, "2 no, go", session)
+
+    assert (out, code) == (f'approved: "{TITLE}" (card 37e114a); answers: 2=no; logged to {session}\n', 0)
+    assert _changed(before, plan.read_bytes()) == [
+        (STATUS_AWAITING, STATUS_APPROVED),
+        (Q2, _you(Q2, "no")),
+        (D1_ASK, _you(D1_ASK, "after 30 days")),
+        (D2_ASK, _you(D2_ASK, "no")),
+    ]
+    entry = _entry("Approved card", plan, "2 no, go", suffix="; answers: 2=no")
+    assert _masked(session.read_text(encoding="utf-8"), days) == SESSION.replace("\n## Status\n", entry + "\n## Status\n")
+
+
+def test_run_answer_rewrites_the_run_line(tmp_path):
+    plan = _awaiting(tmp_path)
+    before = plan.read_bytes()
+
+    (out, code), _ = _decide(plan, "3 Inline", _session(tmp_path))
+
+    assert code == 0, out
+    assert _changed(before, plan.read_bytes()) == [
+        (STATUS_AWAITING, STATUS_APPROVED),
+        (Q3, _you(Q3, "inline")),
+        (D1_ASK, _you(D1_ASK, "after 30 days")),
+        (D2_ASK, _you(D2_ASK, "no")),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("reply", "written"),
+    [
+        ("1 after 7 days, 2 yes, 3 subagent, go", {1: "after 7 days", 2: "yes", 3: "subagent-driven"}),
+        ("3 Inline", {3: "inline"}),
+        ("3 subagent-driven.", {3: "subagent-driven"}),
+        ("1 after 7 days; 3 INLINE", {1: "after 7 days", 3: "inline"}),
+    ],
+)
+def test_every_answer_reaches_the_brief_and_the_dlines(tmp_path, reply, written):
+    plan = _awaiting(tmp_path)
+    (out, code), _ = _decide(plan, reply, _session(tmp_path))
+
+    assert code == 0, out
+    assert out.endswith(f"; logged to {tmp_path / 'SESSION.md'}\n")
+    assert f"; answers: {', '.join(f'{n}={a}' for n, a in sorted(written.items()))}; " in out
+    questions = {q.n: q for q in _plan_card(plan).questions}
+    for n, question in questions.items():
+        assert (question.answered, question.default) == (n in written, written.get(n, question.default)), n
+    dlines = vp.parse_dlines(plan.read_text(encoding="utf-8").splitlines())
+    assert [dlines[did].tag for did in ("D1", "D2")] == [f"you: {written.get(n, questions[n].default)}" for n in (1, 2)]
+    assert [dlines[did].default for did in ("D1", "D2")] == ["after 30 days", "no"], "the D-line text after the tag is untouched"
+
+
+def test_approved_plan_still_validates(tmp_path):
+    # R1: the answers make the frozen Brief longer than the 120 words render allows, and it must still validate
+    plan = _awaiting(tmp_path)
+    reply = "1 after sixty full days of inactivity, 2 only for the list owner, 3 inline"
+    (out, code), _ = _decide(plan, reply, _session(tmp_path))
+    assert code == 0, out
+
+    lines = plan.read_text(encoding="utf-8").splitlines()
+    brief = vp.parse_card(lines)
+    words = vp._words(vp.ask_line(TITLE)) + vp._words(brief.brief_text) + vp.CHECK_TIME_WORDS
+    assert words > 120, "the scenario must push the card over the render-time budget"
+    report = vp.validate_plan(plan)
+    assert report.errors == [] and report.passed
+    assert [q.answered for q in brief.questions] == [True, True, True]
+    assert card.render(plan) == (f'"{TITLE}" is approved; no approval needed.\n', "", 0)
+
+
+def test_approve_sha_matches_render_footer(tmp_path):
+    plan = v3_plan(tmp_path)
+    rendered, _, _ = card.render(plan)
+    sha = _footer_sha(rendered)
+    (out, code), days = _decide(plan, "2 no, go", _session(tmp_path))
+
+    assert code == 0 and f'(card {sha}); answers: 2=no' in out
+    log = _masked((tmp_path / "SESSION.md").read_text(encoding="utf-8"), days)
+    assert f"**DATE** — Approved card {sha} ({plan}); answers: 2=no\n" in log
+    # The sha is of the Brief as rendered: the answer then changed the Brief, so the approved Brief hashes differently
+    assert card.brief_sha7(_plan_card(plan).brief_text) != sha
+
+
+def test_approve_preserves_crlf_line_endings(tmp_path):
+    plan = _awaiting(tmp_path)
+    plan.write_bytes(plan.read_bytes().replace(b"\n", b"\r\n"))
+    before = plan.read_bytes()
+
+    (out, code), _ = _decide(plan, "2 no, go", _session(tmp_path))
+
+    assert code == 0, out
+    after = plan.read_bytes()
+    assert all(line.endswith(b"\r\n") for line in after.splitlines(keepends=True)), "no line lost its CRLF"
+    assert _changed(before, after) == [
+        (STATUS_AWAITING.replace("\n", "\r\n"), STATUS_APPROVED.replace("\n", "\r\n")),
+        (Q2.replace("\n", "\r\n"), _you(Q2, "no").replace("\n", "\r\n")),
+        (D1_ASK.replace("\n", "\r\n"), _you(D1_ASK, "after 30 days").replace("\n", "\r\n")),
+        (D2_ASK.replace("\n", "\r\n"), _you(D2_ASK, "no").replace("\n", "\r\n")),
+    ]
+    assert vp.validate_plan(plan).passed
+
+
+def test_reapproval_replaces_an_earlier_answer(tmp_path):
+    # A Brief edit sends an approved plan back to the card; the new answer must replace the old one everywhere
+    plan = _awaiting(tmp_path)
+    session = _session(tmp_path)
+    assert card.approve(plan, "2 yes, go", session)[1] == 0
+    plan.write_text(plan.read_text(encoding="utf-8").replace(STATUS_APPROVED, STATUS_AWAITING), encoding="utf-8")
+    before = plan.read_bytes()
+
+    out, code = card.approve(plan, "2 no, go", session)
+
+    assert code == 0, out
+    assert _changed(before, plan.read_bytes()) == [
+        (STATUS_AWAITING, STATUS_APPROVED),
+        (_you(Q2, "yes"), _you(Q2, "no")),
+        (_you(D2_ASK, "yes"), _you(D2_ASK, "no")),
+    ]
+
+
+def test_a_default_a_you_tag_cannot_hold_is_refused(tmp_path):
+    # "[you: after [30] days]" does not parse as a D-line, so the approved plan would stop validating
+    plan = _awaiting(tmp_path, **{"Default: after 30 days.": "Default: after [30] days.", "**after 30 days**": "**after [30] days**"})
+    session = _session(tmp_path)
+    plan_before, session_before = plan.read_bytes(), session.read_bytes()
+    assert vp.validate_plan(plan).passed
+
+    out, code = card.approve(plan, "go", session)
+
+    assert code == 1
+    assert out.startswith("ERROR [card] line ") and "D1" in out and "after [30] days" in out and "Answer question 1" in out, out
+    assert (plan.read_bytes(), session.read_bytes()) == (plan_before, session_before)
+    # Answering the question by number sidesteps the default
+    assert card.approve(plan, "1 after 7 days, go", session)[1] == 0
+    assert vp.validate_plan(plan).passed
+
+
+# --- approve: the log ---
+
+
+def test_log_is_verbatim_multiline(tmp_path):
+    plan = _awaiting(tmp_path)
+    session = _session(tmp_path)
+    reply = 'go, "ok"\n  thanks  '
+
+    (_, code), _ = _decide(plan, reply, session)
+
+    assert code == 0
+    assert b'  > go, "ok"\n  >   thanks  \n' in session.read_bytes(), "quotes, the newline and both lines' spaces are as typed"
+
+
+def test_reply_via_quoted_heredoc_is_verbatim(tmp_path):
+    plan = _awaiting(tmp_path)
+    session = _session(tmp_path)
+    reply = "go \"ok\" it's $(x)\nthen `date` \\ $HOME"
+    command = (
+        f"{shlex.quote(sys.executable)} {shlex.quote(str(SCRIPT))} approve {shlex.quote(str(plan))} "
+        f"--reply-file - --session-md {shlex.quote(str(session))} <<'END_OF_REPLY'\n{reply}\nEND_OF_REPLY\n"
+    )
+    before = plan.read_bytes()
+
+    result = subprocess.run(["bash", "-c", command], capture_output=True, env={**git_env(), "PYTHONDONTWRITEBYTECODE": "1"}, check=False)
+
+    # "it's" and "x" are words the classifier does not know, so this is the confirm path: the reply is still logged whole
+    assert (result.returncode, result.stdout.decode(), result.stderr) == (3, CONFIRM, b"")
+    logged = session.read_bytes().decode("utf-8")
+    assert f"Reply needing confirmation on card 37e114a ({plan})\n  > go \"ok\" it's $(x)\n  > then `date` \\ $HOME\n" in logged
+    assert logged.count("  > ") == 2, "the heredoc's own final newline is not a third reply line"
+    assert plan.read_bytes() == before
+
+
+def test_reply_file_drops_one_trailing_newline(tmp_path):
+    plan = _awaiting(tmp_path)
+    session = _session(tmp_path)
+    reply_file = tmp_path / "reply.txt"
+    reply_file.write_bytes(b"go\n\n")
+
+    result = _run_cli("approve", plan, "--reply-file", reply_file, "--session-md", session)
+
+    assert (result.returncode, result.stderr) == (0, "")
+    assert "  > go\n  > \n\n## Status\n" in session.read_text(encoding="utf-8"), "one newline dropped, the second kept"
+
+
+@pytest.mark.parametrize(
+    ("session_text", "expected"),
+    [
+        pytest.param(
+            "# S\n\n## Goal\nx\n\n## Status\ndone\n",
+            "# S\n\n## Goal\nx\n\n## Decisions\n\n{entry}\n## Status\ndone\n",
+            id="before-status",
+        ),
+        pytest.param("# S\n\n## Goal\nx\n", "# S\n\n## Goal\nx\n\n## Decisions\n\n{entry}", id="at-eof"),
+        pytest.param("# S\n\n## Goal\nx", "# S\n\n## Goal\nx\n\n## Decisions\n\n{entry}", id="at-eof-without-final-newline"),
+        pytest.param("", "## Decisions\n\n{entry}", id="empty-file"),
+        pytest.param("# S\n\n## Decisions\n", "# S\n\n## Decisions\n\n{entry}", id="empty-section-at-eof"),
+        pytest.param(
+            "# S\n\n## Decisions\n- **2026-10-06** — Old.\n## Status\ndone\n",
+            "# S\n\n## Decisions\n- **2026-10-06** — Old.\n{entry}## Status\ndone\n",
+            id="appended-after-last-entry",
+        ),
+        pytest.param(
+            "# S\n\n```\n## Decisions\n```\n\n## Status\ndone\n",
+            "# S\n\n```\n## Decisions\n```\n\n## Decisions\n\n{entry}\n## Status\ndone\n",
+            id="heading-in-a-code-fence-is-not-the-section",
+        ),
+    ],
+)
+def test_decisions_section_created_before_status(tmp_path, session_text, expected):
+    plan = _awaiting(tmp_path)
+    session = _session(tmp_path, session_text)
+
+    (out, code), days = _decide(plan, "go", session)
+
+    assert code == 0, out
+    assert _masked(session.read_text(encoding="utf-8"), days) == expected.format(entry=_entry("Approved card", plan, "go"))
+
+
+# --- approve: a reply that does not approve ---
+
+
+def test_change_logs_and_plan_unchanged(tmp_path):
+    plan = _awaiting(tmp_path)
+    session = _session(tmp_path)
+    before = plan.read_bytes()
+
+    (out, code), days = _decide(plan, "change the expiry to 7 days", session)
+
+    assert (out, code) == (f"change request: not approved; logged to {session}\n", 2)
+    assert plan.read_bytes() == before
+    entry = _entry("Change requested on card", plan, "change the expiry to 7 days")
+    assert _masked(session.read_text(encoding="utf-8"), days) == SESSION.replace("\n## Status\n", entry + "\n## Status\n")
+
+
+def test_ambiguous_logs_and_plan_unchanged(tmp_path):
+    plan = _awaiting(tmp_path)
+    session = _session(tmp_path)
+    before = plan.read_bytes()
+
+    (out, code), days = _decide(plan, "ok", session)
+
+    assert (out, code) == (CONFIRM, 3)
+    assert plan.read_bytes() == before
+    entry = _entry("Reply needing confirmation on card", plan, "ok")
+    assert _masked(session.read_text(encoding="utf-8"), days) == SESSION.replace("\n## Status\n", entry + "\n## Status\n")
+
+
+@pytest.mark.parametrize("reply", ["3 option 1", "3 yes, go", "3 sub-agent, go"])
+def test_bad_run_answer_is_ambiguous(tmp_path, reply):
+    # Item 3 is Run, which takes subagent-driven, subagent or inline; an approving reply with another answer is unclear
+    plan = _awaiting(tmp_path)
+    session = _session(tmp_path)
+    before = plan.read_bytes()
+
+    (out, code), days = _decide(plan, reply, session)
+
+    assert (out, code) == (CONFIRM, 3)
+    assert plan.read_bytes() == before
+    assert f"Reply needing confirmation on card 37e114a ({plan})\n  > {reply}\n" in _masked(session.read_text(encoding="utf-8"), days)
+
+
+def test_a_reply_naming_the_plan_approves(tmp_path):
+    # The plan's own path is taken out of the reply first: this directory's name holds the hedge word "Remove"
+    plan = _awaiting(tmp_path / PLAN_DIR)
+    session = _session(tmp_path / PLAN_DIR)
+
+    (out, code), _ = _decide(plan, f"Implement plan {plan}", session)
+
+    assert (out, code) == (f'approved: "{TITLE}" (card 37e114a); logged to {session}\n', 0)
+    assert _plan_card(plan).questions[0].answered is False and b"status: approved\n" in plan.read_bytes()
+
+
+def test_an_answer_for_a_number_the_card_lacks_is_ambiguous(tmp_path):
+    # Questions numbered 1, 2 and 4: the reply grammar takes "3 no" as an answer, but no question 3 can receive it
+    plan = _awaiting(tmp_path, **{"3. Run →": "4. Run →"})
+    session = _session(tmp_path)
+    before = plan.read_bytes()
+
+    (out, code), _ = _decide(plan, "3 no, go", session)
+
+    assert (out, code) == (CONFIRM, 3)
+    assert plan.read_bytes() == before
+
+
+# --- approve: refusals ---
+
+
+def test_refuses_draft(tmp_path):
+    plan = v3_plan(tmp_path)
+    session = _session(tmp_path)
+    plan_before, session_before = plan.read_bytes(), session.read_bytes()
+
+    out, code = card.approve(plan, "go", session)
+
+    assert code == 1
+    assert out.startswith("ERROR [status] ") and "render the card first" in out and out.endswith("\n"), out
+    assert (plan.read_bytes(), session.read_bytes()) == (plan_before, session_before)
+
+
+@pytest.mark.parametrize("status", ["approved", "in-progress", "complete"])
+def test_refuses_a_plan_past_the_card(tmp_path, status):
+    plan = v3_plan(tmp_path, **{"status: draft": f"status: {status}"})
+    session = _session(tmp_path)
+    plan_before, session_before = plan.read_bytes(), session.read_bytes()
+
+    out, code = card.approve(plan, "go", session)
+
+    assert code == 1
+    assert out == f"ERROR [status] plan is {status}, not awaiting-approval; there is nothing to approve\n"
+    assert (plan.read_bytes(), session.read_bytes()) == (plan_before, session_before)
+
+
+def test_refuses_invalid_plan(tmp_path):
+    plan = v3_plan(tmp_path, **{"**Flags:** none\n": "", "status: draft": "status: awaiting-approval"})
+    session = _session(tmp_path)
+    plan_before, session_before = plan.read_bytes(), session.read_bytes()
+    brief_line = plan.read_text(encoding="utf-8").splitlines().index("## Brief") + 1
+
+    out, code = card.approve(plan, "go", session)
+
+    assert code == 1
+    assert f"ERROR [card] line {brief_line}: Brief is missing the label **Flags:**\n" in out
+    assert (plan.read_bytes(), session.read_bytes()) == (plan_before, session_before)
+
+
+def test_refuses_legacy_plan(tmp_path):
+    plan = v3_plan(tmp_path, **{"schema: plan/v3": "schema: plan/v2", "status: draft": "status: awaiting-approval"})
+    session = _session(tmp_path)
+    plan_before, session_before = plan.read_bytes(), session.read_bytes()
+
+    out, code = card.approve(plan, "go", session)
+
+    assert (out, code) == ("card.py approve needs schema: plan/v3 (this plan: plan/v2); present legacy plans as before\n", 1)
+    assert (plan.read_bytes(), session.read_bytes()) == (plan_before, session_before)
+
+
+def test_refuses_a_remote_that_has_gone_since_the_card(tmp_path):
+    # approve re-probes the delivery repos like render does: a plan whose remote is gone is no longer valid
+    plan = _awaiting(tmp_path)
+    session = _session(tmp_path)
+    subprocess.run(["git", "-C", str(tmp_path / "repo"), "remote", "remove", "origin"], check=True, capture_output=True, env=git_env())
+    plan_before, session_before = plan.read_bytes(), session.read_bytes()
+
+    out, code = card.approve(plan, "go", session)
+
+    assert code == 1 and "ERROR [delivery]" in out and "no remote named 'origin'" in out, out
+    assert (plan.read_bytes(), session.read_bytes()) == (plan_before, session_before)
+
+
+def test_nonexistent_session_md_exits_1_plan_unchanged(tmp_path):
+    plan = _awaiting(tmp_path)
+    missing = tmp_path / "nope" / "SESSION.md"
+    before = plan.read_bytes()
+
+    result = _run_cli("approve", plan, "--reply", "go", "--session-md", missing)
+
+    assert (result.returncode, result.stdout) == (1, "")
+    assert result.stderr == f"ERROR [io] SESSION.md not found: {missing}; pass the session's SESSION.md with --session-md\n"
+    assert plan.read_bytes() == before
+    assert not missing.parent.exists(), "approve does not create the session file or its directory"
+
+
+def test_refusal_prints_to_stderr_and_a_decision_to_stdout(tmp_path):
+    drafted = v3_plan(tmp_path / "a")
+    refused = _run_cli("approve", drafted, "--reply", "go", "--session-md", _session(tmp_path / "a"))
+    assert (refused.returncode, refused.stdout) == (1, "")
+    assert "render the card first" in refused.stderr
+
+    plan = _awaiting(tmp_path / "b")
+    approved = _run_cli("approve", plan, "--reply", "go", "--session-md", _session(tmp_path / "b"))
+    assert (approved.returncode, approved.stderr) == (0, "")
+    assert approved.stdout.startswith(f'approved: "{TITLE}" (card 37e114a); logged to ')
+
+
+# --- approve: writes happen log first, plan second, each whole or not at all ---
+
+
+def test_log_is_written_before_the_plan(tmp_path, monkeypatch):
+    plan = _awaiting(tmp_path)
+    session = _session(tmp_path)
+    written = []
+    real = card.write_atomic
+
+    def spy(path, text):
+        written.append(Path(path))
+        real(path, text)
+
+    monkeypatch.setattr(card, "write_atomic", spy)
+
+    assert card.approve(plan, "go", session)[1] == 0
+    assert written == [session, plan]
+    assert sorted(os.listdir(tmp_path)) == ["PLAN.md", "SESSION.md", "repo"], "no temp file is left behind"
+
+
+def test_plan_write_failure_leaves_the_plan_awaiting_and_the_log_written(tmp_path, monkeypatch):
+    plan = _awaiting(tmp_path)
+    session = _session(tmp_path)
+    before = plan.read_bytes()
+    real = card.write_atomic
+
+    def fail_for_the_plan(path, text):
+        if Path(path) == plan:
+            raise OSError(28, "No space left on device")
+        real(path, text)
+
+    monkeypatch.setattr(card, "write_atomic", fail_for_the_plan)
+
+    out, code = card.approve(plan, "go", session)
+
+    assert code == 1
+    assert out == (
+        f"ERROR [io] Cannot write {plan}: No space left on device; the approval is logged in {session}, "
+        "but the plan is still awaiting-approval\n"
+    )
+    assert plan.read_bytes() == before
+    assert f"Approved card 37e114a ({plan})" in session.read_text(encoding="utf-8")
+
+
+def test_session_write_failure_writes_nothing(tmp_path, monkeypatch):
+    plan = _awaiting(tmp_path)
+    session = _session(tmp_path)
+    plan_before, session_before = plan.read_bytes(), session.read_bytes()
+
+    def fail(path, text):
+        raise OSError(13, "Permission denied")
+
+    monkeypatch.setattr(card, "write_atomic", fail)
+
+    out, code = card.approve(plan, "go", session)
+
+    assert (out, code) == (f"ERROR [io] Cannot write {session}: Permission denied\n", 1)
+    assert (plan.read_bytes(), session.read_bytes()) == (plan_before, session_before)
+
+
+# --- approve: the command line ---
+
+
+def test_missing_session_md_arg_exits_64(tmp_path):
+    plan = _awaiting(tmp_path)
+    result = _run_cli("approve", plan, "--reply", "go")
+    assert (result.returncode, result.stdout) == (64, "")
+    assert "usage:" in result.stderr and "--session-md" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "reply_args",
+    [["--reply", "go", "--reply-file", "reply.txt"], []],
+    ids=["both", "neither"],
+)
+def test_reply_and_reply_file_together_exit_64(tmp_path, reply_args):
+    # Both or neither reply option is a usage error, and nothing is read or written
+    plan = _awaiting(tmp_path)
+    session = _session(tmp_path)
+    (tmp_path / "reply.txt").write_text("go\n", encoding="utf-8")
+    before = (plan.read_bytes(), session.read_bytes())
+
+    result = _run_cli("approve", plan, *reply_args, "--session-md", session, cwd=tmp_path)
+
+    assert (result.returncode, result.stdout) == (64, "")
+    assert "usage:" in result.stderr and "--reply" in result.stderr
+    assert (plan.read_bytes(), session.read_bytes()) == before
+
+
+def test_unreadable_reply_file_exits_64(tmp_path):
+    plan = _awaiting(tmp_path)
+    session = _session(tmp_path)
+    before = (plan.read_bytes(), session.read_bytes())
+
+    result = _run_cli("approve", plan, "--reply-file", tmp_path / "nope.txt", "--session-md", session)
+
+    assert (result.returncode, result.stdout) == (64, "")
+    assert "cannot read the reply" in result.stderr
+    assert (plan.read_bytes(), session.read_bytes()) == before
+
+
+def test_cli_exit_codes(tmp_path):
+    codes = {}
+    for reply, name in [("go", "approve"), ("wait", "change"), ("ok", "ambiguous")]:
+        plan = _awaiting(tmp_path / name)
+        result = _run_cli("approve", plan, "--reply", reply, "--session-md", _session(tmp_path / name))
+        codes[name] = (result.returncode, result.stderr)
+    assert codes == {"approve": (0, ""), "change": (2, ""), "ambiguous": (3, "")}
