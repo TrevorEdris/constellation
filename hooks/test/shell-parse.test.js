@@ -341,7 +341,42 @@ test('env -S runs its string through the shell', () => {
     assert.equal(child.via, 'shell-c', cmd);
     assert.deepEqual(commandOf(child.words).args, args, cmd);
   }
-  // The leftover words cannot start a second command or a redirect: they are quoted, so `;` and `>` stay literal.
+  // env splits STR itself, not the way a shell does: blanks and newlines separate words, quotes
+  // and a backslash group, a `#` that starts a word (or `\c`) ends the string, and `; | & < > (`
+  // are ordinary characters. The words after STR are appended to the split string, so they must
+  // never land in a comment, a redirect or a second command. Each row is one shell-c child (plus
+  // the env segment) with exactly the words real env runs.
+  for (const [cmd, name, args] of [
+    ["env -S 'cat #' ~/.ssh/id_rsa", 'cat', ['~/.ssh/id_rsa']],
+    ["env -S 'cat #c' ~/.ssh/id_rsa", 'cat', ['~/.ssh/id_rsa']],
+    ["env -S 'cat a #c' x", 'cat', ['a', 'x']],
+    ["env -S 'cat\n' ~/.ssh/id_rsa", 'cat', ['~/.ssh/id_rsa']],
+    ["env -S 'cat >' x", 'cat', ['>', 'x']],
+    ["env -S 'cat <' ~/.ssh/id_rsa", 'cat', ['<', '~/.ssh/id_rsa']],
+    ["env -S 'cat |' x", 'cat', ['|', 'x']],
+    ["env -S 'cat &' x", 'cat', ['&', 'x']],
+    ["env -S 'cat (' x", 'cat', ['(', 'x']],
+    ["env -S 'cat a;b' x", 'cat', ['a;b', 'x']],
+    ["env -S 'cat \\c' x", 'cat', ['x']],
+    ["env -S 'cat \"#\" x'", 'cat', ['#', 'x']],
+    // A `#` inside a word is literal, `\_` separates words, and a backslash escapes inside "..".
+    ["env -S 'cat x#y' z", 'cat', ['x#y', 'z']],
+    ["env -S 'cat a\\_b' x", 'cat', ['a', 'b', 'x']],
+    ["env -S 'cat \"a\\\"b\" c'", 'cat', ['a"b', 'c']],
+  ]) {
+    const all = segs(cmd);
+    assert.equal(all.length, 2, `${JSON.stringify(cmd)}: ${all.map((s) => s.words.join(' ')).join(' / ')}`);
+    assert.equal(all[1].via, 'shell-c', cmd);
+    assert.equal(all[1].parent, 0, cmd);
+    assert.notEqual(all[1].pipeline, all[0].pipeline, cmd); // a `-c` style body gets a fresh id
+    assert.equal(cmdOf(all[1]), name, cmd);
+    assert.deepEqual(commandOf(all[1].words).args, args, cmd);
+    assert.deepEqual(all[1].redirects, [], cmd);
+  }
+  // An empty or comment-only STR with nothing after it runs no command: no child segment.
+  assert.equal(segs("env -S ''").length, 1);
+  assert.equal(segs("env -S '#c'").length, 1);
+  // The leftover words cannot start a second command or a redirect: `;` and `>` stay literal.
   assert.deepEqual(shape("env -S cat ';' '>' x").slice(1), ['1:shell-c:0:1:cat ; > x']);
   assert.deepEqual(segs("env -S cat '>' x")[1].redirects, []);
   // Without -S, env just runs its command; no body to parse.

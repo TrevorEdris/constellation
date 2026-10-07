@@ -642,9 +642,11 @@ function addSegment(raw, pipeline, via, parent, depth, ctx) {
     } else if (depth + 1 > MAX_DEPTH) {
       skip(ctx, 'depth');
     } else {
-      // The words are already split and unquoted, so the child is built from them directly.
-      const child = { words: e.words, redirects: [], pipeline: seg.pipeline, substs: [] };
-      addSegment(child, seg.pipeline, e.via, seg.position, depth + 1, ctx);
+      // The words are already split and unquoted, so the child is built from them directly. xargs
+      // and find-exec children stay in their parent's pipeline; an env -S child is a `-c` style
+      // body and gets an id of its own.
+      const child = { words: e.words, redirects: [], substs: [] };
+      addSegment(child, e.fresh ? ctx.pipelines++ : seg.pipeline, e.via, seg.position, depth + 1, ctx);
     }
   }
 }
@@ -654,7 +656,8 @@ const FIND_EXEC = new Set(['-exec', '-execdir', '-ok', '-okdir']);
 
 /**
  * The commands a segment runs through its arguments: {via, src} for text to scan (`-c` strings,
- * eval, env -S) or {via, words} for a command already split into words (xargs, find -exec).
+ * eval) or {via, words} for a command already split into words (xargs, find -exec, env -S; `fresh`
+ * asks for a pipeline id of its own).
  */
 function hiddenCommands(words) {
   const { cmd, args } = commandOf(words);
@@ -665,17 +668,18 @@ function hiddenCommands(words) {
   // eval joins its arguments with spaces and runs the result, so `eval cat x` and `eval "cat x"` agree.
   if (cmd === 'eval') return args.length ? [{ via: 'shell-c', src: args.join(' ') }] : [];
   if (cmd === 'env') {
-    // env splices the words after STR into the split string (`env -S 'echo a' b` runs `echo a b`), so
-    // the child text is STR plus every word after it, each quoted to stay one literal word. The
-    // words start right after STR, not after env's options: `env -S cat -u f` hands `-u f` to cat,
-    // and so does a second -S (`env -S cat -S x f` runs `cat -S x f`): only the first -S counts.
+    // env splits STR itself (see splitEnvString) and appends the words after it (`env -S 'echo a' b`
+    // runs `echo a b`), so the child is those words, never shell text. The appended words start
+    // right after STR, not after env's options: `env -S cat -u f` hands `-u f` to cat, and so does
+    // a second -S (`env -S cat -S x f` runs `cat -S x f`): only the first -S counts.
     const o = readOptions(args, 0, PREFIXES.get('env'));
     const str = o.values.S;
     if (str === undefined) return [];
-    // env reads options at the start of STR itself (`env -S '-i cat' f` runs `cat f`, and leading
-    // blanks are skipped first), so STR gets an `env` of its own to strip them.
-    const head = /^\s*-/.test(str) ? 'env ' + str : str;
-    return [{ via: 'shell-c', src: [head].concat(args.slice(o.ends.S).map(singleQuote)).join(' ') }];
+    // env reads options at the start of STR itself (`env -S '-i cat' f` runs `cat f`), so a STR that
+    // starts with one gets an `env` of its own for commandOf to strip them.
+    const split = splitEnvString(str);
+    const words = (split.length && split[0][0] === '-' ? ['env'] : []).concat(split, args.slice(o.ends.S));
+    return words.length ? [{ via: 'shell-c', words, fresh: true }] : [];
   }
   if (cmd === 'xargs') {
     const rest = args.slice(readOptions(args, 0, XARGS).next);
@@ -769,8 +773,48 @@ const XARGS = opts('ILnPdEsa', { 'arg-file': 'a', delimiter: 'd', 'max-args': 'n
 
 const basename = (w) => w.slice(w.lastIndexOf('/') + 1);
 
-// One word as shell text that scans back to exactly that word (a `'` becomes `'\''`).
-const singleQuote = (w) => "'" + w.replace(/'/g, "'\\''") + "'";
+/**
+ * Split the STRING of `env -S` into words the way env does, which is not the way a shell does:
+ * blanks and newlines separate words, '..' and ".." group (a backslash escapes the next character
+ * inside "..", and outside any quotes), `\_` separates words, a `#` that starts a word or a `\c`
+ * ends the string, and `; | & < > ( ` are ordinary characters. It expands nothing, so `${VAR}`
+ * stays literal, which is the safe reading. Escapes env gives a meaning to (`\n`, `\t`) are read as
+ * the plain character: only the command word and the word count matter here.
+ */
+function splitEnvString(s) {
+  const words = [];
+  let cur = null; // the word being built; null between words
+  let q = ''; // the open quote character, or ''
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (q) {
+      if (c === q) q = '';
+      else if (c === '\\' && q === '"' && i + 1 < s.length) cur += s[++i];
+      else cur += c;
+    } else if (c === "'" || c === '"') {
+      q = c;
+      if (cur === null) cur = '';
+    } else if (c === '\\') {
+      i++;
+      if (s[i] === 'c') break;
+      if (s[i] === '_') {
+        if (cur !== null) words.push(cur);
+        cur = null;
+      } else if (i < s.length) {
+        cur = (cur === null ? '' : cur) + s[i];
+      }
+    } else if (/\s/.test(c)) {
+      if (cur !== null) words.push(cur);
+      cur = null;
+    } else if (c === '#' && cur === null) {
+      break;
+    } else {
+      cur = (cur === null ? '' : cur) + c;
+    }
+  }
+  if (cur !== null) words.push(cur);
+  return words;
+}
 
 /**
  * Read the options that start at words[i]. Returns the index of the first word that is not an
