@@ -89,8 +89,10 @@
 #   checkout (or anywhere outside <worktree-path>), after merge-local or after
 #   the pull request merged. Steps, in order:
 #     1. <worktree-path> must be a worktree of the repository you stand in
-#        (the top of one, not a subdirectory), else exit 2. Detect the workspace
-#        from inside it, as detect does.
+#        (the top of one, not a subdirectory), else exit 2. <branch> must not be
+#        main or master, else exit 2: cleanup retires the work's branch, never
+#        the base, and no later check would notice the mix-up. Detect the
+#        workspace from inside it, as detect does.
 #     2. A linked worktree must be on <branch>, else exit 2. If detect says
 #        CLEANUP=host (a harness or IDE owns it) print LEFT_IN_PLACE= and exit
 #        0 without inspecting or touching anything.
@@ -99,8 +101,9 @@
 #        directory: REFUSED=cd <MAIN_ROOT> first, exit 2.
 #     4. --discard needs --confirm discard; the typed word is the ritual that
 #        permits force-deleting an unmerged branch. Without --discard the
-#        branch must already be an ancestor of the main checkout's HEAD, else
-#        exit 1 before anything is touched.
+#        branch must already be an ancestor of the main checkout's HEAD and,
+#        when it has an upstream that still resolves, of that upstream too (the
+#        rule `branch -d` applies), else exit 1 before anything is touched.
 #     5. Uncommitted files in the worktree (tracked changes and every untracked
 #        file) -> BLOCKING= lines, exit 3, nothing removed. --discard does not
 #        override this: it concerns the branch, not the files.
@@ -131,12 +134,13 @@
 # Exit codes:
 #   0  - Done
 #   1  - A git step failed or was refused (checkout, pull, merge, worktree
-#        remove, branch delete), or cleanup's branch is not merged
+#        remove, branch delete), or cleanup's branch is not merged into HEAD
+#        or into its upstream
 #   2  - Usage error, or a precondition failed: outside a git work tree, no
 #        provable main checkout, <base> or <branch> not a local branch,
 #        cleanup's path not a worktree of this repository or on another branch,
-#        run from inside the worktree to remove, --discard without its
-#        confirmation
+#        cleanup's branch is main or master, run from inside the worktree to
+#        remove, --discard without its confirmation
 #   3  - Uncommitted files block: tracked changes block the merge; any
 #        uncommitted file, untracked ones included, blocks the removal
 #   4  - PR-based repo and no approved local-only plan: push and open a PR instead
@@ -581,6 +585,18 @@ cmd_cleanup() {
     exit 2
   fi
 
+  # <branch> is the work being retired, never the base. main is merged into
+  # everything that branched from it, so none of the checks below would stop a
+  # caller that passed the base where the branch was meant. detect's BASE with no
+  # argument is only ever main or master, so this names it. Not even --discard
+  # overrides it: that ritual is for the work's branch.
+  case "$branch" in
+    main | master)
+      echo "REFUSED=$branch is the base branch; cleanup retires the work's branch, not the base"
+      exit 2
+      ;;
+  esac
+
   local detected isolation wt_branch main_root cleanup_mode
   detected="$(cd "$wt" && cmd_detect)" || exit 2
   isolation="$(field ISOLATION "$detected")"
@@ -625,10 +641,25 @@ cmd_cleanup() {
   fi
 
   # Judged before anything is removed, so a refusal leaves the worktree whole.
-  if [ "$discard" -eq 0 ] \
-    && ! git -C "$main_root" merge-base --is-ancestor "refs/heads/$branch" HEAD; then
-    echo "REFUSED=$branch is not merged into the HEAD of $main_root; nothing was removed"
-    exit 1
+  # `branch -d` below judges "merged" against the branch's upstream when it has
+  # one, and against HEAD only when it has none. Both are checked here: a branch
+  # that is in HEAD but ahead of its upstream would pass the HEAD check, lose its
+  # worktree, and only then be refused by `branch -d`, leaving a cleanup that can
+  # no longer be re-run. An upstream whose remote-tracking ref was pruned does
+  # not resolve, and git falls back to HEAD, so it is skipped the same way.
+  if [ "$discard" -eq 0 ]; then
+    if ! git -C "$main_root" merge-base --is-ancestor "refs/heads/$branch" HEAD; then
+      echo "REFUSED=$branch is not merged into the HEAD of $main_root; nothing was removed"
+      exit 1
+    fi
+    local upstream_tip upstream_name
+    upstream_tip="$(git -C "$main_root" rev-parse --verify --quiet "${branch}@{upstream}" 2>/dev/null)"
+    if [ -n "$upstream_tip" ] \
+      && ! git -C "$main_root" merge-base --is-ancestor "refs/heads/$branch" "$upstream_tip"; then
+      upstream_name="$(git -C "$main_root" rev-parse --abbrev-ref "${branch}@{upstream}" 2>/dev/null)"
+      echo "REFUSED=$branch has commits its upstream (${upstream_name:-unknown}) lacks, so git would refuse to delete it; nothing was removed"
+      exit 1
+    fi
   fi
 
   if [ "$wt" != "$main_root" ]; then

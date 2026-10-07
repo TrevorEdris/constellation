@@ -8,9 +8,12 @@
 # merge-local adds its own: a local merge into a repo that ships by PR, a
 # checkout run in the worktree where the base is already taken, and a plan flag
 # taken on trust. cleanup adds more: a branch deleted before the worktree that
-# holds it is removed, and git's force flag deleting a file the user had not
-# committed. Every case here builds a real git repo and runs the real script, so
-# the exact code the agent runs is what gets tested. No network, no `gh`.
+# holds it is removed, git's force flag deleting a file the user had not
+# committed, a branch git refuses to delete (ahead of its upstream) only after
+# its worktree is already gone, and the base branch passed where the work's
+# branch was meant. Every case here builds a real git repo and runs the real
+# script, so the exact code the agent runs is what gets tested. No network, no
+# `gh`.
 #
 # Usage: test-workspace.sh        (any working directory)
 #
@@ -1095,6 +1098,60 @@ assert_eq "merged elsewhere: worktree survives" yes "$(exists "$WT")"
 assert_eq "merged elsewhere: branch survives" yes "$(has_branch feat/w)"
 finish
 
+# `branch -d` judges "merged" against the branch's upstream when it has one, not
+# against HEAD. Push with -u, commit once more, fast-forward main: the branch is
+# merged into HEAD but not into origin/feat/w, so `branch -d` would refuse after
+# the worktree was already gone, and a re-run would exit 2 (not a worktree). The
+# check has to happen before anything is removed.
+begin "cleanup: branch ahead of its upstream refuses before removing"
+new_feature remote
+g -C "$WT" push -q -u origin feat/w || die "push -u feat/w"
+commit_file "$WT" more.txt more "add more"
+land_feature
+assert_eq "setup: merged into main" yes "$(is_merged feat/w main)"
+cleanup_in "$REPO" "$WT" feat/w
+assert_eq "exit" 1 "$RC"
+assert_contains "REFUSED" "upstream" "$(kv REFUSED)"
+assert_contains "REFUSED says nothing was removed" "nothing was removed" "$(kv REFUSED)"
+assert_eq "nothing reported removed" no "$(has REMOVED_WORKTREE)"
+assert_eq "nothing reported deleted" no "$(has DELETED_BRANCH)"
+assert_eq "worktree survives" yes "$(exists "$WT")"
+assert_eq "branch survives" yes "$(has_branch feat/w)"
+finish
+
+# The control: once the upstream holds the branch's tip, the same setup cleans up.
+begin "cleanup: branch whose upstream holds its tip is removed and deleted"
+new_feature remote
+g -C "$WT" push -q -u origin feat/w || die "push -u feat/w"
+commit_file "$WT" more.txt more "add more"
+g -C "$WT" push -q || die "push the extra commit"
+land_feature
+cleanup_in "$REPO" "$WT" feat/w
+assert_eq "exit" 0 "$RC"
+assert_eq "REMOVED_WORKTREE" "$WT" "$(kv REMOVED_WORKTREE)"
+assert_eq "DELETED_BRANCH" feat/w "$(kv DELETED_BRANCH)"
+assert_eq "worktree gone" no "$(exists "$WT")"
+assert_eq "branch gone" no "$(has_branch feat/w)"
+finish
+
+# The usual pull-request ending: merged on the remote, its branch deleted there
+# and pruned here. The upstream ref is gone, so git compares against HEAD and the
+# cleanup must not invent a refusal.
+begin "cleanup: pruned upstream falls back to HEAD"
+new_feature remote
+g -C "$WT" push -q -u origin feat/w || die "push -u feat/w"
+land_feature
+g -C "$REPO" push -q origin --delete feat/w || die "delete remote feat/w"
+g -C "$REPO" fetch -q --prune || die "fetch --prune"
+assert_eq "setup: upstream ref gone" "" \
+  "$(g -C "$REPO" rev-parse --verify --quiet 'feat/w@{upstream}')"
+cleanup_in "$REPO" "$WT" feat/w
+assert_eq "exit" 0 "$RC"
+assert_eq "DELETED_BRANCH" feat/w "$(kv DELETED_BRANCH)"
+assert_eq "worktree gone" no "$(exists "$WT")"
+assert_eq "branch gone" no "$(has_branch feat/w)"
+finish
+
 begin "cleanup --discard --confirm discard: force-deletes unmerged branch"
 new_feature
 cleanup_in "$REPO" "$WT" feat/w --discard --confirm discard
@@ -1104,6 +1161,19 @@ assert_eq "DELETED_BRANCH" feat/w "$(kv DELETED_BRANCH)"
 assert_eq "worktree directory gone" no "$(exists "$WT")"
 assert_eq "branch gone" no "$(has_branch feat/w)"
 assert_eq "the work never reached main" no "$(exists "$REPO/feature.txt")"
+finish
+
+# The typed ritual covers unpushed commits too: the upstream check belongs to the
+# plain path only.
+begin "cleanup --discard --confirm discard: ignores the upstream check"
+new_feature remote
+g -C "$WT" push -q -u origin feat/w || die "push -u feat/w"
+commit_file "$WT" more.txt more "add more"
+cleanup_in "$REPO" "$WT" feat/w --discard --confirm discard
+assert_eq "exit" 0 "$RC"
+assert_eq "DELETED_BRANCH" feat/w "$(kv DELETED_BRANCH)"
+assert_eq "worktree gone" no "$(exists "$WT")"
+assert_eq "branch gone" no "$(has_branch feat/w)"
 finish
 
 # The ritual is the typed word, not the flag.
@@ -1134,6 +1204,50 @@ cleanup_in "$REPO" "$WT" feat/w
 assert_eq "detached worktree: exit" 2 "$RC"
 assert_contains "detached worktree: REFUSED" "detached" "$(kv REFUSED)"
 assert_eq "detached worktree: survives" yes "$(exists "$WT")"
+finish
+
+# <branch> names the work being retired, never the base. main is merged into
+# everything that branched from it, so every other check passes and a caller that
+# passed the base where the branch was meant would delete main with exit 0.
+begin "cleanup: refuses to delete main from the main checkout"
+new_repo
+commit_file "$REPO" tracked.txt base "add tracked"
+g -C "$REPO" checkout -q -b feat/x || die "checkout feat/x"
+cleanup_in "$REPO" "$REPO" main
+assert_eq "exit" 2 "$RC"
+assert_contains "REFUSED" "main" "$(kv REFUSED)"
+assert_eq "nothing reported deleted" no "$(has DELETED_BRANCH)"
+assert_eq "main survives" yes "$(has_branch main)"
+cleanup_in "$REPO" "$REPO" main --discard --confirm discard
+assert_eq "with the discard ritual: exit" 2 "$RC"
+assert_eq "with the discard ritual: nothing reported deleted" no "$(has DELETED_BRANCH)"
+assert_eq "with the discard ritual: main survives" yes "$(has_branch main)"
+finish
+
+begin "cleanup: refuses to delete main from a linked worktree"
+new_repo
+commit_file "$REPO" tracked.txt base "add tracked"
+park_main
+WT="$SB/repo/.worktrees/m"
+g -C "$REPO" worktree add -q "$WT" main || die "worktree add main"
+cleanup_in "$REPO" "$WT" main
+assert_eq "exit" 2 "$RC"
+assert_contains "REFUSED" "main" "$(kv REFUSED)"
+assert_eq "nothing reported removed" no "$(has REMOVED_WORKTREE)"
+assert_eq "nothing reported deleted" no "$(has DELETED_BRANCH)"
+assert_eq "worktree survives" yes "$(exists "$WT")"
+assert_eq "main survives" yes "$(has_branch main)"
+finish
+
+begin "cleanup: refuses to delete master"
+new_repo master
+commit_file "$REPO" tracked.txt base "add tracked"
+g -C "$REPO" checkout -q -b feat/x || die "checkout feat/x"
+cleanup_in "$REPO" "$REPO" master
+assert_eq "exit" 2 "$RC"
+assert_contains "REFUSED" "master" "$(kv REFUSED)"
+assert_eq "nothing reported deleted" no "$(has DELETED_BRANCH)"
+assert_eq "master survives" yes "$(has_branch master)"
 finish
 
 # Removal deletes ignored files (.env, node_modules/) without a word. The script
