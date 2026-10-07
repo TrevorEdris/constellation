@@ -926,6 +926,219 @@ def check_brief(lines: list[str], report: ValidationReport) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Placeholder, v2-step and Traceability-row checks
+#
+# These report an error on a `plan/v3` plan and a warning on every other plan,
+# and none of them touches the score: a legacy plan's PASS/NEEDS WORK status
+# must not change because of them (C13), and a v3 plan is blocked by the error
+# severity alone.
+# ---------------------------------------------------------------------------
+
+PLACEHOLDER_REPORT_CAP = 10
+
+_FENCE_OPEN_RE = re.compile(r"^\s*(`{3,}|~{3,})(.*)$")
+_HEADING_RE = re.compile(r"^ {0,3}(#{1,6})\s+(\S.*)$")
+# Inline code, so a command such as `card.py render <PLAN>` is not a placeholder.
+_CODE_SPAN_RE = re.compile(r"(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)")
+
+_FIELD_PLACEHOLDER_RE = re.compile(r"\{\{[^}]*\}\}")
+_ANGLE_PLACEHOLDER_RE = re.compile(r"<(?![/!])(?!(?:details|summary|br|sub|sup|kbd|img|a)\b)[A-Za-z][^<>\n]*>")
+_AUTOLINK_RE = re.compile(r"<[A-Za-z][A-Za-z0-9+.\-]{1,31}:[^\s<>]*>")
+_EMAIL_RE = re.compile(r"<[^\s@<>]+@[^\s@<>]+>")
+_MARKER_RE = re.compile(r"\bTBD\b|\bTODO\b")
+_ELLIPSIS_LINE_RE = re.compile(r"^\s*(?:\*\*[^*]+\*\*\s*)?\.\.\.\s*$")
+_BOLD_CELL_RE = re.compile(r"\*\*[^*]+\*\*")
+_SEPARATOR_CELL_RE = re.compile(r":?-+:?")
+_TABLE_PIPE_RE = re.compile(r"(?<!\\)\|")
+
+_V2_STEP_RE = re.compile(r"^\s*\d+\.\s+\*\*\((\d+\.\d+)\)")
+_V2_VERIFY_RE = re.compile(r"\bVerify\b[^:\n]{0,20}:|Expected:")
+
+
+def _finding_severity(lines: list[str]) -> str:
+    """"error" for a `plan/v3` plan, "warning" for every other plan."""
+    return "error" if is_v3(parse_frontmatter("\n".join(lines))) else "warning"
+
+
+def _fence_mask(lines: list[str]) -> list[bool]:
+    """True for each line inside a fenced code block, the fence lines included.
+
+    A fence closes on the same character at least as long as the opener, so a
+    ``` line inside a ```` block does not end it. An unclosed fence runs to EOF.
+    """
+    mask: list[bool] = []
+    fence: Optional[tuple[str, int]] = None
+    for line in lines:
+        stripped = line.strip()
+        if fence is None:
+            opener = _FENCE_OPEN_RE.match(line)
+            if opener and not (opener.group(1)[0] == "`" and "`" in opener.group(2)):
+                fence = (opener.group(1)[0], len(opener.group(1)))
+                mask.append(True)
+            else:
+                mask.append(False)
+        else:
+            mask.append(True)
+            if stripped and set(stripped) == {fence[0]} and len(stripped) >= fence[1]:
+                fence = None
+    return mask
+
+
+def _find_section(lines: list[str], mask: list[bool], title: "re.Pattern[str]", max_level: int) -> Optional[tuple[int, int]]:
+    """(heading index, end index) of the first heading whose title matches, ignoring fenced code.
+
+    Only headings of level <= max_level qualify. The section runs to the next
+    heading of the same or a shallower level (deeper headings stay inside it).
+    """
+    headings = [
+        (idx, len(m.group(1)), m.group(2))
+        for idx, line in enumerate(lines)
+        if not mask[idx] and (m := _HEADING_RE.match(line))
+    ]
+    for pos, (idx, level, text) in enumerate(headings):
+        if level <= max_level and title.match(text):
+            end = next((j for j, lv, _ in headings[pos + 1 :] if lv <= level), len(lines))
+            return idx, end
+    return None
+
+
+def _table_cells(line: str) -> Optional[list[str]]:
+    """Cells of a Markdown table row, or None when the line is not one."""
+    stripped = line.strip()
+    if not stripped.startswith("|") or stripped == "|":
+        return None
+    inner = stripped[1:-1] if stripped.endswith("|") else stripped[1:]
+    return [cell.strip() for cell in _TABLE_PIPE_RE.split(inner)]
+
+
+def _is_separator_row(cells: list[str]) -> bool:
+    """A delimiter row such as `|---|:---:|`: it is not a data row."""
+    return all(_SEPARATOR_CELL_RE.fullmatch(cell) for cell in cells)
+
+
+def _placeholder_reasons(line: str) -> list[str]:
+    """What is unfilled on this line (empty list when nothing is)."""
+    text = _CODE_SPAN_RE.sub(" ", line)
+    reasons = _FIELD_PLACEHOLDER_RE.findall(text)
+    reasons += [
+        found
+        for found in _ANGLE_PLACEHOLDER_RE.findall(text)
+        if not (_AUTOLINK_RE.fullmatch(found) or _EMAIL_RE.fullmatch(found))
+    ]
+    reasons += _MARKER_RE.findall(text)
+
+    # A code span in a table cell still fills it, so mask it with text, not blanks.
+    cells = _table_cells(_CODE_SPAN_RE.sub("x", line))
+    if cells is not None:
+        filled = [cell for cell in cells if cell]
+        if not filled or (len(filled) == 1 and cells[0] and _BOLD_CELL_RE.fullmatch(cells[0])):
+            reasons.append("empty table row")
+
+    if _ELLIPSIS_LINE_RE.match(text):
+        reasons.append("a line that is only '...'")
+    if line.lstrip().startswith("> Template:"):
+        reasons.append("template guidance line")
+    return reasons
+
+
+def check_placeholders(lines: list[str], report: ValidationReport) -> None:
+    """Flag text a plan author was meant to replace: `{{FIELD}}`, `<angle>` slots, TBD/TODO,
+    empty table rows, a bare `...` line and `> Template:` guidance.
+
+    Everything outside fenced code blocks and inline code spans is scanned, the
+    frontmatter included. One finding per line, at most 10, then "+N more".
+    """
+    severity = _finding_severity(lines)
+    mask = _fence_mask(lines)
+    found = [(idx + 1, reasons) for idx, line in enumerate(lines) if not mask[idx] and (reasons := _placeholder_reasons(line))]
+    for line_no, reasons in found[:PLACEHOLDER_REPORT_CAP]:
+        report.issues.append(
+            Issue(
+                severity=severity,
+                category="placeholder",
+                message=f"Unfilled placeholder ({', '.join(reasons)}). Fill it in or delete it.",
+                line=line_no,
+            )
+        )
+    if len(found) > PLACEHOLDER_REPORT_CAP:
+        report.issues.append(
+            Issue(
+                severity=severity,
+                category="placeholder",
+                message=f"+{len(found) - PLACEHOLDER_REPORT_CAP} more unfilled placeholder lines not shown.",
+            )
+        )
+
+
+def check_v2_steps(lines: list[str], report: ValidationReport) -> None:
+    """Check each `1. **(1.1)** ...` step under `## Ordered steps` for a verification and a file path.
+
+    The older step checks only see `### Step N` headings, so these numbered
+    steps were never checked. A step's body runs to the next step or heading.
+    """
+    mask = _fence_mask(lines)
+    section = _find_section(lines, mask, re.compile(r"ordered\s+steps\b", re.IGNORECASE), 2)
+    if section is None:
+        return
+    start, end = section
+    severity = _finding_severity(lines)
+
+    steps = [i for i in range(start + 1, end) if not mask[i] and _V2_STEP_RE.match(lines[i])]
+    headings = {i for i in range(start + 1, end) if not mask[i] and _HEADING_RE.match(lines[i])}
+    stops = sorted(headings | set(steps) | {end})
+    for i in steps:
+        step_id = _V2_STEP_RE.match(lines[i]).group(1)
+        body = "\n".join(lines[i : next(stop for stop in stops if stop > i)])
+        if not _V2_VERIFY_RE.search(body):
+            report.issues.append(
+                Issue(
+                    severity=severity,
+                    category="verification",
+                    message=f"Step {step_id} has no 'Verify:' or 'Expected:' line. Say how to confirm the step worked.",
+                    line=i + 1,
+                )
+            )
+        if not FILE_PATH_PATTERN.search(body):
+            report.issues.append(
+                Issue(
+                    severity=severity,
+                    category="specificity",
+                    message=f"Step {step_id} names no file path. Name the exact file the step touches.",
+                    line=i + 1,
+                )
+            )
+
+
+def check_traceability_rows(lines: list[str], report: ValidationReport) -> None:
+    """A Traceability section that exists must hold at least one data row.
+
+    The header and delimiter rows and rows with every cell empty do not count.
+    A missing section is `check_traceability_table`'s finding, not this one's.
+    """
+    mask = _fence_mask(lines)
+    section = _find_section(lines, mask, re.compile(r"traceability\b", re.IGNORECASE), 3)
+    if section is None:
+        return
+    start, end = section
+    rows = [cells for i in range(start + 1, end) if not mask[i] and (cells := _table_cells(lines[i])) is not None]
+    for pos, cells in enumerate(rows):
+        is_header = pos + 1 < len(rows) and _is_separator_row(rows[pos + 1])
+        if not is_header and not _is_separator_row(cells) and any(cells):
+            return
+    report.issues.append(
+        Issue(
+            severity=_finding_severity(lines),
+            category="traceability",
+            message=(
+                "Traceability section has no table data rows. Add one row per discovery finding "
+                "(Discovery finding | Plan step), or say why a finding is out of scope."
+            ),
+            line=start + 1,
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
 # Report rendering
 # ---------------------------------------------------------------------------
 
@@ -1044,6 +1257,9 @@ def validate_plan(path: Path, probe: bool = True) -> ValidationReport:
     check_git_branch(lines, report)
     check_git_commit_plan(lines, report)
     check_brief(lines, report)
+    check_placeholders(lines, report)
+    check_v2_steps(lines, report)
+    check_traceability_rows(lines, report)
 
     report.score = max(0, report.score)
     return report

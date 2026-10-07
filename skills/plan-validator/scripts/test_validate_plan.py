@@ -1,5 +1,6 @@
 """Tests for validate_plan.py: PR-size and Brief checks, frontmatter parsing,
-schema dispatch (v3 vs legacy) and issue audience tags.
+schema dispatch (v3 vs legacy), issue audience tags, placeholder rejection,
+PLAN v2 step parsing and Traceability rows.
 
 Run from the repo root:
     PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q -p no:cacheprovider skills/plan-validator/scripts
@@ -519,3 +520,366 @@ def test_oversized_code_block_is_agent():
     vp.check_oversized_code_blocks(lines, report)
     assert [(i.severity, i.category, i.audience) for i in report.issues] == [("warning", "code-size", "agent")]
     assert report.score == 97
+
+
+# ---------------------------------------------------------------------------
+# Placeholder rejection, PLAN v2 step parsing, Traceability rows
+# ---------------------------------------------------------------------------
+
+V3_HEAD = V3_FM.format(status="draft")
+LEGACY_HEAD = LEGACY_FM.format(status="draft")
+
+
+def _line_of(text: str, needle: str) -> int:
+    """1-indexed line number of the first line containing needle."""
+    return next(n for n, line in enumerate(text.splitlines(), 1) if needle in line)
+
+
+def _in_category(report: "vp.ValidationReport", category: str) -> list["vp.Issue"]:
+    return [i for i in report.issues if i.category == category]
+
+
+def _run_check(check, text: str) -> "vp.ValidationReport":
+    """Run one check function on text, as validate_plan would."""
+    report = vp.ValidationReport(path="p")
+    check(text.splitlines(), report)
+    return report
+
+
+PLACEHOLDER_BODY = (
+    "\n# PLAN — demo\n\n"
+    "## Target repo & files\n"
+    "Edit {{DATE}} in `a.py`.\n"
+    "Owner: <name>\n"
+    "Decide later: TBD\n"
+    "Remember to TODO this.\n"
+)
+PLACEHOLDER_FIXED = (
+    PLACEHOLDER_BODY.replace("{{DATE}}", "the date")
+    .replace("<name>", "Ann")
+    .replace("TBD", "the cache")
+    .replace("TODO", "do")
+)
+
+
+def test_v3_placeholders_are_errors(tmp_path):
+    text = V3_HEAD + PLACEHOLDER_BODY
+    report = _validate(tmp_path, text)
+    errs = _in_category(report, "placeholder")
+    assert [(i.severity, i.line) for i in errs] == [
+        ("error", _line_of(text, "{{DATE}}")),
+        ("error", _line_of(text, "<name>")),
+        ("error", _line_of(text, "TBD")),
+        ("error", _line_of(text, "TODO")),
+    ]
+    for issue, snippet in zip(errs, ["{{DATE}}", "<name>", "TBD", "TODO"]):
+        assert snippet in issue.message
+    assert not report.passed
+    # v3 errors block through severity alone: the score is untouched
+    assert report.score == _validate(tmp_path, V3_HEAD + PLACEHOLDER_FIXED).score
+
+
+def test_v3_placeholder_cli_prints_error_and_exits_1(tmp_path):
+    plan = tmp_path / "PLAN.md"
+    plan.write_text(V3_HEAD + PLACEHOLDER_BODY, encoding="utf-8")
+    proc = _run_cli(plan)
+    assert proc.returncode == 1
+    assert f"[ERROR] [placeholder] (agent) [line {_line_of(V3_HEAD + PLACEHOLDER_BODY, 'TBD')}]" in proc.stdout
+
+
+def test_legacy_placeholders_are_warnings(tmp_path):
+    text = LEGACY_HEAD + PLACEHOLDER_BODY
+    report = _validate(tmp_path, text)
+    found = _in_category(report, "placeholder")
+    assert [(i.severity, i.line) for i in found] == [
+        ("warning", _line_of(text, "{{DATE}}")),
+        ("warning", _line_of(text, "<name>")),
+        ("warning", _line_of(text, "TBD")),
+        ("warning", _line_of(text, "TODO")),
+    ]
+    assert not any(i.category == "placeholder" for i in report.errors)
+    fixed = _validate(tmp_path, LEGACY_HEAD + PLACEHOLDER_FIXED)
+    assert report.score == fixed.score
+    assert report.passed == fixed.passed
+
+
+def test_frontmatter_placeholders_are_scanned():
+    text = "---\nschema: plan/v3\ndate: {{DATE}}\nrepo: <path-or-name>\n---\n"
+    report = _run_check(vp.check_placeholders, text)
+    assert [i.line for i in report.issues] == [3, 4]
+
+
+def test_placeholder_in_code_ignored():
+    text = (
+        "# PLAN — demo\n"
+        "Run `card.py render <PLAN>` and `{{x}}` then `TBD`.\n"
+        "Wrapped: ``a ` <b> ``.\n"
+        "\n"
+        "```bash\n"
+        "card.py render <PLAN> {{DATE}} TBD TODO\n"
+        "| | |\n"
+        "...\n"
+        "> Template: x\n"
+        "```\n"
+        "\n"
+        "~~~\n"
+        "<PLAN> TBD\n"
+        "~~~\n"
+        "````md\n"
+        "```\n"  # a shorter fence inside a four-backtick fence does not close it
+        "<PLAN>\n"
+        "```\n"
+        "````\n"
+        "Real <PLAN> here.\n"
+    )
+    report = _run_check(vp.check_placeholders, text)
+    # Only the line outside every code region: proves the scan ran at all
+    assert [i.line for i in report.issues] == [_line_of(text, "Real <PLAN>")]
+
+
+def test_html_autolink_email_not_placeholder():
+    text = (
+        "See <https://example.com/a?b=1> and <mailto:ops@example.com> and <ops@example.com>.\n"
+        "Use <details><summary>x</summary></details> and a<br>b, <kbd>Ctrl</kbd>, <sub>1</sub>.\n"
+        "<!-- a comment -->\n"
+        '<a href="https://x.y">x</a> <img src="a.png">\n'
+        "Real <PLAN> here.\n"
+        "Also <name: value> here.\n"
+    )
+    report = _run_check(vp.check_placeholders, text)
+    assert [i.line for i in report.issues] == [_line_of(text, "Real <PLAN>"), _line_of(text, "Also <name")]
+
+
+def test_empty_table_row_flagged():
+    text = (
+        "| Area | Added | Removed |\n"
+        "|---|---|---|\n"
+        "| core | 100 | 20 |\n"
+        "| | | |\n"
+        "| **Total** | | |\n"
+        "| **Total** | 120 | 20 |\n"
+        "|  |  |  |\n"
+        "| `a.py` | | |\n"
+    )
+    report = _run_check(vp.check_placeholders, text)
+    assert [i.line for i in report.issues] == [4, 5, 7]
+    assert all("empty table row" in i.message.lower() for i in report.issues)
+
+
+def test_table_separator_not_flagged():
+    text = (
+        "| A | B |\n"
+        "|---|---|\n"
+        "| --- | :---: |\n"
+        "|:--|--:|\n"
+        "| a | b |\n"
+    )
+    assert _run_check(vp.check_placeholders, text).issues == []
+
+
+def test_template_guidance_line_flagged():
+    text = (
+        "> Template: replace this block with the real text.\n"
+        "  > Template: indented too.\n"
+        "> Templates are fine to mention.\n"
+        "> A quote about a Template: not at the start.\n"
+    )
+    report = _run_check(vp.check_placeholders, text)
+    assert [i.line for i in report.issues] == [1, 2]
+
+
+def test_ellipsis_line_flagged():
+    text = (
+        "...\n"
+        "**Critical path:** ...\n"
+        "**Delivers:**   ...  \n"
+        "Wait for it... then go.\n"
+        "**Delivers:** Faster builds...\n"
+        "1. **(1.1)** ... Verify: ...\n"
+    )
+    report = _run_check(vp.check_placeholders, text)
+    assert [i.line for i in report.issues] == [1, 2, 3]
+
+
+def test_placeholder_report_is_capped_at_ten():
+    text = "".join(f"Line {n}: TBD\n" for n in range(1, 14))
+    report = _run_check(vp.check_placeholders, text)
+    assert len(report.issues) == 11
+    assert [i.line for i in report.issues[:10]] == list(range(1, 11))
+    assert report.issues[10].message.startswith("+3 more")
+    assert {i.severity for i in report.issues} == {"warning"}
+
+
+def test_one_issue_per_line_names_every_placeholder():
+    report = _run_check(vp.check_placeholders, "Fill {{DATE}} and <name> and TBD.\n")
+    assert len(report.issues) == 1
+    for snippet in ("{{DATE}}", "<name>", "TBD"):
+        assert snippet in report.issues[0].message
+
+
+STEPS_PLAN = """# PLAN — demo
+
+## Ordered steps
+
+### Phase 1 — one
+1. **(1.1)** Edit `a.py`. Verify: `pytest a` passes.
+2. **(1.2)** Edit `b.py` to add the flag.
+3. **(1.3)** Edit `c.py` to read it.
+   - note on how
+4. **(1.4)** Edit `d.py`. Expected: PASS
+
+### Phase 2 — two
+5. **(2.1)** Edit `e.py`.
+   - Verify (ACs): the run prints ok.
+"""
+
+
+def test_v2_steps_without_verify_warn_per_step():
+    report = _run_check(vp.check_v2_steps, STEPS_PLAN)
+    assert len(report.issues) == 2
+    assert "Step 1.2" in report.issues[0].message and "Step 1.3" in report.issues[1].message
+    assert [i.line for i in report.issues] == [_line_of(STEPS_PLAN, "(1.2)"), _line_of(STEPS_PLAN, "(1.3)")]
+    assert {(i.severity, i.category) for i in report.issues} == {("warning", "verification")}
+
+
+def test_v2_step_without_file_path_warns():
+    text = (
+        "## Ordered steps\n"
+        "1. **(1.1)** Update the config. Verify: run the tests.\n"
+        "2. **(1.2)** Edit `b.py`. Verify: run the tests.\n"
+        "3. **(1.3)** Edit the loader.\n"
+    )
+    report = _run_check(vp.check_v2_steps, text)
+    assert [(i.category, i.line) for i in report.issues] == [
+        ("specificity", 2),
+        ("verification", 4),
+        ("specificity", 4),
+    ]
+    assert "Step 1.1" in report.issues[0].message
+    assert "Step 1.3" in report.issues[1].message and "Step 1.3" in report.issues[2].message
+    assert {i.severity for i in report.issues} == {"warning"}
+
+
+def test_v2_step_body_ends_at_next_step_or_heading():
+    text = (
+        "## Ordered steps\n"
+        "1. **(1.1)** Edit `a.py`.\n"
+        "2. **(1.2)** Edit `b.py`. Verify: ok.\n"
+        "3. **(1.3)** Edit `c.py`.\n"
+        "### Phase 2\n"
+        "Verify: phase prose belongs to no step.\n"
+        "4. **(2.1)** Edit `d.py`.\n"
+        "```\n"
+        "# a shell comment is not a heading\n"
+        "Verify: it\n"
+        "```\n"
+        "## Risks\n"
+        "5. **(9.9)** Edit `z.py` outside the steps section.\n"
+    )
+    report = _run_check(vp.check_v2_steps, text)
+    # 1.1 gets nothing from 1.2's Verify; 1.3 gets nothing from the prose under the next
+    # heading; 2.1 keeps the Verify inside its fenced block; 9.9 is outside the section.
+    assert [i.message.split()[1] for i in report.issues] == ["1.1", "1.3"]
+
+
+def test_v2_steps_in_code_fences_are_examples():
+    text = (
+        "## Ordered steps\n"
+        "```markdown\n"
+        "1. **(1.1)** An example step with no file and no check.\n"
+        "```\n"
+        "1. **(1.2)** Edit `b.py`. Verify: ok.\n"
+    )
+    assert _run_check(vp.check_v2_steps, text).issues == []
+
+
+def test_v2_verify_must_be_a_label():
+    def flagged(step_text: str) -> bool:
+        return bool(_run_check(vp.check_v2_steps, f"## Ordered steps\n1. **(1.1)** Edit `a.py`. {step_text}\n").issues)
+
+    assert not flagged("Verify: ok")
+    assert not flagged("**Verify:** ok")
+    assert not flagged("Verify (ACs): ok")
+    assert not flagged("Verify each run: ok")
+    # Prose that merely contains the word, with the colon far away, is not a label
+    assert flagged("Verify the parser rejects an empty string: ok")
+    assert flagged("We verify: ok")  # case matters: the label is `Verify`
+
+
+def test_v3_unverified_step_is_error(tmp_path):
+    plan = V3_HEAD + "\n# PLAN — demo\n\n" + STEPS_PLAN.split("\n", 2)[2]
+    clean = plan.replace("Edit `b.py` to add the flag.", "Edit `b.py`. Verify: ok.").replace(
+        "Edit `c.py` to read it.", "Edit `c.py`. Verify: ok."
+    )
+    report = _validate(tmp_path, plan)
+    errs = [i for i in report.errors if i.category == "verification"]
+    assert [i.line for i in errs] == [_line_of(plan, "(1.2)"), _line_of(plan, "(1.3)")]
+    assert not report.passed
+    assert report.score == _validate(tmp_path, clean).score
+
+
+def test_traceability_without_rows_flagged(tmp_path):
+    def trace(*rows: str) -> str:
+        return "\n".join(["# PLAN — demo", "", "## Traceability", "| Finding | Step |", "|---|---|", *rows, "", "## Out of scope", "x"])
+
+    for rows in ((), ("| | |",)):
+        legacy = _run_check(vp.check_traceability_rows, trace(*rows))
+        assert [(i.severity, i.category, i.line) for i in legacy.issues] == [("warning", "traceability", 3)]
+    assert _run_check(vp.check_traceability_rows, trace("| A-1 | 1.1 |")).issues == []
+    # A table inside a fenced block is an example, not a row of this section
+    fenced = "# PLAN — demo\n\n## Traceability\n```\n| A | B |\n|---|---|\n| x | y |\n```\n"
+    assert [i.line for i in _run_check(vp.check_traceability_rows, fenced).issues] == [3]
+    # A missing section is the existing check's job, not a second finding here
+    assert _run_check(vp.check_traceability_rows, "# PLAN — demo\n\n## Out of scope\nx\n").issues == []
+    # Through validate_plan: error on v3, warning on legacy
+    v3 = _validate(tmp_path, V3_HEAD + "\n" + trace())
+    assert [i.line for i in v3.errors if i.category == "traceability"] == [_line_of(V3_HEAD + "\n" + trace(), "## Traceability")]
+    assert not any(i.category == "traceability" for i in _validate(tmp_path, LEGACY_HEAD + "\n" + trace("| A-1 | 1.1 |")).issues)
+
+
+LEGACY_72 = (
+    LEGACY_HEAD
+    + """
+# PLAN — demo
+
+## Target repo & files
+Repo `/work/demo`. Modified: `a.py`, `b.py`. Owner: {{OWNER}}
+
+## Structure (phased)
+Phase 1 only.
+
+## Ordered steps
+
+### Phase 1 — core
+1. **(1.1)** Edit `a.py` to add the flag.
+2. **(1.2)** Edit `b.py` to read the flag.
+3. **(1.3)** Edit `c.py` to log the flag.
+4. **(1.4)** Edit `d.py` to test the flag.
+5. **(1.5)** Document the flag for users.
+
+## Verification (aggregate)
+Run the test suite and the lint.
+
+## Traceability
+| Discovery finding | Plan step |
+|---|---|
+
+## Out of scope
+Nothing else will change.
+"""
+)
+
+
+def test_legacy_pass_status_unchanged_by_new_checks(tmp_path):
+    # C13. Without the new checks this plan scores 72 and passes (no Brief, PR-size, risks or
+    # git sections cost 28). It also carries 5 unverified v2 steps (one without a file path), a
+    # placeholder and an empty Traceability table. The new checks must see all of them and still
+    # leave 72 and PASS.
+    report = _validate(tmp_path, LEGACY_72)
+    assert len([i for i in report.issues if i.category == "verification" and "Step 1." in i.message]) == 5
+    assert [i.severity for i in report.issues if i.category == "specificity" and "Step 1.5" in i.message] == ["warning"]
+    assert [i.severity for i in report.issues if i.category == "placeholder"] == ["warning"]
+    assert [i.severity for i in report.issues if i.category == "traceability" and i.line] == ["warning"]
+    assert not report.errors
+    assert report.score == 72
+    assert report.passed
