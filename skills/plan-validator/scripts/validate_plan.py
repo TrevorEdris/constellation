@@ -1520,7 +1520,18 @@ def check_card(lines: list[str], report: ValidationReport) -> None:
             plain[CARD_MAX_QUESTIONS].line,
         )
     first_run = next((q.line for q in card.questions if q.is_run), 0)
-    if first_run and card.questions[-1].line != first_run:
+    if not first_run:
+        # An unreadable numbered line may be the Run itself; question_format already reports it
+        unreadable = any(problem.rule == "question_format" for problem in problems)
+        needs = card.fields.get(NEEDS_LABEL)
+        if not unreadable:
+            error(
+                "run_not_last",
+                "The card has no Run item. End the numbered list with "
+                "'N. Run → **<subagent-driven|inline>** (<reason>; or <other>)'; Run must be the last numbered item.",
+                card.questions[-1].line if card.questions else needs.line if needs else card.brief_start,
+            )
+    elif card.questions[-1].line != first_run:
         error("run_not_last", "Run must be the last numbered item, and appear once.", first_run)
 
     # Fields

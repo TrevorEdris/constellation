@@ -1134,6 +1134,25 @@ def test_run_not_last_error(tmp_path):
     _fires_only(report, "run_not_last")
 
 
+def test_run_missing_is_run_not_last_error(tmp_path):
+    # GC4: Run is always the last numbered item, so a card without one is not a card. Dropping
+    # the Run line only removes words, so no budget rule fires beside it.
+    report = _v3(tmp_path, **{Q_BLOCK: Q1 + "\n" + Q2})
+    errors = _fires_only(report, "run_not_last")
+    assert "no Run" in errors[0].message
+
+
+def test_card_without_any_question_is_run_not_last_error(tmp_path):
+    # No questions, no [ask] lines and no Run. Asking nothing is legal; the Run answer is not optional.
+    report = _v3(tmp_path, **{Q_BLOCK + "\n": "", D1 + "\n": "", D2 + "\n": ""})
+    _fires_only(report, "run_not_last")
+
+
+def test_unreadable_run_line_is_reported_once_as_question_format(tmp_path):
+    # The Run line is there but malformed, so "no Run item" would mislead
+    _fires_only(_v3(tmp_path, **{"or inline)": "or banana)"}), "question_format")
+
+
 @pytest.mark.parametrize("delivers", ["Sharing by link.", "A user shares lists.", "A user can", "Share a list."])
 def test_delivers_not_user_action_error(tmp_path, delivers):
     report = _v3(tmp_path, **{DELIVERS: "**Delivers:** " + delivers})
