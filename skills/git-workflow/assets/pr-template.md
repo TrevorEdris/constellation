@@ -9,7 +9,7 @@
 
 ## Changes
 
-<!-- Auto-populated by scripts/pr-body.sh from diff stat.
+<!-- Auto-populated by `bash scripts/pr-body.sh` from diff stat.
      If filling manually, list the significant files or areas changed.
      Example:
      - `auth/oauth.go` — new OAuth2 handler

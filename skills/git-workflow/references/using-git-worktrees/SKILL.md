@@ -7,99 +7,101 @@ description: Use when starting feature work that needs isolation from the curren
 
 ## Overview
 
-Git worktrees create isolated workspaces that share one repository, so you can work on multiple branches at once without switching or stashing.
+Ensure work happens in an isolated workspace. Detect existing isolation first, then prefer a native worktree tool, then fall back to plain git. Never fight the harness.
 
-**Core principle:** Deterministic directory selection + ignore verification + clean test baseline = reliable isolation.
-
-This skill is a REQUIRED predecessor for execution skills (constellation:executing-plans, constellation:subagent-driven-development) — set up the worktree before any code is written. It pairs with constellation:git-workflow (REQUIRED BACKGROUND) for branch naming, commits, and cleanup.
+**Core principle:** Detect isolation, get consent, use a native tool or a git fallback in an ignored directory, then prove a clean test baseline.
 
 **Announce at start:** "Using using-git-worktrees to set up an isolated workspace."
 
-## Directory Selection (deterministic priority)
+Script paths are relative to the git-workflow skill base directory (shown when the skill loads); run them by that absolute path from the repo.
 
-Follow this order. Do not skip a step or guess.
+## Step 0: Detect existing isolation
 
-### 1. Check existing directories
-
-```bash
-ls -d .worktrees 2>/dev/null     # preferred (hidden)
-ls -d worktrees 2>/dev/null      # alternative
-```
-
-If found, use it. If both exist, `.worktrees` wins.
-
-### 2. Check CLAUDE.md
+Before creating anything, run this inside the current workspace:
 
 ```bash
-grep -i "worktree.*director" CLAUDE.md 2>/dev/null
+bash scripts/workspace.sh detect
 ```
 
-If a preference is specified, use it without asking.
+It prints `KEY=value` lines. Shell variables do not survive between commands, so substitute the values wherever later steps write `$WORKTREE_PATH`, `$BASE` or `$REMOTE`.
 
-### 3. Ask the user
+- `ISOLATION=worktree`: you are already in a linked worktree. Create nothing and go to Step 2. A submodule reports `none`, not `worktree`. Report:
+  - On a branch: `Already in isolated workspace at <WORKTREE_PATH> on branch <BRANCH>.`
+  - `HEAD=detached`: `Already in isolated workspace at <WORKTREE_PATH> (detached HEAD, externally managed). Branch creation needed at finish time.`
+- `ISOLATION=none`: a normal checkout. If your instructions, memory or the active plan declare a worktree preference, follow it without asking. Otherwise ask: "Would you like me to set up an isolated worktree? It protects your current branch from changes." If the user declines, work in place and go to Step 2.
 
-Only if no directory exists and no CLAUDE.md preference:
+## Step 1: Create the isolated workspace
 
-```
-No worktree directory found. Where should I create worktrees?
+Two mechanisms, in this order.
 
-1. .worktrees/ (project-local, hidden)
-2. ~/.config/constellation/worktrees/<project-name>/ (global, outside the repo)
+### 1a. Native tool
 
-Which would you prefer?
-```
+Use `EnterWorktree` only when the user said yes in Step 0 or explicitly asked for a worktree (project instructions and memory count). A request for a branch is not one. A native tool owns placement, branching and cleanup; a hand-made `git worktree add` creates state the harness cannot see.
 
-## Safety Verification
+- It creates `.claude/worktrees/<name>` on a new branch. Its `fresh` base (the default of the `worktree.baseRef` setting) is `origin/<default branch>`, so base commits that are not pushed are missing. When the work builds on them, use 1b.
+- `ExitWorktree` leaves a worktree that `EnterWorktree` made in this same session. Never call it on your own initiative; run it only when the user asks.
 
-### Project-local directories (.worktrees or worktrees)
+When it succeeds, go to Step 2. With no native tool, or when it does not fit, use 1b.
 
-You MUST verify the directory is ignored before creating a worktree:
+### 1b. Git fallback
+
+#### Choose the directory
+
+First match wins. Run these from the project root (`WORKTREE_PATH`).
+
+1. A directory your instructions, memory or the plan declare: use it without asking.
+2. An existing `.worktrees/`, else `worktrees/`, else `.claude/worktrees/`:
+   ```bash
+   for d in .worktrees worktrees .claude/worktrees; do [ -d "$d" ] && { echo "$d"; break; }; done
+   ```
+3. None of those: the default, `.worktrees/` at the project root.
+
+#### Verify the directory is ignored
+
+Probe a path inside the directory, not the directory itself: before it exists, `check-ignore` on its bare name returns 1 even when a rule covers it. `$dir` is the directory chosen above (substitute it by hand, like the other variables) and `<name>` is the new branch name (slashes nest):
 
 ```bash
-git check-ignore -q .worktrees 2>/dev/null || git check-ignore -q worktrees 2>/dev/null
+git check-ignore -q "$dir/<name>" && echo ignored || echo NOT-IGNORED
 ```
 
-If NOT ignored, fix it immediately before proceeding:
+If NOT ignored, fix it before creating anything:
 
-1. Add the directory to `.gitignore`.
-2. Commit that change (staging only `.gitignore`).
-3. Then create the worktree.
+1. Run the branch check: `git branch --show-current`. On `main`, `master` or `develop`, ask before committing; continue only on a yes.
+2. Append `$dir/` to `.gitignore`, stage only `.gitignore`, and commit it (`chore: ignore $dir/`).
+3. Run the probe again; it must print `ignored`.
 
-Why: an untracked worktree directory pollutes `git status` and can be committed into the repository by accident.
+Why: an unignored worktree directory pollutes `git status` and can be committed into the repository by accident.
 
-### Global directory (~/.config/constellation/worktrees)
+#### Create the worktree
 
-No `.gitignore` check needed — it lives outside the repository.
-
-## Creation Steps
-
-Track these as TodoWrite items so none get skipped.
-
-### 1. Detect project name
+Name the new branch (`$BRANCH`) and validate it; on FAIL, use the suggestion:
 
 ```bash
-project=$(basename "$(git rev-parse --show-toplevel)")
+bash scripts/branch-check.sh "$BRANCH"
 ```
 
-### 2. Create the worktree
+Then create it from `$BASE` (`BASE=` from Step 0, or the base the plan or conversation names):
 
 ```bash
-case $LOCATION in
-  .worktrees|worktrees)
-    path="$LOCATION/$BRANCH_NAME"
-    ;;
-  ~/.config/constellation/worktrees/*)
-    path="$HOME/.config/constellation/worktrees/$project/$BRANCH_NAME"
-    ;;
-esac
-
-git worktree add "$path" -b "$BRANCH_NAME"
-cd "$path"
+git worktree add --no-track "$dir/<name>" -b "$BRANCH" "$BASE"
+cd "$dir/<name>"
 ```
 
-### 3. Run project setup
+PR-based repo (`DELIVERY=pr`) with a non-empty `REMOTE`: branch from the remote's base instead, so the PR does not carry stale history:
 
-Auto-detect from project files; never hardcode for one toolchain:
+```bash
+git fetch "$REMOTE"
+git worktree add --no-track "$dir/<name>" -b "$BRANCH" "$REMOTE/<base>"
+cd "$dir/<name>"
+```
+
+`--no-track` keeps the new branch from tracking `$REMOTE/<base>`. Tracking would make a bare `git push` target the base branch under `push.default=upstream`.
+
+**Sandbox fallback:** if `git worktree add` fails with a permission error (sandbox denial), tell the user the sandbox blocked worktree creation and that you are working in the current directory instead. Then run Steps 2 and 3 in place.
+
+## Step 2: Project setup
+
+Auto-detect from project files; never hardcode one toolchain:
 
 ```bash
 if [ -f package.json ]; then npm install; fi
@@ -109,24 +111,12 @@ if [ -f pyproject.toml ]; then poetry install; fi
 if [ -f go.mod ]; then go mod download; fi
 ```
 
-### 4. Verify a clean baseline
+## Step 3: Verify a clean baseline
 
-Run the project's test command in the fresh worktree:
+Run the project's test command in the workspace (`npm test`, `cargo test`, `pytest`, `go test ./...`). A clean baseline separates bugs you introduce from pre-existing failures; without it every later failure is ambiguous.
 
-```bash
-# use the project-appropriate command
-npm test
-cargo test
-pytest
-go test ./...
-```
-
-A clean baseline is what lets you distinguish bugs YOU introduce from pre-existing failures. Skip it and every later failure is ambiguous.
-
-- **Tests pass:** report ready.
-- **Tests fail:** report the failures and ask whether to proceed or investigate first. Do not silently continue.
-
-### 5. Report location
+- Tests pass: report ready.
+- Tests fail: report the failures and ask whether to proceed or investigate first. Never continue silently.
 
 ```
 Worktree ready at <full-path>
@@ -138,58 +128,27 @@ Ready to implement <feature-name>
 
 | Situation | Action |
 |-----------|--------|
-| `.worktrees/` exists | Use it (verify ignored) |
-| `worktrees/` exists | Use it (verify ignored) |
-| Both exist | Use `.worktrees/` |
-| Neither exists | Check CLAUDE.md, then ask user |
-| Directory not ignored | Add to `.gitignore` + commit, then proceed |
-| Tests fail during baseline | Report failures + ask |
-| No package.json / Cargo.toml / etc. | Skip dependency install |
+| `ISOLATION=worktree` | Create nothing; report the workspace (Step 0) |
+| `ISOLATION=none`, no declared preference | Ask the consent question |
+| User consented, `EnterWorktree` available | Use it (1a); unpushed base commits are missing |
+| No native tool, or it does not fit | `git worktree add` (1b) |
+| Directory choice | Declared, then `.worktrees/`, `worktrees/`, `.claude/worktrees/`, default `.worktrees/` |
+| Directory not ignored | Branch check, add rule to `.gitignore`, commit it |
+| Permission error on create | Sandbox fallback; work in place |
+| Tests fail during baseline | Report failures and ask |
 
-## Common Mistakes
+## Common Rationalizations
 
-| Mistake | Problem | Fix |
-|---------|---------|-----|
-| Skipping ignore verification | Worktree contents get tracked, pollute git status, risk being committed | Always `git check-ignore` before creating a project-local worktree |
-| Assuming directory location | Inconsistency, violates project conventions | Follow priority: existing > CLAUDE.md > ask |
-| Proceeding with failing tests | Can't tell new bugs from pre-existing ones | Report failures, get explicit permission |
-| Hardcoding setup commands | Breaks on other toolchains | Auto-detect from project files |
-
-## Good / Bad
-
-✅ Good:
-```
-Using using-git-worktrees to set up an isolated workspace.
-[.worktrees/ exists] [git check-ignore confirms it is ignored]
-git worktree add .worktrees/auth -b feature/auth
-npm install  →  npm test: 47 passing
-Worktree ready at /Users/me/myproject/.worktrees/auth — 47 tests, 0 failures. Ready to implement auth.
-```
-
-❌ Bad:
-```
-git worktree add wt -b feature/auth   # location guessed, not ignored, no baseline
-cd wt && start editing                # later failures are now ambiguous
-```
-
-## Red Flags — STOP
-
-If you catch yourself thinking any of these, stop and follow the steps above:
-
-- "I'll just create the worktree wherever and check ignore later."
-- "Skipping the baseline tests, they probably pass."
-- "Tests are failing but they look unrelated, I'll keep going."
-- "I'll guess the directory rather than check CLAUDE.md."
-
-**Always:** follow directory priority (existing > CLAUDE.md > ask); verify project-local directories are ignored; auto-detect and run setup; verify a clean test baseline before implementing.
+| Excuse | Reality |
+|--------|---------|
+| "I'm obviously not in a worktree, so skip the check" | Run `bash scripts/workspace.sh detect`. Harness-created isolation and submodules both fool eyeballing. |
+| "`git worktree add` is quicker than the native tool" | After consent, `EnterWorktree` owns placement, branching and cleanup. Bypassing it creates state the harness cannot see. |
+| "`.worktrees` is surely ignored already" | Probe a child path with `check-ignore`. An unignored directory lets the whole tree get committed. |
+| "The work is done, so call `ExitWorktree` to tidy up" | It works only in the session that entered, and only when the user asks. The finishing reference owns cleanup. |
+| "The workspace is fresh, so baseline tests can wait" | A dirty baseline makes every later failure ambiguous. Run them now; proceeding past failures is the user's call. |
 
 ## Integration
 
-**Called by (REQUIRED before execution):**
-- constellation:executing-plans — set up the worktree before executing any task
-- constellation:subagent-driven-development — set up before dispatching implementation subagents
-- constellation:brainstorming — when a design is approved and implementation follows
-- Any skill needing an isolated workspace
-
-**Pairs with:**
-- constellation:git-workflow (REQUIRED BACKGROUND) — branch naming, conventional commits, and worktree cleanup after work completes
+- Called by: `constellation:subagent-driven-development` before dispatching implementation subagents (its inline executing-plans mode included), and `constellation:brainstorming` once a design is approved and implementation follows.
+- Pairs with `references/finishing-a-development-branch/`: its Step 6 removes the worktree this skill created.
+- Pairs with `constellation:git-workflow`: branch names (`bash scripts/branch-check.sh`) and commits.

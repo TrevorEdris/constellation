@@ -7,7 +7,8 @@
 #   base-branch  Branch to compare against (default: auto-detected from main/master/develop)
 #
 # Output:
-#   Formatted markdown PR body ready for use with 'gh pr create --body "$(pr-body.sh)"'
+#   Formatted markdown PR body ready for use with
+#   'GITHUB_TOKEN= gh pr create --body "$(bash <path>/pr-body.sh)"'
 #   or for pasting into a GitHub/GitLab PR form.
 #
 # Exit codes:
@@ -17,6 +18,10 @@
 set -euo pipefail
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+# Absolute path of this script, so the usage hint at the end can be pasted from
+# any directory. Resolved here, before anything could change the working directory.
+SELF="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"
 
 die() {
   echo "ERROR: $*" >&2
@@ -162,6 +167,6 @@ echo "=== PR Body Generated ===" >&2
 echo "Title suggestion (under 70 chars):" >&2
 echo "  $PR_TITLE" >&2
 echo "" >&2
-echo "To create PR with gh CLI:" >&2
-echo "  gh pr create --title \"$PR_TITLE\" --body \"\$(bash scripts/pr-body.sh)\"" >&2
+echo "To create PR with gh CLI (a repo PULL_REQUEST_TEMPLATE.md wins over this body):" >&2
+echo "  GITHUB_TOKEN= gh pr create --title \"$PR_TITLE\" --body \"\$(bash '$SELF')\"" >&2
 echo "" >&2
