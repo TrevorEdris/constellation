@@ -77,7 +77,8 @@ def main(argv=None):
             print(f"MISSING MARKERS: {fn}")
             ok = False
             continue
-        new = BLOCK.sub(generated, text)
+        # A callable replacement is inserted as-is; a string would have its backslashes expanded.
+        new = BLOCK.sub(lambda m: generated, text)
         if args.check:
             if new != text:
                 print(f"STALE: {fn} SKILLS block out of date")
