@@ -187,6 +187,14 @@ def test_explicit_bump_updates_manifests_and_dates_changelog(tmp):
     assert new_log in expected, new_log
     assert "(unreleased)" not in new_log
 
+    # The not-above guard compares numbers, not text: "0.10.0" sorts below
+    # "0.9.0" as a string, yet 0.10.0 is the valid next minor after 0.9.0.
+    repo = make_repo(tmp / "ten", "0.9.0", {"origin/main": "0.9.0"})
+    res = run_bump(repo, "0.10.0", "--note", "n")
+    assert res.returncode == 0, res.stderr
+    assert plugin_version(repo) == "0.10.0"
+    assert market_version(repo) == "0.10.0"
+
 
 def test_next_from_origin_main(tmp):
     repo = make_repo(tmp / "repo", "0.1.0", {"origin/main": "0.1.0"})
@@ -194,6 +202,14 @@ def test_next_from_origin_main(tmp):
     assert res.returncode == 0, res.stderr
     assert plugin_version(repo) == "0.2.0"
     assert market_version(repo) == "0.2.0"
+
+    # Crossing 0.9 to 0.10: the computed 0.10.0 must pass the same numeric
+    # not-above guard, which a string comparison would wrongly refuse.
+    repo = make_repo(tmp / "ten", "0.9.0", {"origin/main": "0.9.0"})
+    res = run_bump(repo, "--next", "--note", "n")
+    assert res.returncode == 0, res.stderr
+    assert plugin_version(repo) == "0.10.0"
+    assert market_version(repo) == "0.10.0"
 
 
 def test_next_uses_max_of_origin_main_and_base(tmp):
