@@ -199,6 +199,16 @@ expect_suggestion_differs "feature/has!bang"
 # would turn PROJ-42 into proj-42.
 expect_suggestion "feature/PROJ-42-Add-Login" "feature/PROJ-42-add-login"
 
+# One line builds every suggestion, so each branch of it is pinned by an exact
+# match. 'differs' is too weak: dropping the lowercase step leaves the suggestion
+# identical to the rejected name.
+#   No ticket: the whole name is lowercased.
+expect_suggestion "feature/AddOAuthLogin" "feature/addoauthlogin"
+#   Ticket: the type is lowercased too, while the ticket keeps its case.
+expect_suggestion "Feat/PROJ-42-Add" "feat/PROJ-42-add"
+#   No type prefix: there is no ticket exception, and no leading '/' appears.
+expect_suggestion "PROJ-42-oauth" "proj-42-oauth"
+
 # ── Cases: printed type lists come from VALID_TYPES ───────────────────────────
 
 expect_types_listed
