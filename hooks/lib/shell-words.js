@@ -32,26 +32,38 @@
  * second paren is immediately followed by another `)`; otherwise `$((cat x) | sh)` is a
  * substitution and `((a); b)` is nested subshells. arithClose makes the same call with a
  * look-ahead over quotes and parens, so neither reading can hide a command and a `<<` inside
- * `((x=1<<2))` is not taken for a heredoc. The look-ahead has a total work budget of 16
- * passes over the input; past it the `((` is read as parens or a substitution and `overflow`
- * is set.
+ * `((x=1<<2))` is not taken for a heredoc. A `((` can open arithmetic wherever a command can
+ * start: at the start of a segment and after `if`, `elif`, `while`, `until`, `then`, `else`,
+ * `do`, `{`, `!`, `time` and `for`. The look-ahead has a total work budget of 16 passes over
+ * the input; past it the `((` is read as parens or a substitution and `overflow` is set.
  *
  * scan never throws. Unterminated quotes, substitutions and heredocs close at end of input.
- * Substitutions nested more than MAX_NEST deep are not followed: the rest of the input becomes
- * that body and `overflow` is set so the caller can treat the command as unparsed.
+ * `overflow` means the text could not be followed to its end, so the caller should treat the
+ * command as unparsed. It is set when substitutions nest more than MAX_NEST deep (the rest of
+ * the input becomes that body), when the arithmetic look-ahead runs out of budget, and when a
+ * heredoc never finds its delimiter line. The last one is the backstop for every `<<` that bash
+ * reads as arithmetic and this module does not (`$[1<<2]`, `a[1<<2]=5`, `${a[1<<2]}`): read as a
+ * heredoc, its body would run to end of input and hide every later command.
+ *
+ * A heredoc inside a substitution may also end on a line that starts with its delimiter and a
+ * `)` (`EOF)`), and that `)` closes the substitution. Bash accepts the form with a warning, so
+ * `$(cat <<EOF`, `hi`, `EOF) ; next` on three lines runs `next` as a command; the body is not
+ * allowed to swallow it.
  *
  * Known gaps, kept out on purpose:
  *   - `${...}` is not parsed as a unit (so `${X:-a b}` splits on the space).
- *   - `((` is arithmetic only where a command can start. After a keyword (`while ((`, `do ((`,
- *     `for ((`) it is still read as two subshell parens, so a `<<` inside it opens a heredoc.
+ *   - `<<` inside `$[...]`, a subscript or a `${x:off}` offset is read as a heredoc; the only
+ *     protection is the `overflow` backstop above.
  *   - `case` patterns are followed by a small state machine (`case WORD in`, then `)` ends a
  *     pattern until the next `;;`, `;&`, `;;&` or `esac`). It does not follow extglob patterns
  *     (`@(a|b)`), a `)` inside a bracket expression (`[)]`), or `in` on a line of its own.
  */
 
 const MAX_NEST = 16;
-// Reserved words after which a command can still start, so `then case x in` is a case command.
-const LEAD_WORDS = new Set(['if', 'then', 'elif', 'else', 'while', 'until', 'do', '{', '!', 'time']);
+// Reserved words after which a command can still start, so `then case x in` is a case command
+// and `while ((` opens arithmetic. `for` is here only for `for ((`: the word after it, a loop
+// variable, ends the lead like any other word.
+const LEAD_WORDS = new Set(['if', 'then', 'elif', 'else', 'while', 'until', 'do', 'for', '{', '!', 'time']);
 
 function scan(cmd) {
   const src = typeof cmd === 'string' ? cmd : '';
@@ -103,6 +115,10 @@ function run(src, start, depth, untilParen, st) {
     const k = cases[cases.length - 1];
     return k && k.parens === parens ? k : null;
   };
+  // A `((` opens arithmetic only where a command can start: at the start of a segment, after a
+  // reserved word that can precede a command (`while ((`, `do ((`) and after `for`. Anywhere
+  // else, `echo a ((1))` is a syntax error in bash and the parens are ordinary subshell parens.
+  const arithCanStart = () => lead && !inWord && !pending && !seg.redirects.length;
 
   // A pattern's `)` must not close an enclosing `$(...)`, so the scanner has to know when it is
   // between `case WORD in` and the pattern's `)`. `esac` in command position ends the case.
@@ -157,25 +173,45 @@ function run(src, start, depth, untilParen, st) {
   // Read the bodies of every pending heredoc, in order, starting at `pos` (just after a
   // newline). A body ends at a line equal to its delimiter, or at end of input. Quoted
   // delimiters make the body literal and it is dropped; otherwise only its $(...) and
-  // backticks matter.
+  // backticks matter. A body that never finds its delimiter runs to end of input and sets
+  // `overflow`: when the `<<` was really arithmetic, that body is every later command.
+  // Inside a substitution, bash also ends the body at a line that starts with the delimiter
+  // and a `)`. The scan then resumes at that `)` so it closes the substitution, and any
+  // heredoc still pending is dropped (its text is read as commands, which can only over-report).
   function readHeredocBodies(pos) {
     while (heredocs.length) {
       const h = heredocs.shift();
       const bodyStart = pos;
-      let lineEnd = n;
+      let bodyEnd = n;
+      let resume = n;
       let found = false;
+      let byParen = false;
       while (pos < n) {
         const nl = src.indexOf('\n', pos);
-        lineEnd = nl === -1 ? n : nl;
-        const line = h.strip ? src.slice(pos, lineEnd).replace(/^\t+/, '') : src.slice(pos, lineEnd);
-        if (line === h.delim) { found = true; break; }
+        const lineEnd = nl === -1 ? n : nl;
+        const tabs = h.strip ? /^\t*/.exec(src.slice(pos, lineEnd))[0].length : 0;
+        const line = src.slice(pos + tabs, lineEnd);
+        if (line === h.delim) {
+          found = true;
+          bodyEnd = pos;
+          resume = Math.min(lineEnd + 1, n);
+          break;
+        }
+        if (untilParen && line.startsWith(h.delim + ')')) {
+          found = true;
+          byParen = true;
+          bodyEnd = pos;
+          resume = pos + tabs + h.delim.length;
+          break;
+        }
         pos = lineEnd + 1;
       }
-      const bodyEnd = found ? pos : n;
+      if (!found) st.overflow = true;
       if (!h.quoted) {
         dqText(src.slice(bodyStart, bodyEnd), 0, false, depth, st, (body) => { h.owner.substs.push(body); });
       }
-      pos = found ? Math.min(lineEnd + 1, n) : n;
+      pos = resume;
+      if (byParen) heredocs.length = 0;
     }
     return pos;
   }
@@ -292,10 +328,14 @@ function run(src, start, depth, untilParen, st) {
     if (c === '(') {
       const k = caseHere();
       if (k && k.pattern) { flushWord(); i++; continue; } // optional `(` before a case pattern
-      if (src[i + 1] === '(' && isEmpty()) {
+      if (src[i + 1] === '(') {
+        // A word right before `((` ends there (`while((`), so settle it before looking at the segment.
+        flushWord();
         // `((` opening a command is arithmetic when it closes as `))`, else two subshell parens.
-        const end = arithEnd(src, i + 2, st);
-        if (end !== -1) { i = arithmetic(src, i + 2, end, depth, st, addSubst); continue; }
+        if (arithCanStart()) {
+          const end = arithEnd(src, i + 2, st);
+          if (end !== -1) { i = arithmetic(src, i + 2, end, depth, st, addSubst); continue; }
+        }
       }
       endSegment(false);
       parens++;
