@@ -1085,6 +1085,34 @@ def test_approve_sha_matches_render_footer(tmp_path):
     assert card.brief_sha7(_plan_card(plan).brief_text) != sha
 
 
+def test_approve_logs_absolute_paths_for_relative_arguments(tmp_path, monkeypatch):
+    # The skill prose may pass PLAN.md and SESSION.md as relative paths: the log entry and stdout must still name absolute ones
+    plan = _awaiting(tmp_path)
+    session = _session(tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    (out, code), days = _decide("PLAN.md", "go", "SESSION.md")
+
+    assert code == 0, out
+    assert out == f'approved: "{TITLE}" (card 37e114a); logged to {session}\n'
+    assert out.endswith(f"; logged to {tmp_path / 'SESSION.md'}\n")
+    entry = _entry("Approved card", plan, "go")
+    assert _masked(session.read_text(encoding="utf-8"), days) == SESSION.replace("\n## Status\n", entry + "\n## Status\n")
+    assert f"Approved card 37e114a ({tmp_path / 'PLAN.md'})\n" in session.read_text(encoding="utf-8")
+
+
+def test_approve_cli_logs_absolute_paths_for_relative_arguments(tmp_path):
+    plan = _awaiting(tmp_path)
+    session = _session(tmp_path)
+
+    result = _run_cli("approve", "PLAN.md", "--reply", "go", "--session-md", "SESSION.md", cwd=tmp_path)
+
+    assert (result.returncode, result.stderr) == (0, "")
+    assert result.stdout == f'approved: "{TITLE}" (card 37e114a); logged to {tmp_path / "SESSION.md"}\n'
+    assert f"Approved card 37e114a ({tmp_path / 'PLAN.md'})\n  > go\n" in session.read_text(encoding="utf-8")
+    assert "status: approved\n" in plan.read_text(encoding="utf-8")
+
+
 def test_approve_preserves_crlf_line_endings(tmp_path):
     plan = _awaiting(tmp_path)
     plan.write_bytes(plan.read_bytes().replace(b"\n", b"\r\n"))
