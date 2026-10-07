@@ -587,6 +587,53 @@ def test_every_unsure_word_makes_an_answer_ambiguous(word):
     assert (result.kind, result.answers) == ("ambiguous", {}), result
 
 
+@pytest.mark.parametrize("token", [token for token in HEDGE if token != "no"])
+def test_every_hedge_token_blocks_a_numbered_answer(token):
+    # The same words that make "go, <token>" a change make "2 <token>" no clean answer: ambiguous, since the
+    # reply is not clearly a change request. Only the bare answer "no" is clean ("2 no, go" is approve).
+    result = card.classify_reply(f"2 {token}, go", 3)
+    assert (result.kind, result.answers) == ("ambiguous", {}), result
+    assert f'"{token}"' in result.reason, result
+
+
+def _separators() -> list:
+    """Every character str.splitlines treats as a line break: the ones that would split a D-line or a Brief line."""
+    return [chr(code) for code in range(0x2100) if len(f"a{chr(code)}b".splitlines()) > 1]
+
+
+@pytest.mark.parametrize("char", list("[]*`|\\") + _separators())
+def test_an_answer_the_card_cannot_carry_never_approves(char):
+    # T8 splices an answer into "[you: <answer>]" (a D-line) and "**you: <answer>**" (a Brief line)
+    for reply in (f"2 a{char}b, go", f"2 a{char}b"):
+        result = card.classify_reply(reply, 3)
+        assert result.kind != "approve", (reply, result)
+        assert result.answers == {}
+
+
+@pytest.mark.parametrize(
+    ("reply", "questions"),
+    [
+        ("2 no, go", 3),
+        ("3 inline", 3),
+        ("2 PostgreSQL, go", 3),
+        ("2 PostgreSQL with pooled connections and replicas, go", 3),
+        ("1. option 3, 2. option 3, 3. ... rest looks good, 4. option 1, 5. yes, 6. option 1", 6),
+    ],
+)
+def test_an_approved_answer_fits_the_card_grammar(reply, questions):
+    # The answers of an approval go back into the plan: the card's own regexes must still read what T8 writes
+    result = card.classify_reply(reply, questions)
+    assert result.kind == "approve" and result.answers, result
+    for answer in result.answers.values():
+        dline = f"- D1 [you: {answer}] Which database?"
+        match = vp._DLINE_RE.match(dline)
+        assert match and match.group(2) == f"you: {answer}", dline
+        question = f"1. Which database? → **you: {answer}** (Postgres; if wrong: swap it)"
+        match = vp._QUESTION_RE.match(question)
+        assert match and match.group(3) == f"you: {answer}", question
+        assert question.count("**") == 2 and len(question.splitlines()) == 1, question
+
+
 def _approve(answers=None):
     """The (kind, answers) pair of an approval, to unpack into a test_reply_grammar row."""
     return ("approve", answers or {})
@@ -618,6 +665,20 @@ def _approve(answers=None):
         pytest.param("2 not sure, go", 3, "ambiguous", {}, id="answer-not-sure"),
         pytest.param("2 unsure, go", 3, "ambiguous", {}, id="answer-unsure"),
         pytest.param("2 skip, go", 3, "ambiguous", {}, id="answer-skip"),
+        # A negation inside an answer holds the plan back just as it does in text ("go, stop" is a change)
+        pytest.param("1 stop", 3, "ambiguous", {}, id="answer-stop"),
+        pytest.param("3 don't implement yet", 3, "ambiguous", {}, id="answer-dont-implement-yet"),
+        pytest.param("2 not yet", 3, "ambiguous", {}, id="answer-not-yet"),
+        pytest.param("2 no go", 3, "ambiguous", {}, id="answer-no-go"),
+        pytest.param("1 no way", 3, "ambiguous", {}, id="answer-no-way"),
+        pytest.param("1 do not proceed", 3, "ambiguous", {}, id="answer-do-not-proceed"),
+        pytest.param("2 'stop', go", 3, "ambiguous", {}, id="answer-hedge-in-quotes"),
+        pytest.param("2 NO, go", 3, *_approve({2: "NO"}), id="answer-no-any-case"),
+        # An answer is spliced into "[you: <answer>]" and "**you: <answer>**", so it cannot carry their syntax
+        pytest.param("2 **no**", 3, "ambiguous", {}, id="answer-bold"),
+        pytest.param("2 foo] bar, go", 3, "ambiguous", {}, id="answer-closing-bracket"),
+        pytest.param("2 [you: x]", 3, "ambiguous", {}, id="answer-you-bracket"),
+        pytest.param("2 `x`, go", 3, "ambiguous", {}, id="answer-backticks"),
         # Approval words only
         pytest.param("approved, go ahead and implement", 3, *_approve(), id="approval-phrases"),
         pytest.param("Plan LGTM. Proceed with implementation.", 3, *_approve(), id="approval-sentences"),

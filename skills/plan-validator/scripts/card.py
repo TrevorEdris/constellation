@@ -267,6 +267,13 @@ UNSURE_WORDS = frozenset((
 UNSURE_PHRASES = ("not sure",)
 MAX_ANSWER_WORDS = 6
 
+# An answer goes back into the plan as "[you: <answer>]" (a D-line) and "**you: <answer>**" (the Brief),
+# so it cannot hold the characters that close or reopen those spans, a code span, a table cell or an escape.
+# A line break (any character str.splitlines splits at) would cut the D-line or Brief line in two.
+ANSWER_UNSAFE_CHARS = frozenset("[]*`|\\")
+# The one hedge word a clean answer may be: "2 no" answers a yes/no question. "2 no go" and "2 no way" are not.
+CLEAN_NEGATIVE = "no"
+
 _TOKEN_RE = re.compile(r"[\w']+")
 _CHUNK_SPLIT_RE = re.compile(r"[,;\n]")
 _SENTENCE_END_RE = re.compile(r"\.(?=\s|$)")
@@ -278,7 +285,8 @@ class Classification(NamedTuple):
     """What a reply means. kind is approve, change or ambiguous; reason says why, for logs and test failures.
 
     answers maps a question number to the user's answer, in the reply's own case. It is empty
-    unless kind is approve: a reply that is not an approval gives nothing to apply.
+    unless kind is approve: a reply that is not an approval gives nothing to apply. An answer in it
+    is safe to write into a D-line ("[you: <answer>]") and a Brief line ("**you: <answer>**").
     """
 
     kind: str
@@ -319,6 +327,30 @@ def _first_unsure(tokens: list[str]) -> Optional[str]:
         for phrase in UNSURE_PHRASES:
             if _phrase_at(tokens, n, phrase):
                 return phrase
+    return None
+
+
+def _answer_problem(answer: str) -> Optional[str]:
+    """Why answer is not a clean numbered answer (a phrase to follow "answer N"), or None when it is clean.
+
+    A clean answer is short, free of uncertainty and hedge words (except the bare answer "no") and safe
+    to write into a D-line and a Brief line. Quotes around a word do not hide it: 'stop' is "stop".
+    """
+    tokens = _tokens(answer)
+    if len(tokens) > MAX_ANSWER_WORDS:
+        return f"is longer than {MAX_ANSWER_WORDS} words"
+    unsafe = next((repr(ch) for ch in answer if ch in ANSWER_UNSAFE_CHARS), None)
+    if unsafe is None and len(answer.splitlines()) > 1:
+        unsafe = "a line break"
+    if unsafe is not None:
+        return f"holds {unsafe}, which the card cannot carry"
+    unsure = _first_unsure(tokens)
+    if unsure:
+        return f'says "{unsure}"'
+    bare = [tok.strip("'") for tok in tokens]
+    hedge = None if bare == [CLEAN_NEGATIVE] else _first_hedge(bare)
+    if hedge:
+        return f'says "{hedge}"'
     return None
 
 
@@ -379,7 +411,9 @@ def classify_reply(reply: str, question_count: int, plan_path: Optional[str] = N
        "<number> <answer>" is a numbered answer, and every other chunk is cut again at sentence
        ends into text (so "1. option 3" stays one answer);
     5. a hedge word in the text is a change;
-    6. an answer longer than MAX_ANSWER_WORDS or holding an uncertainty word is ambiguous;
+    6. an answer is ambiguous when it is longer than MAX_ANSWER_WORDS, holds an uncertainty word or a
+       hedge word (the bare answer "no" is clean), or holds a character the card cannot carry (see
+       ANSWER_UNSAFE_CHARS and _answer_problem);
     7. text left after approval phrases and filler are taken out is ambiguous;
     8. no approval phrase and no answer is ambiguous;
     9. otherwise the reply approves.
@@ -405,12 +439,9 @@ def classify_reply(reply: str, question_count: int, plan_path: Optional[str] = N
             return Classification(CHANGE, {}, f'the reply says "{hedge}"')
 
     for number, answer in answers.items():
-        tokens = _tokens(answer)
-        if len(tokens) > MAX_ANSWER_WORDS:
-            return Classification(AMBIGUOUS, {}, f"answer {number} is longer than {MAX_ANSWER_WORDS} words")
-        unsure = _first_unsure(tokens)
-        if unsure:
-            return Classification(AMBIGUOUS, {}, f'answer {number} says "{unsure}"')
+        problem = _answer_problem(answer)
+        if problem:
+            return Classification(AMBIGUOUS, {}, f"answer {number} {problem}")
 
     approved = False
     left: list[str] = []
