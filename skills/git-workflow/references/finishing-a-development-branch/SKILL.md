@@ -151,7 +151,7 @@ Only the literal word `discard` counts; "yes", "y" and "go ahead" do not. On a m
 
 ## Step 6: Clean up
 
-Runs after a local merge and after a confirmed discard (and later, once a PR has merged). A PR or Keep leaves the worktree and branch alone until then. Inside an `EnterWorktree` session skip this step; the session owns the worktree, and `ExitWorktree` runs only when the user asks.
+Runs after a local merge and after a confirmed discard. A PR or Keep leaves the worktree and branch alone. Inside an `EnterWorktree` session skip this step; the session owns the worktree, and `ExitWorktree` runs only when the user asks.
 
 Removal must start outside the worktree, so `cd` first, in the same block:
 
@@ -163,8 +163,8 @@ bash scripts/workspace.sh cleanup "$WORKTREE_PATH" <branch>
 `<branch>` is the work's branch, never the base. For a confirmed discard, add `--discard --confirm discard`.
 
 - Exit 0: report `REMOVED_WORKTREE=` and `DELETED_BRANCH=`. Name every `IGNORED=` path (such as `.env` or `node_modules/`) as deleted with the worktree. `LEFT_IN_PLACE=` means the host owns the workspace; say so and leave it.
-- Exit 3: files exist only in the worktree. Show the `BLOCKING=` lines and ask: commit them, move them into `MAIN_ROOT`, or delete exactly those. Carry out the answer, then rerun.
-- Exit 1 or 2: nothing was forced. Report `REFUSED=`. If it names the upstream, nothing was removed: push the branch (or confirm it landed through that upstream) and rerun. Otherwise fix what it names; do not work around it.
+- Exit 3: files exist only in the worktree. Show the `BLOCKING=` lines and ask: commit them, move them into `MAIN_ROOT`, or delete exactly those. Carry out the answer, then rerun. After a local merge, a commit made now is not in the base yet: rerun the Step 5 merge, then this step.
+- Exit 1 or 2: nothing was forced. Report `REFUSED=`. If it names the upstream, nothing was removed: push the branch (or confirm it landed through that upstream) and rerun. If it says the branch is not merged into the HEAD, a squash- or rebase-merged PR is the usual cause (its commits are not ancestors of the base), so the refusal is expected: confirm the merge with `GITHUB_TOKEN= gh pr view <branch> --json state`, tell the user, and let them retire the branch with an explicit Discard request (typed `discard`); never `-D` or `--force` directly. Otherwise fix what it names; do not work around it.
 
 ## Quick Reference
 
