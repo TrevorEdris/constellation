@@ -5,8 +5,11 @@
 # directories compared before canonicalizing made a normal repo look like a
 # worktree, the main checkout was taken from the wrong git command, and a piped
 # `grep -q` under pipefail reported "no PR history" for a repo that had it.
-# Every case here builds a real git repo and runs the real script, so the exact
-# code the agent runs is what gets tested. No network, no `gh`.
+# merge-local adds its own: a local merge into a repo that ships by PR, a
+# checkout run in the worktree where the base is already taken, and a plan flag
+# taken on trust. Every case here builds a real git repo and runs the real
+# script, so the exact code the agent runs is what gets tested. No network, no
+# `gh`.
 #
 # Usage: test-workspace.sh        (any working directory)
 #
@@ -106,9 +109,96 @@ detect_in() {
   ERR="$(cat "$TMP/stderr")"
 }
 
+# merge_in <dir> [args...] — run `workspace.sh merge-local` from <dir>.
+# Sets OUT, ERR, RC.
+merge_in() {
+  local dir="$1"
+  shift
+  OUT="$(cd "$dir" && ws merge-local "$@" 2>"$TMP/stderr")"
+  RC=$?
+  ERR="$(cat "$TMP/stderr")"
+}
+
 # kv <KEY> — the value of KEY=value from the last run's stdout.
 kv() {
   sed -n "s/^$1=//p" <<<"$OUT"
+}
+
+# has <KEY> — "yes" when the last run printed a KEY= line, even an empty one.
+has() {
+  case $'\n'"$OUT" in
+    *$'\n'"$1="*) echo yes ;;
+    *) echo no ;;
+  esac
+}
+
+# commit_file <dir> <file> <content> <subject> — commit one file.
+commit_file() {
+  printf '%s\n' "$3" >"$1/$2" || die "write $1/$2"
+  g -C "$1" add "$2" || die "add $2"
+  g -C "$1" commit -q -m "$4" || die "commit '$4' in $1"
+}
+
+# new_feature [remote] — new_repo plus a tracked file on main, and a worktree
+# $WT on feat/w with one commit that adds feature.txt. With "remote", main also
+# tracks a bare origin, which makes the repo PR-based. Sets $MAIN_SHA.
+new_feature() {
+  new_repo
+  commit_file "$REPO" tracked.txt base "add tracked"
+  if [ "${1:-}" = remote ]; then
+    g init -q --bare "$SB/origin.git" || die "bare origin"
+    g -C "$REPO" remote add origin "$SB/origin.git" || die "remote add"
+    g -C "$REPO" push -q -u origin main || die "push main"
+  fi
+  add_wt repo/.worktrees/w feat/w
+  commit_file "$WT" feature.txt feature "add feature"
+  MAIN_SHA="$(g -C "$REPO" rev-parse main)"
+}
+
+# diverge_main — put a commit on main that feat/w lacks, so merging makes a real
+# merge commit. Call it while the main checkout is still on main. Updates $MAIN_SHA.
+diverge_main() {
+  commit_file "$REPO" mainline.txt mainline "add mainline"
+  MAIN_SHA="$(g -C "$REPO" rev-parse main)"
+}
+
+# park_main — move the main checkout off main, onto a new branch "other".
+park_main() {
+  g -C "$REPO" checkout -q -b other || die "checkout -b other"
+}
+
+# is_merged <branch> <into> — "yes" when <branch> is an ancestor of <into>.
+is_merged() {
+  if g -C "$REPO" merge-base --is-ancestor "$1" "$2"; then echo yes; else echo no; fi
+}
+
+# exists <path> — "yes" or "no".
+exists() {
+  if [ -e "$1" ]; then echo yes; else echo no; fi
+}
+
+# write_plan <file> <status> <repo> <mode> — a plan whose single delivery item
+# is <repo> / <mode>. <status> goes in verbatim, so it can carry a comment.
+write_plan() {
+  cat >"$1" <<EOF
+---
+schema: plan/v3
+date: 2026-10-07
+slug: t
+status: $2
+delivery:
+  - repo: $3
+    mode: $4
+    branch: feat/w
+    base: main
+    remote: none
+    prs: 0
+tags: [t]
+---
+# Plan
+
+Body text.
+EOF
 }
 
 # Per-case bookkeeping: assertions accumulate, finish reports once.
@@ -430,6 +520,341 @@ commit "$REPO" "Merge branch 'feature/x'"
 detect_in "$REPO"
 assert_eq "REMOTE" "" "$(kv REMOTE)"
 assert_eq "DELIVERY" local "$(kv DELIVERY)"
+finish
+
+# ── Cases: merge-local ────────────────────────────────────────────────────────
+
+# The seed incident: a local merge into a repo that ships by PR. Both signals
+# (a remote, merged-PR subjects) must refuse before anything moves: the base
+# keeps its SHA and the main checkout stays on the branch the user left it on.
+begin "merge-local: refuses PR-based repo"
+new_feature remote
+park_main
+merge_in "$WT" main feat/w -- true
+assert_eq "remote: exit" 4 "$RC"
+assert_contains "remote: REFUSED" "PR-based repo" "$(kv REFUSED)"
+assert_contains "remote: REFUSED names the fix" "open a PR instead" "$(kv REFUSED)"
+assert_eq "remote: base unchanged" "$MAIN_SHA" "$(g -C "$REPO" rev-parse main)"
+assert_eq "remote: main checkout untouched" other "$(g -C "$REPO" symbolic-ref --short HEAD)"
+assert_eq "remote: nothing reported as moved" no "$(has PREVIOUS_BRANCH)"
+new_feature
+commit "$REPO" "feat: seed (#4)"
+MAIN_SHA="$(g -C "$REPO" rev-parse main)"
+merge_in "$WT" main feat/w -- true
+assert_eq "PR subjects: exit" 4 "$RC"
+assert_eq "PR subjects: base unchanged" "$MAIN_SHA" "$(g -C "$REPO" rev-parse main)"
+finish
+
+# Run from the worktree, with the main checkout on another branch. The checkout
+# and merge must happen in the main checkout: base is free there, and the
+# worktree's own checkout of it would be the wrong directory.
+begin "merge-local: works from inside the worktree"
+new_feature
+park_main
+merge_in "$WT" main feat/w -- true
+assert_eq "exit" 0 "$RC"
+assert_eq "PREVIOUS_BRANCH" other "$(kv PREVIOUS_BRANCH)"
+assert_eq "feat/w is an ancestor of main" yes "$(is_merged feat/w main)"
+assert_eq "MERGED is main's tip" "$(g -C "$REPO" rev-parse main)" "$(kv MERGED)"
+assert_eq "main checkout is left on the base" main "$(g -C "$REPO" symbolic-ref --short HEAD)"
+assert_eq "worktree kept" yes "$(exists "$WT")"
+assert_eq "branch kept" feat/w "$(g -C "$REPO" branch --list feat/w --format='%(refname:short)')"
+finish
+
+# Base already checked out in the main checkout: `git checkout main` in the
+# worktree would exit 128 ("already checked out"). The main checkout is where
+# the checkout has to run.
+begin "merge-local: works when the main checkout already sits on the base"
+new_feature
+merge_in "$WT" main feat/w -- true
+assert_eq "exit" 0 "$RC"
+assert_eq "PREVIOUS_BRANCH" main "$(kv PREVIOUS_BRANCH)"
+assert_eq "feat/w is an ancestor of main" yes "$(is_merged feat/w main)"
+finish
+
+begin "merge-local: detached main checkout reports an empty PREVIOUS_BRANCH"
+new_feature
+g -C "$REPO" checkout -q --detach || die "detach"
+merge_in "$WT" main feat/w -- true
+assert_eq "exit" 0 "$RC"
+assert_eq "PREVIOUS_BRANCH printed" yes "$(has PREVIOUS_BRANCH)"
+assert_eq "PREVIOUS_BRANCH empty" "" "$(kv PREVIOUS_BRANCH)"
+assert_eq "main checkout is on the base" main "$(g -C "$REPO" symbolic-ref --short HEAD)"
+assert_eq "feat/w is an ancestor of main" yes "$(is_merged feat/w main)"
+finish
+
+# The documented path: cd to the main checkout, which is on the feature branch
+# itself when there is no worktree.
+begin "merge-local: works from the main checkout"
+new_repo
+commit_file "$REPO" tracked.txt base "add tracked"
+g -C "$REPO" checkout -q -b feat/x || die "checkout feat/x"
+commit_file "$REPO" feature.txt feature "add feature"
+merge_in "$REPO" main feat/x -- true
+assert_eq "exit" 0 "$RC"
+assert_eq "PREVIOUS_BRANCH" feat/x "$(kv PREVIOUS_BRANCH)"
+assert_eq "feat/x is an ancestor of main" yes "$(is_merged feat/x main)"
+assert_eq "main checkout is on the base" main "$(g -C "$REPO" symbolic-ref --short HEAD)"
+finish
+
+# The tests judge the merged result, from the main checkout, with the command's
+# own arguments intact. Their output must not mix into the KEY=value lines.
+begin "merge-local: tests run in the main checkout on the merged result"
+new_feature
+diverge_main
+park_main
+merge_in "$WT" main feat/w -- bash -c \
+  'pwd -P >"$1"; ls | paste -sd, - >>"$1"; printf "%s\n" "$2" >>"$1"; echo NOISE=from-tests' \
+  _ "$TMP/ran.out" "two words"
+assert_eq "exit" 0 "$RC"
+assert_eq "cwd, files, argument" \
+  "$REPO"$'\n'"feature.txt,mainline.txt,tracked.txt"$'\n'"two words" "$(cat "$TMP/ran.out")"
+assert_eq "test output stays off stdout" no "$(has NOISE)"
+assert_contains "test output reaches stderr" "NOISE=from-tests" "$ERR"
+finish
+
+# Exit 5 leaves the merge in place for the caller to inspect, keeps the worktree
+# and branch, and prints an UNDO that really restores the pre-merge base.
+begin "merge-local: failing tests keep worktree and branch"
+new_feature
+diverge_main
+park_main
+merge_in "$WT" main feat/w -- false
+assert_eq "exit" 5 "$RC"
+assert_contains "REFUSED" "tests" "$(kv REFUSED)"
+assert_eq "KEPT_BRANCH" feat/w "$(kv KEPT_BRANCH)"
+assert_eq "UNDO" "git -C $REPO reset --merge $MAIN_SHA" "$(kv UNDO)"
+assert_eq "worktree kept" yes "$(exists "$WT")"
+assert_eq "branch kept" feat/w "$(g -C "$REPO" branch --list feat/w --format='%(refname:short)')"
+assert_eq "merge is in place" yes "$(is_merged feat/w main)"
+eval "$(kv UNDO)" >/dev/null 2>&1
+assert_eq "UNDO restores the base" "$MAIN_SHA" "$(g -C "$REPO" rev-parse main)"
+finish
+
+# Tracked changes in the main checkout would ride along into the base or block
+# the merge. Untracked files neither move nor merge, so they do not block.
+begin "merge-local: dirty main checkout refuses"
+new_feature
+park_main
+printf 'edit\n' >"$REPO/tracked.txt"
+merge_in "$WT" main feat/w -- true
+assert_eq "exit" 3 "$RC"
+assert_contains "BLOCKING names the file" "tracked.txt" "$(kv BLOCKING)"
+assert_contains "REFUSED" "uncommitted" "$(kv REFUSED)"
+assert_eq "base unchanged" "$MAIN_SHA" "$(g -C "$REPO" rev-parse main)"
+assert_eq "main checkout untouched" other "$(g -C "$REPO" symbolic-ref --short HEAD)"
+assert_eq "edit still there" edit "$(cat "$REPO/tracked.txt")"
+new_feature
+printf 'scratch\n' >"$REPO/untracked.txt"
+merge_in "$WT" main feat/w -- true
+assert_eq "untracked file: exit" 0 "$RC"
+finish
+
+begin "merge-local: conflict aborts cleanly"
+new_feature
+commit_file "$WT" tracked.txt feature "feature edit"
+commit_file "$REPO" tracked.txt mainline "mainline edit"
+MAIN_SHA="$(g -C "$REPO" rev-parse main)"
+park_main
+merge_in "$WT" main feat/w -- true
+assert_eq "exit" 1 "$RC"
+assert_contains "REFUSED" "feat/w" "$(kv REFUSED)"
+assert_eq "no MERGE_HEAD" no \
+  "$(g -C "$REPO" rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1 && echo yes || echo no)"
+assert_eq "base unchanged" "$MAIN_SHA" "$(g -C "$REPO" rev-parse main)"
+assert_eq "tracked files clean" "" "$(g -C "$REPO" status --porcelain -uno)"
+assert_eq "tests never ran, so no MERGED" no "$(has MERGED)"
+finish
+
+# ── Cases: merge-local and the approved local-only plan ───────────────────────
+
+# A PR-based repo can be merged locally only when the plan the user approved
+# says so for this repo. The plan is read by the script, not taken on trust.
+begin "merge-local: approved local-only plan overrides remote"
+new_feature remote
+write_plan "$SB/PLAN.md" "approved  # ok" "$REPO" local-only
+merge_in "$WT" main feat/w --plan "$SB/PLAN.md" -- true
+assert_eq "main checkout path, 'approved  # ok': exit" 0 "$RC"
+assert_eq "main checkout path: merged" yes "$(is_merged feat/w main)"
+new_feature remote
+write_plan "$SB/PLAN.md" '"in-progress"' "$WT" local-only
+merge_in "$WT" main feat/w --plan "$SB/PLAN.md" -- true
+assert_eq "worktree path, quoted in-progress: exit" 0 "$RC"
+assert_eq "worktree path: merged" yes "$(is_merged feat/w main)"
+new_feature remote
+cat >"$SB/PLAN.md" <<EOF
+---
+status: approved
+delivery:  # where it ships
+  - mode: local-only
+    remote: none
+---
+EOF
+merge_in "$WT" main feat/w --plan "$SB/PLAN.md" -- true
+assert_eq "item without repo, commented delivery: exit" 0 "$RC"
+assert_eq "item without repo: merged" yes "$(is_merged feat/w main)"
+new_feature remote
+cat >"$SB/PLAN.md" <<EOF
+---
+status: approved
+delivery:
+  - repo: $SB/elsewhere
+    mode: pr
+    prs: 1
+  - repo: $REPO
+    mode: local-only
+    prs: 0
+---
+EOF
+merge_in "$WT" main feat/w --plan "$SB/PLAN.md" -- true
+assert_eq "second item qualifies: exit" 0 "$RC"
+assert_eq "second item qualifies: merged" yes "$(is_merged feat/w main)"
+new_feature remote
+cat >"$SB/PLAN.md" <<EOF
+---
+status: approved
+delivery:
+  - repo: $REPO
+    mode: local-only
+    prs: 0
+  - repo: $SB/elsewhere
+    mode: pr
+    prs: 1
+---
+EOF
+merge_in "$WT" main feat/w --plan "$SB/PLAN.md" -- true
+assert_eq "first item qualifies: exit" 0 "$RC"
+assert_eq "first item qualifies: merged" yes "$(is_merged feat/w main)"
+finish
+
+# Each plan below is on disk and well-formed enough to read, and each must still
+# be refused: a flag that merely named a file would let any of them through.
+begin "merge-local: non-qualifying plans refuse"
+new_feature remote
+park_main
+mkdir -p "$SB/elsewhere"
+refuse_with() { # <label> — expect a refusal using the plan already at $SB/PLAN.md
+  merge_in "$WT" main feat/w --plan "$SB/PLAN.md" -- true
+  assert_eq "$1: exit" 4 "$RC"
+  assert_eq "$1: base unchanged" "$MAIN_SHA" "$(g -C "$REPO" rev-parse main)"
+}
+write_plan "$SB/PLAN.md" awaiting-approval "$REPO" local-only
+refuse_with "status awaiting-approval"
+write_plan "$SB/PLAN.md" "awaiting-approval  # approved" "$REPO" local-only
+refuse_with "status comment is not the status"
+write_plan "$SB/PLAN.md" complete "$REPO" local-only
+refuse_with "status complete"
+write_plan "$SB/PLAN.md" approved "$REPO" pr
+refuse_with "mode pr"
+write_plan "$SB/PLAN.md" approved "$SB/elsewhere" local-only
+refuse_with "another repo"
+# From the worktree, "." would canonicalize to the worktree itself.
+write_plan "$SB/PLAN.md" approved "." local-only
+refuse_with "relative repo"
+printf -- '---\nstatus: approved\n---\n# Legacy plan\n' >"$SB/PLAN.md"
+refuse_with "legacy plan without delivery"
+cat >"$SB/PLAN.md" <<EOF
+---
+status: approved
+delivery: [{repo: $REPO, mode: local-only}]
+---
+EOF
+refuse_with "flow-form delivery"
+cat >"$SB/PLAN.md" <<EOF
+---
+status: approved
+---
+# Plan
+
+delivery:
+  - repo: $REPO
+    mode: local-only
+tags: [t]
+EOF
+refuse_with "delivery outside the frontmatter"
+cat >"$SB/PLAN.md" <<EOF
+---
+status: approved
+delivery:
+  - repo: $REPO
+    mode: local-only
+tags: [t]
+EOF
+refuse_with "unterminated frontmatter"
+merge_in "$WT" main feat/w --plan "$SB/missing.md" -- true
+assert_eq "missing file: exit" 4 "$RC"
+assert_eq "missing file: base unchanged" "$MAIN_SHA" "$(g -C "$REPO" rev-parse main)"
+merge_in "$WT" main feat/w -- true
+assert_eq "no --plan: exit" 4 "$RC"
+finish
+
+# An approved plan lifts the PR-based refusal only; the base still has to be
+# brought up to date from its upstream first, or the merge lands on stale code.
+begin "merge-local: fast-forwards base from its upstream first"
+new_feature remote
+g clone -q "$SB/origin.git" "$SB/clone" || die "clone origin"
+commit_file "$SB/clone" upstream.txt upstream "add upstream"
+g -C "$SB/clone" push -q origin main || die "push upstream commit"
+UPSTREAM_SHA="$(g -C "$SB/clone" rev-parse HEAD)"
+write_plan "$SB/PLAN.md" approved "$REPO" local-only
+merge_in "$WT" main feat/w --plan "$SB/PLAN.md" -- true
+assert_eq "exit" 0 "$RC"
+assert_eq "upstream commit is in main" yes "$(is_merged "$UPSTREAM_SHA" main)"
+assert_eq "feat/w is in main" yes "$(is_merged feat/w main)"
+finish
+
+# ── Cases: merge-local preconditions ──────────────────────────────────────────
+
+begin "merge-local: usage errors exit 2"
+new_feature
+usage_case() { # <label> <args...> — expect exit 2, usage on stderr, nothing on stdout
+  local label="$1"
+  shift
+  merge_in "$WT" "$@"
+  assert_eq "$label: exit" 2 "$RC"
+  assert_eq "$label: stdout" "" "$OUT"
+  assert_contains "$label: stderr" "merge-local <base> <branch>" "$ERR"
+}
+usage_case "no branch" main
+usage_case "no --" main feat/w
+usage_case "no test command" main feat/w --
+usage_case "unknown flag" main feat/w --bogus -- true
+usage_case "--plan without a value" main feat/w --plan
+usage_case "option-like base" -x feat/w -- true
+usage_case "option-like branch" main -x -- true
+mkdir -p "$TMP/notrepo"
+merge_in "$TMP/notrepo" main feat/w -- true
+assert_eq "outside a repo: exit" 2 "$RC"
+assert_contains "outside a repo: stderr" "git work tree" "$ERR"
+finish
+
+# Without a main checkout (bare repo) there is no directory to merge in.
+begin "merge-local: no provable main checkout exits 2"
+new_repo
+g clone -q --bare "$REPO" "$SB/bare.git" || die "bare clone"
+g -C "$SB/bare.git" worktree add -q -b feat/b "$SB/wt-bare" || die "bare worktree"
+merge_in "$SB/wt-bare" main feat/b -- true
+assert_eq "exit" 2 "$RC"
+assert_contains "REFUSED" "main checkout" "$(kv REFUSED)"
+finish
+
+# A base that is not a local branch (a remote-tracking ref, a tag) would leave
+# the main checkout on a detached HEAD, and the merge would land on no branch.
+# Both names must be local branches, checked before anything moves.
+begin "merge-local: base and branch must be local branches"
+new_feature
+g -C "$REPO" update-ref refs/remotes/up/main main || die "update-ref"
+park_main
+merge_in "$WT" up/main feat/w -- true
+assert_eq "remote-tracking base: exit" 2 "$RC"
+assert_contains "remote-tracking base: REFUSED" "up/main" "$(kv REFUSED)"
+merge_in "$WT" nosuch feat/w -- true
+assert_eq "missing base: exit" 2 "$RC"
+merge_in "$WT" main nosuch -- true
+assert_eq "missing branch: exit" 2 "$RC"
+assert_contains "missing branch: REFUSED" "nosuch" "$(kv REFUSED)"
+assert_eq "main checkout untouched" other "$(g -C "$REPO" symbolic-ref --short HEAD)"
+assert_eq "base unchanged" "$MAIN_SHA" "$(g -C "$REPO" rev-parse main)"
 finish
 
 # ── Summary ───────────────────────────────────────────────────────────────────
