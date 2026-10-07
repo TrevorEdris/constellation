@@ -1043,6 +1043,67 @@ def test_answered_question_skips_default_check(tmp_path, replace):
     assert [i for i in report.issues if i.category == "card"] == []
 
 
+def _approved_replies(reply: dict[str, str] | None = None, status: str = "approved") -> dict[str, str]:
+    """The fixture as approve leaves it after the reply '1 after 90 days, 2 yes, 3 inline'.
+
+    The three bolds read `**you: <answer>**`, the answered [ask] lines read `[you: <answer>]`,
+    and the status has moved on. `reply` overrides single edits.
+    """
+    edits = {
+        "status: draft": f"status: {status}",
+        "\u2192 **after 30 days**": "\u2192 **you: after 90 days**",
+        "\u2192 **no**": "\u2192 **you: yes**",
+        "\u2192 **subagent-driven**": "\u2192 **you: inline**",
+        "- D1 [ask]": "- D1 [you: after 90 days]",
+        "- D2 [ask]": "- D2 [you: yes]",
+    }
+    return {**edits, **(reply or {})}
+
+
+# Approve (T8) adds `you: ` and the user's words to the Brief, which is then frozen. The word
+# budgets are a render-time limit, so a plan that is past approval keeps validating (R1).
+ANSWER_LONG = {"\u2192 **you: after 90 days**": "\u2192 **you: after seven days then review**"}  # 6-word answer
+ANSWER_LONG_Q2 = {"\u2192 **you: yes**": "\u2192 **you: yes for owners and admins only**"}  # question 2 is 21 words
+
+
+@pytest.mark.parametrize("status", ["approved", "in-progress", "complete"])
+@pytest.mark.parametrize("reply", [{}, ANSWER_LONG, ANSWER_LONG_Q2], ids=["short", "six-words", "question-over-20"])
+def test_approved_plan_with_answered_card_has_no_card_errors(tmp_path, status, reply):
+    report = _v3(tmp_path, **_approved_replies(reply, status))
+    assert [i for i in report.issues if i.category == "card"] == []
+    assert report.passed
+    assert report.score == 100
+
+
+def test_answered_card_is_over_budget_until_the_plan_is_approved(tmp_path):
+    # The same text before approval still breaks the budgets: the answers add 3 words, 118 -> 121 and 58 -> 61
+    for n, status in enumerate(("draft", "awaiting-approval")):
+        report = _v3(tmp_path / str(n), **_approved_replies(status=status))
+        assert {i.rule for i in report.errors} == {"card_over_120_words", "questions_after_word_60"}, status
+        assert "121" in next(i.message for i in report.errors if i.rule == "card_over_120_words")
+    long_answer = _v3(tmp_path / "long", **_approved_replies(ANSWER_LONG, "awaiting-approval"))
+    assert {i.rule for i in long_answer.errors} == {"card_over_120_words", "questions_after_word_60"}
+    long_question = _v3(tmp_path / "q2", **_approved_replies(ANSWER_LONG_Q2, "awaiting-approval"))
+    assert "question_over_20_words" in {i.rule for i in long_question.errors}
+
+
+def test_post_approval_status_lifts_only_the_word_budgets(tmp_path):
+    # An approved plan keeps every other card rule: a dropped label still blocks it
+    _fires_only(_v3(tmp_path, **_approved_replies({FLAGS + "\n": ""})), "missing_label")
+    _fires_only(_v3(tmp_path / "b", **_approved_replies({"**Flags:** none": "**Flags:** sudo"})), "unknown_flag")
+
+
+def test_post_approval_status_also_lifts_the_made_and_delivers_caps(tmp_path):
+    filler = "tests, styles, loading states, error states, empty states, too"
+    wordy_made = f"- D5 Viewer reuses the list component and its {filler} (if wrong: one file)"
+    wordy_delivers = "**Delivers:** A user can " + " ".join(f"w{i}" for i in range(26)) + "."
+    edits = {MADE_ITEMS: wordy_made + "\n", DELIVERS: wordy_delivers}
+    before = _v3(tmp_path / "draft", **edits)
+    assert {"made_over_20_words", "delivers_over_25_words"} <= {i.rule for i in before.errors}
+    after = _v3(tmp_path / "approved", **{"status: draft": "status: approved", **edits})
+    assert [i for i in after.issues if i.category == "card"] == []
+
+
 def test_card_budget_boundaries_are_inclusive(tmp_path):
     # Exactly 120 words in total, and the last question ending at exactly word 60, are fine ...
     total_120 = _v3(tmp_path / "a", **{"with anyone.": "with anyone now today."})

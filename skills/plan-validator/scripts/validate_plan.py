@@ -1199,6 +1199,10 @@ CARD_MAX_QUESTIONS = 3  # not counting Run
 CARD_MAX_MADE = 3
 CARD_ITEM_MAX_WORDS = 20  # each question and each Made-for-you item
 CARD_DELIVERS_MAX_WORDS = 25
+# The word budgets limit what the renderer shows for approval. Once the plan is approved the Brief is
+# frozen, and `approve` has added `you: <answer>` to it, which can push it over; so they stop applying.
+CARD_PAST_APPROVAL_STATUSES = ("approved", "in-progress", "complete")
+_WORD_BUDGET_RULES = frozenset({"question_over_20_words", "made_over_20_words"})
 
 _QUESTION_RE = re.compile(r"^(\d+)\. (.+\?) → \*\*(.+?)\*\* \((.+); if wrong: (.+)\)$")
 _RUN_RE = re.compile(r"^(\d+)\. Run → \*\*(.+?)\*\* \((.+); or (subagent-driven|inline)\)$")
@@ -1473,12 +1477,20 @@ def check_card(lines: list[str], report: ValidationReport) -> None:
 
     Every finding is an error with category "card" and a stable rule id. None
     touches the score: a v3 plan is blocked by the error severity alone.
+
+    The word budgets (the card total, the questions-by-word-60 limit and the per-item
+    caps) are render-time limits. They stop applying once the status is approved,
+    in-progress or complete, so a plan keeps validating however long the user's answers
+    made the frozen Brief (DESIGN 3.3, R1). Every other card rule still applies.
     """
 
     def error(rule: str, message: str, line: int = 0) -> None:
         report.issues.append(Issue(severity="error", category="card", message=message, line=line, rule=rule))
 
+    budgets = parse_frontmatter("\n".join(lines)).data.get("status") not in CARD_PAST_APPROVAL_STATUSES
     card, problems, entries, is_first = _scan_card(lines)
+    if not budgets:
+        problems = [problem for problem in problems if problem.rule not in _WORD_BUDGET_RULES]
     has_constraints, dlines, dline_problems = _scan_dlines(lines)
     if not has_constraints:
         error(
@@ -1550,7 +1562,7 @@ def check_card(lines: list[str], report: ValidationReport) -> None:
                 f"Delivers must say what a user can do ('A <user> can <action>.'), or start '{_DELIVERS_FOUNDATION} <X>'.",
                 delivers.line,
             )
-        if _words(delivers.text) > CARD_DELIVERS_MAX_WORDS:
+        if budgets and _words(delivers.text) > CARD_DELIVERS_MAX_WORDS:
             error(
                 "delivers_over_25_words",
                 f"Delivers is {_words(delivers.text)} words; the limit is {CARD_DELIVERS_MAX_WORDS}.",
@@ -1589,7 +1601,7 @@ def check_card(lines: list[str], report: ValidationReport) -> None:
     # Budgets: ask line + Brief + the check time the renderer adds
     ask_words = _words(ask_line(title or ""))
     total = ask_words + sum(_words(text) for _, text in entries) + CHECK_TIME_WORDS
-    if total > CARD_MAX_WORDS:
+    if budgets and total > CARD_MAX_WORDS:
         error(
             "card_over_120_words",
             f"Card is {total} words; the budget is {CARD_MAX_WORDS} "
@@ -1601,7 +1613,7 @@ def check_card(lines: list[str], report: ValidationReport) -> None:
         position += _words(text)
         if _NUMBERED_RE.match(text):
             last_question_end, last_question_line = position, line_no
-    if last_question_end > CARD_QUESTIONS_END_BY_WORD:
+    if budgets and last_question_end > CARD_QUESTIONS_END_BY_WORD:
         error(
             "questions_after_word_60",
             f"The questions end at word {last_question_end}; they must end by word {CARD_QUESTIONS_END_BY_WORD}. "
