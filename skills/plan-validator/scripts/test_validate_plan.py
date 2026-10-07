@@ -285,6 +285,88 @@ def test_frontmatter_unparseable_line_is_a_problem():
     assert [(p.code, p.line) for p in problems] == [("syntax", 3)]
 
 
+def test_frontmatter_blank_block_list_values_are_none_never_a_sentinel():
+    # A blank value after the dash key, a blank continuation key and a bare `-` all read
+    # as None. The parser's private "no text" marker is truthy, so if it leaked into data
+    # a consumer that tests `if value` would treat an empty `remote:` as set.
+    text = (
+        "---\n"
+        "delivery:\n"
+        "  - repo:\n"
+        "    mode:\n"
+        "  -\n"
+        "slug: s\n"
+        "---\n"
+    )
+    data, _, problems = vp.parse_frontmatter(text)
+    assert problems == []
+    assert data["delivery"] == [{"repo": None, "mode": None}, None]
+    assert data["slug"] == "s"
+
+
+def test_frontmatter_comment_only_value_still_opens_block_list():
+    text = (
+        "---\n"
+        "delivery: # one entry per repo\n"
+        "  - repo: /work/a\n"
+        "    mode: pr\n"
+        "---\n"
+    )
+    data, _, problems = vp.parse_frontmatter(text)
+    assert data["delivery"] == [{"repo": "/work/a", "mode": "pr"}]
+    assert [(p.code, p.line) for p in problems] == [("inline-comment", 2)]
+
+
+@pytest.mark.parametrize("dash", [" - repo: /work/b", "    - repo: /work/b"])
+def test_frontmatter_block_list_dash_at_other_indent_is_one_syntax_problem(dash):
+    text = "---\ndelivery:\n  - repo: /work/a\n" + dash + "\nslug: s\n---\n"
+    data, _, problems = vp.parse_frontmatter(text)
+    assert [(p.code, p.line) for p in problems] == [("syntax", 4)]
+    assert data["delivery"] == [{"repo": "/work/a"}]
+    assert data["slug"] == "s"
+
+
+def test_frontmatter_comment_lines_inside_block_list_are_skipped():
+    # An indented note, a column-zero note and a blank line between items are not
+    # content, and the column-zero note must not end the list early.
+    text = (
+        "---\n"
+        "delivery:\n"
+        "  - repo: /work/a\n"
+        "    # indented note\n"
+        "    mode: pr\n"
+        "# note at column zero\n"
+        "\n"
+        "  - repo: /work/b\n"
+        "slug: s\n"
+        "---\n"
+    )
+    data, _, problems = vp.parse_frontmatter(text)
+    assert problems == []
+    assert data["delivery"] == [{"repo": "/work/a", "mode": "pr"}, {"repo": "/work/b"}]
+    assert data["slug"] == "s"
+
+
+def test_frontmatter_block_list_item_keys_align_with_the_first_key():
+    # The first key's column is wherever it sits after the dash, not a fixed offset.
+    wide = "---\ndelivery:\n  -   repo: /work/a\n      mode: pr\n---\n"
+    data, _, problems = vp.parse_frontmatter(wide)
+    assert problems == []
+    assert data["delivery"] == [{"repo": "/work/a", "mode": "pr"}]
+    # Deeper or shallower than the first key is not a sibling key.
+    for key_line in ("      mode: pr", "   mode: pr"):
+        text = "---\ndelivery:\n  - repo: /work/a\n" + key_line + "\n---\n"
+        data, _, problems = vp.parse_frontmatter(text)
+        assert [(p.code, p.line) for p in problems] == [("syntax", 4)], key_line
+        assert data["delivery"] == [{"repo": "/work/a"}], key_line
+    # A key under a scalar item has no item to join, even when it lines up with the
+    # previous dict item's keys (the parser must report it, not crash on a missing item).
+    text = "---\ndelivery:\n  - repo: /work/a\n  - plain\n    mode: pr\n---\n"
+    data, _, problems = vp.parse_frontmatter(text)
+    assert [(p.code, p.line) for p in problems] == [("syntax", 5)]
+    assert data["delivery"] == [{"repo": "/work/a"}, "plain"]
+
+
 def test_v3_inline_comment_is_error(tmp_path):
     commented = _validate(tmp_path, V3_FM.format(status="draft # x") + PLAN_BODY)
     clean = _validate(tmp_path, V3_FM.format(status="draft") + PLAN_BODY)
