@@ -292,6 +292,46 @@ test('new-session.sh honors SESSION_DATE and CLAUDE_CODE_SESSION_ID', () => {
   assert.ok(!fs.existsSync(path.join(bare.SESSION_ROOT, '.sessions')), 'a date-slug id must not get a pointer');
 });
 
+test('the pointer holds the realpath when SESSION_ROOT is a symlink', () => {
+  // hookEnv roots live under the realpath of the temp dir, so a realpath and a
+  // plain path coincide there. Only a root reached through a link tells them apart.
+  const base = makeTmp();
+  const realRoot = path.join(base, 'real-sessions');
+  const linkRoot = path.join(base, 'link-sessions');
+  fs.mkdirSync(realRoot);
+  fs.symlinkSync(realRoot, linkRoot);
+  assert.notEqual(fs.realpathSync(linkRoot), linkRoot, 'the fixture root is not a symlink');
+  const env = hookEnv({ SESSION_ROOT: linkRoot });
+
+  // The pointer must name the dir under the real root, never under the link.
+  const expectResolved = (id, name) => {
+    const viaLink = path.join(linkRoot, name);
+    const real = path.join(fs.realpathSync(realRoot), name);
+    assert.ok(fs.statSync(real).isDirectory(), `${real} is not a dir`);
+    assert.equal(pointerOf(linkRoot, id), real + '\n', `pointer for ${id}`);
+    assert.notEqual(pointerOf(linkRoot, id), viaLink + '\n', `pointer for ${id} holds the link path`);
+    return real;
+  };
+
+  // The Stop hook scaffolds through new-session.sh, which writes the pointer.
+  assert.deepEqual(stop(env, 'link-sess-1', writeTranscript({ title: 'PROJ-42 Fix login bug' })).json, {});
+  expectResolved('link-sess-1', visible(linkRoot)[0]);
+
+  // The script on its own, including the dir it prints as its last line.
+  const res = runScript(['Other-slug', '', 'link-sess-2'], env);
+  assert.equal(res.status, 0, res.stderr);
+  const name = visible(linkRoot).find(n => n.endsWith('_Other-slug'));
+  assert.ok(name, `no Other-slug dir in ${visible(linkRoot)}`);
+  assert.equal(res.lastLine, expectResolved('link-sess-2', name));
+
+  // The Stop hook rebinding a session that only a scan can find goes through the lib.
+  const old = path.join(linkRoot, '2026-10-01_Old');
+  fs.mkdirSync(old);
+  fs.writeFileSync(path.join(old, 'SESSION.md'), '---\nschema: v1\nsession_id: link-sess-3\n---\n\n# Old\n');
+  assert.deepEqual(stop(env, 'link-sess-3', writeTranscript({ title: 'PROJ-42 Fix login bug' })).json, {});
+  expectResolved('link-sess-3', '2026-10-01_Old');
+});
+
 test('new-session.sh gives up after -99 and writes nothing more', () => {
   const env = hookEnv({ SESSION_DATE: '2031-02-03' });
   const root = env.SESSION_ROOT;
