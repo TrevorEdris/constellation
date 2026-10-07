@@ -10,9 +10,12 @@ Every violation prints as <relpath>:<line>: <rule>: <message>. Lints (constellat
     conditions only, no workflow summary), and its name matches its directory
   - section-sign: no section-sign character in skill bodies or docs/*.md (one violation per line)
   - catalog-stale: CATALOG.md is missing or differs from what this script would generate
+  - unknown-skill-ref: every constellation:<x> reference in the plugin's skills, agents, hooks,
+    docs, scripts and config names a top-level skills/<x>/SKILL.md or an agents/<x>.md
 Adding a skill = drop skills/<name>/SKILL.md; the catalog auto-registers it. No manifest edit.
 """
 import argparse
+import fnmatch
 import re
 import sys
 from pathlib import Path
@@ -21,6 +24,23 @@ DEFAULT_ROOT = Path(__file__).resolve().parent.parent
 # Built from its code point so this source never holds the character it forbids.
 SECTION_SIGN = chr(0xA7)
 REGEN_HINT = "run python3 scripts/gen-catalog.py"
+
+# Scan scopes, each a list of (glob relative to the root, file suffixes to keep).
+# "ref" feeds the skill-ref lint; "markdown" is the prose the path and script lints read.
+REF_SUFFIXES = {".md", ".js", ".cjs", ".py", ".sh", ".json"}
+REF_DIRS = ("skills", "agents", "hooks", "docs", "scripts", ".codex", ".claude-plugin")
+SCAN_SCOPES = {
+    "ref": [(f"{d}/**/*", REF_SUFFIXES) for d in REF_DIRS] + [("*", {".md"})],
+    "markdown": [("skills/**/*", {".md"}), ("agents/*", {".md"})],
+}
+# Test data and history are not plugin content. Parts are matched on the path relative to
+# the scan root, never the absolute path, so a root under <repo>/.worktrees/ is still scanned.
+EXCLUDED_PARTS = {"fixtures", "node_modules", "__pycache__", ".git", ".worktrees"}
+EXCLUDED_NAMES = ("CHANGELOG.md", "test_*.py", "*.test.js", "test-*.sh")
+
+# Only a bare constellation:<name> counts. A preceding word character, slash, dot or hyphen
+# means the text is part of a path, URL or longer identifier, not a skill reference.
+SKILL_REF = re.compile(r"(?<![\w/.-])constellation:([A-Za-z0-9][A-Za-z0-9_-]*)")
 
 
 def parse_frontmatter(text):
@@ -92,6 +112,53 @@ def lint_catalog(root, skills):
     return []
 
 
+def is_excluded(rel):
+    return bool(EXCLUDED_PARTS.intersection(rel.parts)) or any(
+        fnmatch.fnmatchcase(rel.name, glob) for glob in EXCLUDED_NAMES
+    )
+
+
+def iter_files(root, scope):
+    """Return the files in SCAN_SCOPES[scope] under root, sorted, minus excluded ones."""
+    found = []
+    for pattern, suffixes in SCAN_SCOPES[scope]:
+        for p in root.glob(pattern):
+            if p.suffix in suffixes and p.is_file() and not is_excluded(p.relative_to(root)):
+                found.append(p)
+    return sorted(found)
+
+
+def skill_ref_targets(root):
+    """Names a constellation:<name> reference may use: top-level skills and agents.
+
+    A SKILL.md nested under a skill's references/ is a guide, not a registered skill,
+    so only direct children of skills/ count.
+    """
+    names = set()
+    if (root / "skills").is_dir():
+        names |= {d.name for d in (root / "skills").iterdir() if (d / "SKILL.md").is_file()}
+    if (root / "agents").is_dir():
+        names |= {p.stem for p in (root / "agents").glob("*.md") if p.is_file()}
+    return names
+
+
+def lint_skill_refs(root):
+    """One violation per constellation:<x> reference that is not a skill or an agent."""
+    valid = skill_ref_targets(root)
+    out = []
+    for p in iter_files(root, "ref"):
+        rel = p.relative_to(root).as_posix()
+        text = p.read_text(encoding="utf-8", errors="ignore")
+        for n, line in enumerate(text.split("\n"), 1):
+            for m in SKILL_REF.finditer(line):
+                x = m.group(1)
+                if x not in valid:
+                    out.append((rel, n, "unknown-skill-ref",
+                                f"constellation:{x} is not a skill (skills/{x}/SKILL.md)"
+                                f" or agent (agents/{x}.md)"))
+    return out
+
+
 def render(skills):
     lines = [
         "# Constellation Catalog",
@@ -127,7 +194,10 @@ def main(argv=None):
         (root / "CATALOG.md").write_bytes(render(skills).encode("utf-8"))
         print(f"Wrote CATALOG.md ({len(skills)} skills)")
     violations = sorted(
-        lint_frontmatter(skills) + lint_section_sign(root, skills) + lint_catalog(root, skills)
+        lint_frontmatter(skills)
+        + lint_section_sign(root, skills)
+        + lint_catalog(root, skills)
+        + lint_skill_refs(root)
     )
 
     if not args.check:

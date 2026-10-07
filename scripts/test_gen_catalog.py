@@ -53,6 +53,14 @@ def check_lines(proc):
     return proc.stdout.splitlines()
 
 
+def write(root, rel, text):
+    """Write root/rel (creating parent dirs) and return its path."""
+    path = root / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
 def assert_stale(proc):
     lines = check_lines(proc)
     assert proc.returncode == 1, proc.stdout + proc.stderr
@@ -154,4 +162,118 @@ def test_failures_sorted_and_counted(tmp_path):
     assert len(lines) == 3, lines
     assert lines[0].startswith("docs/a.md:1: section-sign:"), lines
     assert lines[1].startswith("skills/alpha/SKILL.md:1: frontmatter:"), lines
+    assert lines[-1] == "LINT FAILED (2)"
+
+
+def test_unknown_skill_ref_reports_file_and_line(tmp_path):
+    root = make_tree(tmp_path)
+    write(root, "docs/x.md", "# Notes\n\nSee constellation:not-a-skill for details.\n")
+
+    proc = run(root, "--check")
+    lines = check_lines(proc)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert lines[0].startswith("docs/x.md:3: unknown-skill-ref: constellation:not-a-skill"), lines
+    assert lines[-1] == "LINT FAILED (1)"
+
+
+def test_unknown_ref_in_hook_js(tmp_path):
+    root = make_tree(tmp_path)
+    write(root, "hooks/h.js", "// hook\nconsole.log('run constellation:ghost-skill first');\n")
+
+    proc = run(root, "--check")
+    lines = check_lines(proc)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert lines[0].startswith("hooks/h.js:2: unknown-skill-ref: constellation:ghost-skill"), lines
+    assert lines[-1] == "LINT FAILED (1)"
+
+
+def test_skill_and_agent_refs_pass(tmp_path):
+    root = make_tree(tmp_path)
+    write(root, "docs/x.md", "Use constellation:alpha, then hand off to constellation:beta.\n")
+
+    proc = run(root, "--check")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert check_lines(proc) == ["LINT OK (1 skills)"]
+
+
+def test_nested_reference_skill_is_not_a_target(tmp_path):
+    root = make_tree(tmp_path)
+    write(root, "skills/alpha/references/sub/SKILL.md", "# sub\n")
+    write(root, "docs/x.md", "Load constellation:sub now.\n")
+
+    proc = run(root, "--check")
+    lines = check_lines(proc)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert lines[0].startswith("docs/x.md:1: unknown-skill-ref: constellation:sub"), lines
+    assert lines[-1] == "LINT FAILED (1)"
+
+
+def test_excluded_files_not_scanned(tmp_path):
+    root = make_tree(tmp_path)
+    bad = "constellation:not-a-skill\n"
+    for rel in (
+        "skills/alpha/scripts/fixtures/f.md",
+        "CHANGELOG.md",
+        "scripts/test_x.py",
+        "hooks/h.test.js",
+        "skills/alpha/scripts/test-x.sh",
+        "hooks/node_modules/pkg/x.js",
+        "scripts/__pycache__/x.py",
+        "docs/.worktrees/x.md",
+        "docs/.git/x.md",
+    ):
+        write(root, rel, bad)
+
+    proc = run(root, "--check")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert check_lines(proc) == ["LINT OK (1 skills)"]
+
+
+def test_root_inside_dot_worktrees_dir_is_still_scanned(tmp_path):
+    root = make_tree(tmp_path / ".worktrees" / "w")
+    write(root, "docs/x.md", "# Notes\nSee constellation:not-a-skill.\n")
+
+    proc = run(root, "--check")
+    lines = check_lines(proc)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert lines[0].startswith("docs/x.md:2: unknown-skill-ref:"), lines
+    assert lines[-1] == "LINT FAILED (1)"
+
+
+def test_ref_scope_covers_listed_dirs_and_suffixes(tmp_path):
+    root = make_tree(tmp_path)
+    in_scope = (
+        "skills/alpha/references/g.md",
+        "agents/beta.md",
+        "hooks/lib/l.cjs",
+        "docs/d.md",
+        "scripts/s.py",
+        "scripts/s.sh",
+        ".codex/INSTALL.md",
+        ".claude-plugin/plugin.json",
+        "README.md",
+    )
+    out_of_scope = ("other/o.md", "docs/d.txt", "package.json", "hooks/h.txt")
+    for rel in in_scope + out_of_scope:
+        write(root, rel, "constellation:not-a-skill\n")
+
+    proc = run(root, "--check")
+    flagged = sorted(ln.split(":", 1)[0] for ln in check_lines(proc) if "unknown-skill-ref" in ln)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert flagged == sorted(in_scope), flagged
+
+
+def test_ref_pattern_boundaries_and_one_violation_per_ref(tmp_path):
+    root = make_tree(tmp_path)
+    write(root, "docs/x.md", (
+        "a/constellation:foo b.constellation:bar c-constellation:baz d_constellation:qux\n"
+        "constellation:one and constellation:two, then constellation:alpha\n"
+    ))
+
+    proc = run(root, "--check")
+    lines = check_lines(proc)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert [ln.split(": ", 2)[0] for ln in lines[:-1]] == ["docs/x.md:2", "docs/x.md:2"], lines
+    assert lines[0].startswith("docs/x.md:2: unknown-skill-ref: constellation:one"), lines
+    assert lines[1].startswith("docs/x.md:2: unknown-skill-ref: constellation:two"), lines
     assert lines[-1] == "LINT FAILED (2)"
