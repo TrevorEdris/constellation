@@ -134,6 +134,42 @@ test('docs/PLAN.md without schema silent', () => {
   assert.deepEqual(checkForPlan(writeEvent(noSchema)), { remind: false, message: '' });
 });
 
+test("only the leading frontmatter block's top-level keys are read", () => {
+  const silent = { remind: false, message: '' };
+
+  // (a) A plan that documents plan frontmatter: the body quotes column-0 keys in a
+  // fenced example. A whole-file scan would let them override the real ones.
+  const documents = sessionPlan('documents-frontmatter', [
+    '---', 'schema: plan/v3', 'status: draft', '---', '',
+    '# PLAN: Documents frontmatter', '',
+    'A plan opens with a block like this:', '',
+    '```yaml', '---', 'schema: plan/v2', 'status: approved', '---', '```', '',
+  ].join('\n'));
+  assert.equal(checkForPlan(writeEvent(documents)).message, cardMessage(documents), '(a) body example overrode the frontmatter');
+
+  // (b) No leading fence, so no frontmatter at all. A later rule must not turn the
+  // lines above it into one.
+  const noFence = writeFile('docs/leading-fence/PLAN.md', [
+    '# PLAN: Roadmap', 'schema: plan/v3', 'status: draft', '', '---', '', 'Prose, not frontmatter.', '',
+  ].join('\n'));
+  assert.deepEqual(checkForPlan(writeEvent(noFence)), silent, '(b) body lines read without a leading fence');
+
+  // (c) A delivery item's indented keys are not the plan's own schema and status.
+  const nested = sessionPlan('nested-keys', [
+    '---', 'schema: plan/v3', 'date: 2026-10-07', 'slug: nested-keys', 'status: draft',
+    'delivery:', '  - repo: /tmp/fixture-repo', '    mode: pr', '    status: approved', '    schema: plan/v2',
+    'tags: [fixture]', '---', '', '# PLAN: Nested keys', '',
+  ].join('\n'));
+  assert.equal(checkForPlan(writeEvent(nested)).message, cardMessage(nested), '(c) indented key overrode the top-level one');
+
+  // (d) The closing fence is exactly `---`. Frontmatter that is never closed, with a
+  // longer rule further down, is not frontmatter.
+  const unclosed = writeFile('docs/closing-fence/PLAN.md', [
+    '---', 'schema: plan/v3', 'status: draft', '', '# PLAN: Never closed', '', '----', '', 'Prose.', '',
+  ].join('\n'));
+  assert.deepEqual(checkForPlan(writeEvent(unclosed)), silent, '(d) a ---- rule closed the frontmatter');
+});
+
 test('Edit event reminds', () => {
   // An Edit carries no file content, so the hook has to read the schema off disk.
   const file = sessionPlan('edit', planText('schema: plan/v3', 'status: awaiting-approval'));
