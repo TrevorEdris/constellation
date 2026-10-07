@@ -9,7 +9,7 @@
     {
       "name": "constellation",
       "description": "Curated skills that work together for a complete dev workflow",
-      "version": "0.1.0",
+      "version": "0.2.0",
       "source": "./",
       "author": {
         "name": "Trevor Edris",
