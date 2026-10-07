@@ -124,6 +124,11 @@ expect_types_listed() {
   fi
 }
 
+# <n> lowercase 'a' characters, for building descriptions of an exact length.
+repeat_a() {
+  printf '%*s' "$1" '' | tr ' ' a
+}
+
 expect_usage_error() {
   local out status
   out="$(bash "$TARGET" 2>&1)"
@@ -160,6 +165,11 @@ expect_valid "feature/PROJ-42-add-oauth"
 expect_valid "feature/PROJ-42-add-oauth-login"
 expect_valid "fix/ENG-456-null-pointer"
 
+# The ticket does not count toward the 50-char description limit. With a 48-char
+# description the part after the type is 56 chars (ticket plus description), so
+# measuring that instead of the description fails this case.
+expect_valid "feature/PROJ-42-$(repeat_a 48)"
+
 # ── Cases: names that must still be rejected ──────────────────────────────────
 # Widening the character class must not swallow these.
 
@@ -177,6 +187,8 @@ expect_invalid "Feat/add-login"             "must be lowercase"
 # hyphen. 'PROJ--' only passed while the pattern read [0-9]* instead of [0-9]+.
 expect_invalid "feature/add-PROJ-42-login"  "uppercase"
 expect_invalid "feature/PROJ--add-login"    "uppercase"
+# A description over 50 chars is still rejected when a ticket precedes it.
+expect_invalid "feature/PROJ-42-$(repeat_a 51)" "Description segment"
 
 # ── Cases: rejection output must be actionable ────────────────────────────────
 
