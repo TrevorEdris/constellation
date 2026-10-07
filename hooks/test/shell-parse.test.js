@@ -308,6 +308,33 @@ test('env -S runs its string through the shell', () => {
     assert.equal(cat.via, 'shell-c', cmd);
     assert.deepEqual(cat.words, ['cat', 'x'], cmd);
   }
+  // env appends the words after STR to the split string (`env -S 'echo a' b` prints `a b`), so the
+  // command that really runs keeps those words as its arguments. Each is one literal word, never
+  // re-split or re-expanded: the quoted `a b` stays a single argument.
+  for (const [cmd, name, args] of [
+    ['env -S cat ~/.ssh/id_rsa', 'cat', ['~/.ssh/id_rsa']],
+    ["env -S '' rm -rf ~", 'rm', ['-rf', '~']],
+    ["env -S 'FOO=1' cat .env", 'cat', ['.env']],
+    ["env -S 'echo a' b", 'echo', ['a', 'b']],
+    ["env -S cat 'a b'", 'cat', ['a b']],
+    ["env -S 'cat x' y z", 'cat', ['x', 'y', 'z']],
+    ['env -i -S cat .env', 'cat', ['.env']],
+    ["env -u FOO -S'cat x' y", 'cat', ['x', 'y']],
+    // Words after STR belong to the child, even ones that look like env's own options: real env
+    // runs `cat -u f` here, so `f` must stay visible (`-u` and `-C` take a value for env itself).
+    ['env -S cat -u .env', 'cat', ['-u', '.env']],
+    ['env -S sed -C ~/.aws/credentials', 'sed', ['-C', '~/.aws/credentials']],
+    ['env -S cat -- .env', 'cat', ['--', '.env']],
+    ["sudo env -S cat '$HOME/.aws/credentials'", 'cat', ['$HOME/.aws/credentials']],
+    ["env --split-string=cat 'it'\\''s'", 'cat', ["it's"]],
+  ]) {
+    const child = only(cmd, name);
+    assert.equal(child.via, 'shell-c', cmd);
+    assert.deepEqual(commandOf(child.words).args, args, cmd);
+  }
+  // The leftover words cannot start a second command or a redirect: they are quoted, so `;` and `>` stay literal.
+  assert.deepEqual(shape("env -S cat ';' '>' x").slice(1), ['1:shell-c:0:1:cat ; > x']);
+  assert.deepEqual(segs("env -S cat '>' x")[1].redirects, []);
   // Without -S, env just runs its command; no body to parse.
   assert.equal(segs('env -u FOO cat x').filter((s) => s.via === 'shell-c').length, 0);
   assert.equal(segs('env -i').length, 1);

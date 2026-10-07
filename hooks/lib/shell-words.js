@@ -665,8 +665,12 @@ function hiddenCommands(words) {
   // eval joins its arguments with spaces and runs the result, so `eval cat x` and `eval "cat x"` agree.
   if (cmd === 'eval') return args.length ? [{ via: 'shell-c', src: args.join(' ') }] : [];
   if (cmd === 'env') {
-    const split = readOptions(args, 0, PREFIXES.get('env')).values.S;
-    return split === undefined ? [] : [{ via: 'shell-c', src: split }];
+    // env splices the words after STR into the split string (`env -S 'echo a' b` runs `echo a b`), so
+    // the child text is STR plus every word after it, each quoted to stay one literal word. The
+    // words start right after STR, not after env's options: `env -S cat -u f` hands `-u f` to cat.
+    const o = readOptions(args, 0, PREFIXES.get('env'));
+    if (o.values.S === undefined) return [];
+    return [{ via: 'shell-c', src: [o.values.S].concat(args.slice(o.ends.S).map(singleQuote)).join(' ') }];
   }
   if (cmd === 'xargs') {
     const rest = args.slice(readOptions(args, 0, XARGS).next);
@@ -760,14 +764,18 @@ const XARGS = opts('ILnPdEsa', { 'arg-file': 'a', delimiter: 'd', 'max-args': 'n
 
 const basename = (w) => w.slice(w.lastIndexOf('/') + 1);
 
+// One word as shell text that scans back to exactly that word (a `'` becomes `'\''`).
+const singleQuote = (w) => "'" + w.replace(/'/g, "'\\''") + "'";
+
 /**
  * Read the options that start at words[i]. Returns the index of the first word that is not an
  * option (after an optional `--`) and the values taken, keyed by the option's letter. Short
  * options may be clustered (`-Eu root`); a valued one takes the rest of its cluster (`-uroot`) or
- * else the next word.
+ * else the next word. `ends` holds, per valued option, the index just past its (last) value.
  */
 function readOptions(words, i, spec) {
   const values = {};
+  const ends = {};
   while (i < words.length) {
     const w = words[i];
     if (w === '--') { i++; break; }
@@ -779,6 +787,7 @@ function readOptions(words, i, spec) {
       if (Object.hasOwn(spec.long, name)) {
         if (eq !== -1) values[spec.long[name]] = w.slice(eq + 1);
         else if (i < words.length) values[spec.long[name]] = words[i++];
+        if (values[spec.long[name]] !== undefined) ends[spec.long[name]] = i;
       }
       continue;
     }
@@ -786,10 +795,11 @@ function readOptions(words, i, spec) {
       if (!spec.short.includes(w[k])) continue;
       if (k + 1 < w.length) values[w[k]] = w.slice(k + 1);
       else if (i < words.length) values[w[k]] = words[i++];
+      if (values[w[k]] !== undefined) ends[w[k]] = i;
       break;
     }
   }
-  return { next: i, values };
+  return { next: i, values, ends };
 }
 
 /**
@@ -798,7 +808,7 @@ function readOptions(words, i, spec) {
  * prefix commands in PREFIXES with their options. `cmd` is the basename. When nothing is left
  * after a prefix, the prefix is the command (bare `env`, `sudo`, `time`), with the words after it
  * as `args`; with no words at all (or only assignments) `cmd` is ''. `env -S STRING` is also left
- * as `env`: its string is a command line that parse() reads.
+ * as `env`: its string, followed by the words after it, is a command line that parse() reads.
  */
 function commandOf(words) {
   const w = Array.isArray(words) ? words : [];
