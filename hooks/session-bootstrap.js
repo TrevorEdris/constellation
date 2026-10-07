@@ -10,7 +10,7 @@
 const { execFileSync } = require('child_process');
 const path = require('path');
 const {
-  DEFAULT_SESSION_ROOT, resolveSessionDir, sessionIdFromStdin,
+  sessionRoot, resolveSessionDir, sessionIdFromStdin,
   latestCustomTitle, firstRealPromptText, detectTicket, slugifyTitle,
 } = require('./lib/session');
 
@@ -24,7 +24,7 @@ async function main() {
   const sessionId = payload.session_id;
   const transcriptPath = payload.transcript_path;
 
-  if (!transcriptPath || resolveSessionDir(DEFAULT_SESSION_ROOT, { sessionId })) {
+  if (!transcriptPath || resolveSessionDir(sessionRoot(), { sessionId })) {
     console.log('{}');
     return;
   }
