@@ -637,6 +637,52 @@ def test_placeholder_in_code_ignored():
     assert [i.line for i in report.issues] == [_line_of(text, "Real <PLAN>")]
 
 
+def test_placeholder_in_wrapped_code_span_ignored():
+    # An inline code span can run across a line break; nothing inside it is a placeholder.
+    text = (
+        "Use `Promise<Foo>\n"
+        "returns <bar> and TBD` here.\n"
+        "\n"
+        "- Call ``List<Item>\n"
+        "  with {{x}}`` first.\n"
+        "\n"
+        "| Col | Notes |\n"
+        "|---|---|\n"
+        "| a | `<id>` |\n"
+    )
+    assert _run_check(vp.check_placeholders, text).issues == []
+
+
+def test_placeholder_after_wrapped_code_span_still_flagged():
+    text = (
+        "Use `Promise<Foo>\n"  # 1: opens a span
+        "returns` and <real> slot\n"  # 2: span closes, then a real placeholder
+        "TBD on this line\n"  # 3: same paragraph, outside the span
+        "\n"
+        "Next paragraph has `Promise<Bar>\n"  # 5: unclosed in its paragraph, so no span at all
+        "\n"
+        "closing` after a blank line\n"  # 7
+    )
+    report = _run_check(vp.check_placeholders, text)
+    assert [(i.line, i.message) for i in report.issues] == [
+        (2, "Unfilled placeholder (<real>). Fill it in or delete it."),
+        (3, "Unfilled placeholder (TBD). Fill it in or delete it."),
+        (5, "Unfilled placeholder (<Bar>). Fill it in or delete it."),
+    ]
+
+
+def test_wrapped_code_span_does_not_cross_a_fence():
+    text = (
+        "Open `span <c>\n"  # 1: flagged, its span is never closed in this paragraph
+        "```\n"
+        "close` here\n"
+        "```\n"
+        "Plain <b> text\n"  # 5
+    )
+    report = _run_check(vp.check_placeholders, text)
+    assert [i.line for i in report.issues] == [1, 5]
+
+
 def test_html_autolink_email_not_placeholder():
     text = (
         "See <https://example.com/a?b=1> and <mailto:ops@example.com> and <ops@example.com>.\n"

@@ -939,7 +939,8 @@ PLACEHOLDER_REPORT_CAP = 10
 _FENCE_OPEN_RE = re.compile(r"^\s*(`{3,}|~{3,})(.*)$")
 _HEADING_RE = re.compile(r"^ {0,3}(#{1,6})\s+(\S.*)$")
 # Inline code, so a command such as `card.py render <PLAN>` is not a placeholder.
-_CODE_SPAN_RE = re.compile(r"(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)")
+# re.S lets a span run across a line break; _mask_code_spans feeds it whole paragraphs.
+_CODE_SPAN_RE = re.compile(r"(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)", re.S)
 
 _FIELD_PLACEHOLDER_RE = re.compile(r"\{\{[^}]*\}\}")
 _ANGLE_PLACEHOLDER_RE = re.compile(r"<(?![/!])(?!(?:details|summary|br|sub|sup|kbd|img|a)\b)[A-Za-z][^<>\n]*>")
@@ -1016,9 +1017,35 @@ def _is_separator_row(cells: list[str]) -> bool:
     return all(_SEPARATOR_CELL_RE.fullmatch(cell) for cell in cells)
 
 
-def _placeholder_reasons(line: str) -> list[str]:
-    """What is unfilled on this line (empty list when nothing is)."""
-    text = _CODE_SPAN_RE.sub(" ", line)
+def _mask_code_spans(lines: list[str], fenced: list[bool], fill: str) -> list[str]:
+    """Each line with every inline code span overwritten by `fill`, newlines kept.
+
+    A span can wrap across a line break (`Promise<Foo>` split after "Promise"),
+    so spans are matched per paragraph: a run of non-blank lines outside fenced
+    blocks. A backtick never pairs with one in another paragraph or past a fence.
+    The line count and each line's other characters are unchanged.
+    """
+    masked = list(lines)
+    idx = 0
+    while idx < len(lines):
+        if fenced[idx] or not lines[idx].strip():
+            idx += 1
+            continue
+        end = idx
+        while end < len(lines) and not fenced[end] and lines[end].strip():
+            end += 1
+        paragraph = _CODE_SPAN_RE.sub(lambda m: "".join("\n" if c == "\n" else fill for c in m.group()), "\n".join(lines[idx:end]))
+        masked[idx:end] = paragraph.split("\n")
+        idx = end
+    return masked
+
+
+def _placeholder_reasons(text: str, cell_text: str) -> list[str]:
+    """What is unfilled on this line (empty list when nothing is).
+
+    `text` is the line with its code spans blanked with spaces; `cell_text` has
+    them filled with a letter instead, because code in a table cell still fills it.
+    """
     reasons = _FIELD_PLACEHOLDER_RE.findall(text)
     reasons += [
         found
@@ -1027,8 +1054,7 @@ def _placeholder_reasons(line: str) -> list[str]:
     ]
     reasons += _MARKER_RE.findall(text)
 
-    # A code span in a table cell still fills it, so mask it with text, not blanks.
-    cells = _table_cells(_CODE_SPAN_RE.sub("x", line))
+    cells = _table_cells(cell_text)
     if cells is not None:
         filled = [cell for cell in cells if cell]
         if not filled or (len(filled) == 1 and cells[0] and _BOLD_CELL_RE.fullmatch(cells[0])):
@@ -1036,7 +1062,7 @@ def _placeholder_reasons(line: str) -> list[str]:
 
     if _ELLIPSIS_LINE_RE.match(text):
         reasons.append("a line that is only '...'")
-    if line.lstrip().startswith("> Template:"):
+    if text.lstrip().startswith("> Template:"):
         reasons.append("template guidance line")
     return reasons
 
@@ -1050,7 +1076,13 @@ def check_placeholders(lines: list[str], report: ValidationReport) -> None:
     """
     severity = _finding_severity(lines)
     mask = _fence_mask(lines)
-    found = [(idx + 1, reasons) for idx, line in enumerate(lines) if not mask[idx] and (reasons := _placeholder_reasons(line))]
+    texts = _mask_code_spans(lines, mask, " ")
+    cell_texts = _mask_code_spans(lines, mask, "x")
+    found = [
+        (idx + 1, reasons)
+        for idx in range(len(lines))
+        if not mask[idx] and (reasons := _placeholder_reasons(texts[idx], cell_texts[idx]))
+    ]
     for line_no, reasons in found[:PLACEHOLDER_REPORT_CAP]:
         report.issues.append(
             Issue(
