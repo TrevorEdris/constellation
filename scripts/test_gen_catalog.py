@@ -481,3 +481,38 @@ def test_tilde_and_nested_fences_hold_code(tmp_path):
         bare(DOC, 2, "scripts/x.sh", "bash"),
         bare(DOC, 7, "scripts/y.py", "python3"),
     )
+
+
+def test_fence_closes_only_on_matching_bare_fence(tmp_path):
+    """A closer carries no info string, so ```js stays code; once closed, prose and spans are normal again."""
+    root = make_tree(tmp_path)
+    add_scripts(root)
+    write(root, DOC, (
+        "```\n"
+        "~~~\n"
+        "```js\n"
+        "scripts/x.sh\n"
+        "```\n"
+        "\n"
+        "scripts/y.py is prose after the fence.\n"
+        "Run `scripts/x.sh` now.\n"
+        "```code``` then `scripts/z.cjs`.\n"
+    ))
+    assert_fails(
+        run(root, "--check"),
+        bare(DOC, 4, "scripts/x.sh", "bash"),
+        bare(DOC, 8, "scripts/x.sh", "bash"),
+        bare(DOC, 9, "scripts/z.cjs", "node"),
+    )
+
+
+def test_agent_files_are_linted(tmp_path):
+    """Both lints cover agents/*.md, not only skills/**."""
+    root = make_tree(tmp_path)
+    write(root, "agents/beta.md", "Run `python scripts/y.py` and read `references/nope.md`.\n")
+    assert_fails(
+        run(root, "--check"),
+        bare("agents/beta.md", 1, "scripts/y.py", "python3"),
+        "agents/beta.md:1: missing-path: references/nope.md not found in agents",
+        "agents/beta.md:1: missing-path: scripts/y.py not found in agents",
+    )
