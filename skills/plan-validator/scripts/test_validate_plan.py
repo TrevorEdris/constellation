@@ -1,6 +1,6 @@
 """Tests for validate_plan.py: PR-size and Brief checks, frontmatter parsing,
 schema dispatch (v3 vs legacy), issue audience tags, placeholder rejection,
-PLAN v2 step parsing and Traceability rows.
+PLAN v2 step parsing, Traceability rows and the v3 approval-card checks.
 
 Run from the repo root:
     PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q -p no:cacheprovider skills/plan-validator/scripts
@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 
 import validate_plan as vp
+from conftest import v3_plan
 
 SCRIPT = Path(vp.__file__).resolve()
 
@@ -929,3 +930,557 @@ def test_legacy_pass_status_unchanged_by_new_checks(tmp_path):
     assert not report.errors
     assert report.score == 72
     assert report.passed
+
+
+# ---------------------------------------------------------------------------
+# v3 approval card: parse_card, parse_dlines and check_card
+#
+# Each rule test edits the valid fixture with str.replace (the v3_plan factory
+# raises when the text to replace is not there) and asserts that exactly that
+# rule fires. The fixture is 118 words with the questions ending at word 58, so
+# a test that adds words to the questions takes the same number out elsewhere.
+# ---------------------------------------------------------------------------
+
+Q1 = "1. Share links expire? \u2192 **after 30 days** (limits leaked links; if wrong: one config value)"
+Q2 = "2. Link viewers see claimed items? \u2192 **no** (protects the surprise invariant; if wrong: one flag)"
+Q3 = "3. Run \u2192 **subagent-driven** (5 independent tasks; or inline)"
+SHIPS = "**Ships as:** 1 PR, feat/share-link \u2192 origin/main"
+DELIVERS = "**Delivers:** A signed-in user can share a read-only wishlist link with anyone."
+SIZE = "**Size:** ~430 lines \u00b7 9 files \u00b7 5 tasks \u00b7 1 endpoint \u00b7 1 PR"
+SIZE_SHORT = "**Size:** ~430 lines \u00b7 9 files \u00b7 1 PR"  # 4 words shorter
+MADE_D4 = "- D4 Token is 128-bit random, stored hashed (if wrong: rotate all tokens)"
+MADE_D5 = "- D5 Viewer reuses the list component (if wrong: one file)"
+MADE_ITEMS = MADE_D4 + "\n" + MADE_D5 + "\n"
+FLAGS = "**Flags:** none"
+D1 = "- D1 [ask] Share links expire? Default: after 30 days. Why: limits leaked links. If wrong: one config value."
+D2 = "- D2 [ask] Link viewers see claimed items? Default: no. Why: protects the surprise invariant. If wrong: one flag."
+Q_BLOCK = "\n".join((Q1, Q2, Q3))
+
+CARD_RULES = (
+    "missing_label label_order card_over_120_words questions_after_word_60 question_over_20_words "
+    "four_questions run_not_last delivers_not_user_action size_without_counts unknown_flag "
+    "made_for_you_unknown_did ask_without_question question_without_ask one_way_made conflicts_made "
+    "backticks_in_brief remote_checked_in_brief dline_default_mismatch"
+).split()
+
+
+def _v3(tmp_path, **replace) -> "vp.ValidationReport":
+    return vp.validate_plan(v3_plan(tmp_path, **replace))
+
+
+def _fires_only(report: "vp.ValidationReport", rule: str) -> list["vp.Issue"]:
+    """Assert `rule` is the one error id in the report, as a human-audience card error that costs no score."""
+    got = [(i.rule, i.category, i.message) for i in report.errors]
+    assert {r for r, _, _ in got} == {rule}, got
+    assert all(i.category == "card" and i.audience == "human" for i in report.errors), got
+    assert not report.passed
+    assert report.score == 100, "v3 errors block through severity alone"
+    return report.errors
+
+
+def _plan_lines(tmp_path, **replace) -> list[str]:
+    return v3_plan(tmp_path, **replace).read_text(encoding="utf-8").splitlines()
+
+
+def test_fixture_is_118_words_with_questions_ending_at_word_58():
+    # An independent count (whitespace tokens that contain a word character), so the
+    # budget tests below cannot pass on a miscounting validator.
+    text = (Path(vp.__file__).parent / "fixtures" / "v3-valid-PLAN.md").read_text(encoding="utf-8").splitlines()
+    start = text.index("## Brief")
+    brief = [ln for ln in text[start + 1 : text.index("---", start)] if ln.strip()]
+
+    def words(line: str) -> int:
+        return sum(1 for token in line.split() if any(c.isalnum() or c == "_" for c in token))
+
+    ask = words('**Approve "Wishlist: share a list by link"?** Reply go to take every default, or answer by number.')
+    position, last_numbered = ask, 0
+    for line in brief:
+        position += words(line)
+        if line[:1].isdigit():
+            last_numbered = position
+    assert (position + 4, last_numbered) == (118, 58)
+
+
+def test_issue_rule_defaults_to_empty():
+    assert vp.Issue("error", "card", "m").rule == ""
+    assert vp.Issue("error", "card", "m", 3, "missing_label").rule == "missing_label"
+
+
+def test_valid_v3_has_no_card_errors(tmp_path):
+    report = _v3(tmp_path)
+    assert [i for i in report.issues if i.category in ("card", "brief")] == []
+    assert report.errors == []
+    assert report.passed
+    assert report.score == 100
+
+
+def test_v3_plan_factory_makes_a_real_repo_and_rejects_stale_edits(tmp_path):
+    plan = v3_plan(tmp_path)
+    repo = vp.parse_frontmatter(plan.read_text(encoding="utf-8")).data["delivery"][0]["repo"]
+    assert repo == str((tmp_path / "repo").resolve()) and Path(repo, ".git").is_dir()
+    with pytest.raises(AssertionError):
+        v3_plan(tmp_path / "other", **{"text that is not in the fixture": "x"})
+
+
+def test_answered_you_counts_as_counterpart(tmp_path):
+    answered_question = {"\u2192 **after 30 days**": "\u2192 **you: after 30 days**"}
+    answered_dline = {"- D2 [ask]": "- D2 [you: no]"}
+    for n, replace in enumerate((answered_question, answered_dline, {**answered_question, **answered_dline})):
+        report = _v3(tmp_path / str(n), **replace)
+        assert [i for i in report.issues if i.category == "card"] == [], replace
+
+
+@pytest.mark.parametrize(
+    "replace",
+    [
+        {D1: D1.replace("after 30 days", "after 7 days").replace("[ask]", "[you: after 7 days]")},
+        {Q2: Q2.replace("**no**", "**you: no**"), D2: D2.replace("Default: no", "Default: yes")},
+    ],
+    ids=["you-dline", "you-question"],
+)
+def test_answered_question_skips_default_check(tmp_path, replace):
+    report = _v3(tmp_path, **replace)
+    assert [i for i in report.issues if i.category == "card"] == []
+
+
+def test_card_budget_boundaries_are_inclusive(tmp_path):
+    # Exactly 120 words in total, and the last question ending at exactly word 60, are fine ...
+    total_120 = _v3(tmp_path / "a", **{"with anyone.": "with anyone now today."})
+    last_question_at_60 = _v3(tmp_path / "b", **{"invariant;": "invariant for viewers;"})
+    for report in (total_120, last_question_at_60):
+        assert [i for i in report.issues if i.category == "card"] == []
+    # ... one more word in either is not
+    total_121 = _v3(tmp_path / "c", **{"with anyone.": "with anyone now today soon."})
+    last_question_at_61 = _v3(tmp_path / "d", **{"invariant;": "invariant for every viewer;", SIZE: SIZE_SHORT})
+    assert {i.rule for i in total_121.errors} == {"card_over_120_words"}
+    assert {i.rule for i in last_question_at_61.errors} == {"questions_after_word_60"}
+
+
+@pytest.mark.parametrize(
+    "removed",
+    [SHIPS + "\n", DELIVERS + "\n", SIZE + "\n", "**Made for you:**\n", FLAGS + "\n"],
+    ids=["ships-as", "delivers", "size", "made-for-you", "flags"],
+)
+def test_missing_label_error(tmp_path, removed):
+    errors = _fires_only(_v3(tmp_path, **{removed: ""}), "missing_label")
+    assert removed.split("**")[1] in errors[0].message
+
+
+def test_missing_needs_your_call_label_is_an_error(tmp_path):
+    report = _v3(tmp_path, **{"**Needs your call:**": "**Questions:**"})
+    assert "missing_label" in {i.rule for i in report.errors}
+    assert not report.passed
+
+
+def test_label_order_error(tmp_path):
+    report = _v3(tmp_path, **{DELIVERS + "\n" + SIZE: SIZE + "\n" + DELIVERS})
+    errors = _fires_only(report, "label_order")
+    assert "**Size:**" in errors[0].message and "**Delivers:**" in errors[0].message
+
+
+def test_card_over_120_words_error(tmp_path):
+    report = _v3(tmp_path, **{"with anyone.": "with anyone they choose today."})
+    errors = _fires_only(report, "card_over_120_words")
+    assert "121" in errors[0].message
+
+
+def test_questions_after_word_60_error(tmp_path):
+    # +3 words in question 2 push the last numbered line to word 61; Size gives 4 back to stay under 120
+    report = _v3(tmp_path, **{"invariant;": "invariant for every viewer;", SIZE: SIZE_SHORT})
+    errors = _fires_only(report, "questions_after_word_60")
+    assert "61" in errors[0].message
+
+
+def test_question_over_20_words_error(tmp_path):
+    long_question = "Should shared wishlist links stop working after a while?"
+    plan = v3_plan(
+        tmp_path,
+        **{
+            "Share links expire?": long_question,  # question 1 grows to 21 words (+6)
+            "(protects the surprise invariant;": "(protects invariant;",  # -2
+            "(5 independent tasks;": "(tasks;",  # -2, so the questions still end by word 60
+        },
+    )
+    errors = _fires_only(vp.validate_plan(plan), "question_over_20_words")
+    assert errors[0].line == _line_of(plan.read_text(encoding="utf-8"), "1. Should shared")
+    assert "21 words" in errors[0].message
+
+
+def _terse_questions(n_questions: int, first_dline: int = 6) -> dict[str, str]:
+    """Replace the fixture's three questions and their [ask] lines with n terse ones plus Run.
+
+    The terse card is short, so only the question count is in play. The new [ask]
+    lines use ids from D6 up, because D3 to D5 belong to the made-for-you items.
+    """
+    questions = "\n".join(f"{n}. Q{n}? \u2192 **x** (r; if wrong: c)" for n in range(1, n_questions + 1))
+    questions += f"\n{n_questions + 1}. Run \u2192 **inline** (r; or subagent-driven)"
+    asks = "\n".join(f"- D{first_dline + n} [ask] Q{n + 1}? Default: x. Why: r. If wrong: c." for n in range(n_questions))
+    return {Q_BLOCK: questions, D1: asks, D2 + "\n": ""}
+
+
+def test_four_questions_error(tmp_path):
+    errors = _fires_only(_v3(tmp_path, **_terse_questions(4)), "four_questions")
+    assert "4 questions" in errors[0].message
+
+
+def test_three_questions_plus_run_is_allowed(tmp_path):
+    report = _v3(tmp_path, **_terse_questions(3))
+    assert [i for i in report.issues if i.category == "card"] == []
+
+
+def test_run_not_last_error(tmp_path):
+    swapped = Q_BLOCK.replace(Q2 + "\n" + Q3, "2. Run \u2192 **subagent-driven** (5 independent tasks; or inline)\n3." + Q2[2:])
+    report = _v3(tmp_path, **{Q_BLOCK: swapped})
+    _fires_only(report, "run_not_last")
+
+
+@pytest.mark.parametrize("delivers", ["Sharing by link.", "A user shares lists.", "A user can", "Share a list."])
+def test_delivers_not_user_action_error(tmp_path, delivers):
+    report = _v3(tmp_path, **{DELIVERS: "**Delivers:** " + delivers})
+    _fires_only(report, "delivers_not_user_action")
+
+
+@pytest.mark.parametrize(
+    "delivers",
+    ["An admin can export every list.", "None user-visible: foundation for link sharing."],
+)
+def test_delivers_accepts_user_action_and_foundation(tmp_path, delivers):
+    report = _v3(tmp_path, **{DELIVERS: "**Delivers:** " + delivers})
+    assert [i for i in report.issues if i.category == "card"] == []
+
+
+@pytest.mark.parametrize("n_words, rules", [(25, set()), (26, {"delivers_over_25_words"})])
+def test_delivers_is_at_most_25_words(tmp_path, n_words, rules):
+    delivers = "A user can " + " ".join(f"w{i}" for i in range(n_words - 3)) + "."
+    # The made-for-you items give 21 words back so only the Delivers cap is in play
+    report = _v3(tmp_path, **{DELIVERS: "**Delivers:** " + delivers, MADE_ITEMS: "None.\n"})
+    assert {i.rule for i in report.errors} == rules
+
+
+@pytest.mark.parametrize(
+    "replace",
+    [{"~430 lines \u00b7 ": ""}, {"9 files \u00b7 ": ""}, {"1 endpoint \u00b7 1 PR": "1 endpoint"}],
+    ids=["no-lines", "no-files", "no-prs"],
+)
+def test_size_without_counts_error(tmp_path, replace):
+    _fires_only(_v3(tmp_path, **replace), "size_without_counts")
+
+
+@pytest.mark.parametrize("size", ["~1,200 lines \u00b7 1 file \u00b7 2 PRs", "430 lines \u00b7 9 files \u00b7 1 PR"])
+def test_size_accepts_comma_tilde_and_plurals(tmp_path, size):
+    report = _v3(tmp_path, **{SIZE: "**Size:** " + size})
+    assert [i for i in report.issues if i.category == "card"] == []
+
+
+def test_unknown_flag_error(tmp_path):
+    report = _v3(tmp_path, **{FLAGS: "**Flags:** auth, banana"})
+    errors = _fires_only(report, "unknown_flag")
+    assert "banana" in errors[0].message
+    # "none" is a whole-field value, not a list member
+    _fires_only(_v3(tmp_path / "b", **{FLAGS: "**Flags:** auth, none"}), "unknown_flag")
+    _fires_only(_v3(tmp_path / "c", **{FLAGS: "**Flags:**"}), "unknown_flag")
+
+
+@pytest.mark.parametrize(
+    "flags", ["none", "auth", "payments", "migration", "delete", "external-contract", "prod-infra", "auth, payments"]
+)
+def test_flags_accepts_each_documented_flag(tmp_path, flags):
+    report = _v3(tmp_path, **{FLAGS: "**Flags:** " + flags})
+    assert [i for i in report.issues if i.category == "card"] == []
+
+
+@pytest.mark.parametrize(
+    "replace",
+    [{"- D5 Viewer": "- D9 Viewer"}, {"- D4 Token": "- D1 Token"}],
+    ids=["no-such-dline", "dline-is-ask"],
+)
+def test_made_for_you_unknown_did_error(tmp_path, replace):
+    errors = _fires_only(_v3(tmp_path, **replace), "made_for_you_unknown_did")
+    assert any(did in errors[0].message for did in ("D9", "D1"))
+
+
+def test_ask_without_question_error(tmp_path):
+    extra = "- D6 [ask] Notify the owner? Default: no. Why: quiet. If wrong: one flag.\n- Do not change:"
+    errors = _fires_only(_v3(tmp_path, **{"- Do not change:": extra}), "ask_without_question")
+    assert "D6" in errors[0].message
+
+
+def test_question_without_ask_error(tmp_path):
+    errors = _fires_only(_v3(tmp_path, **{D2 + "\n": ""}), "question_without_ask")
+    assert "Link viewers see claimed items?" in errors[0].message
+
+
+def test_one_way_made_error(tmp_path):
+    errors = _fires_only(_v3(tmp_path, **{"- D3 [made]": "- D3 [made, one-way]"}), "one_way_made")
+    assert "D3" in errors[0].message
+
+
+def test_conflicts_made_error(tmp_path):
+    report = _v3(tmp_path, **{"add a role column.": "add a role column. Conflicts: CLAUDE.md Terraform default."})
+    errors = _fires_only(report, "conflicts_made")
+    assert "D3" in errors[0].message
+
+
+def test_backticks_in_brief_error(tmp_path):
+    _fires_only(_v3(tmp_path, **{"a read-only wishlist": "a `read-only` wishlist"}), "backticks_in_brief")
+
+
+@pytest.mark.parametrize("ref", ["anyone (2.1).", "step 2.", "step 2.1."])
+def test_step_ref_in_brief_error(tmp_path, ref):
+    _fires_only(_v3(tmp_path, **{"anyone.": ref}), "step_ref_in_brief")
+
+
+def test_remote_checked_in_brief_error(tmp_path):
+    # The renderer adds the check time; an author-written one would print twice. Size gives 4 words back.
+    report = _v3(tmp_path, **{SHIPS: SHIPS + " (remote checked 10-07 09:12)", SIZE: SIZE_SHORT})
+    _fires_only(report, "remote_checked_in_brief")
+
+
+def test_dline_default_mismatch_error(tmp_path):
+    errors = _fires_only(_v3(tmp_path, **{"Default: after 30 days.": "Default: after 7 days."}), "dline_default_mismatch")
+    assert "D1" in errors[0].message and "after 7 days" in errors[0].message
+
+
+@pytest.mark.parametrize("n_words, rules", [(20, set()), (21, {"made_over_20_words"})])
+def test_made_for_you_item_is_at_most_20_words(tmp_path, n_words, rules):
+    filler = ["tests,", "styles,", "loading", "states,", "error", "states,", "empty", "states", "too", "again"]
+    item = "- D5 Viewer reuses the list component and its " + " ".join(filler[: n_words - 12]) + " (if wrong: one file)"
+    report = _v3(tmp_path, **{MADE_ITEMS: item + "\n"})
+    assert {i.rule for i in report.errors} == rules
+
+
+def test_four_made_for_you_items_error(tmp_path):
+    items = "- D3 Read-only (if wrong: roles)\n- D4 Hashed (if wrong: rotate)\n- D5 Reused (if wrong: one file)\n- D6 Counted (if wrong: one flag)\n"
+    extra = "- D6 [made] Owner sees view counts. Why: cheap. If wrong: one flag.\n- Do not change:"
+    report = _v3(tmp_path, **{MADE_ITEMS: items, "- Do not change:": extra})
+    _fires_only(report, "four_made")
+
+
+def test_made_for_you_none_is_valid(tmp_path):
+    report = _v3(tmp_path, **{MADE_ITEMS: "None.\n"})
+    assert [i for i in report.issues if i.category == "card"] == []
+
+
+def test_made_for_you_format_error(tmp_path):
+    _fires_only(_v3(tmp_path, **{"(if wrong: one file)": "(one file)"}), "made_for_you_format")
+    # a label with neither items nor "None." is unfilled
+    _fires_only(_v3(tmp_path / "b", **{MADE_ITEMS: ""}), "made_for_you_format")
+
+
+def test_question_format_error(tmp_path):
+    plan = v3_plan(tmp_path, **{"\u2192 **no**": "**no**"})
+    errors = [i for i in vp.validate_plan(plan).errors if i.rule == "question_format"]
+    assert [i.line for i in errors] == [_line_of(plan.read_text(encoding="utf-8"), "2. Link viewers")]
+
+
+def test_ascii_arrow_is_normalized(tmp_path):
+    ascii_card = {Q1: Q1.replace("\u2192", "->"), Q3: Q3.replace("\u2192", "->"), SHIPS: SHIPS.replace("\u2192", "->")}
+    plan = v3_plan(tmp_path, **ascii_card)
+    assert [i for i in vp.validate_plan(plan).issues if i.category == "card"] == []
+    card = vp.parse_card(plan.read_text(encoding="utf-8").splitlines())
+    # parsed text reads the arrow; brief_text stays verbatim for the renderer
+    assert card.fields["**Ships as:**"].text == "1 PR, feat/share-link \u2192 origin/main"
+    assert card.questions[0].text == "Share links expire?"
+    assert "feat/share-link -> origin/main" in card.brief_text
+
+
+def test_question_must_end_in_a_question_mark_and_run_must_offer_the_other_option(tmp_path):
+    no_mark = _v3(tmp_path / "a", **{"Share links expire? \u2192": "Share links expire \u2192"})
+    assert "question_format" in {i.rule for i in no_mark.errors}
+    bad_other = _v3(tmp_path / "b", **{"or inline)": "or banana)"})
+    assert "question_format" in {i.rule for i in bad_other.errors}
+
+
+def test_three_made_for_you_items_are_allowed(tmp_path):
+    items = "- D3 Read-only (if wrong: roles)\n- D4 Hashed (if wrong: rotate)\n- D5 Reused (if wrong: one file)\n"
+    assert [i for i in _v3(tmp_path, **{MADE_ITEMS: items}).issues if i.category == "card"] == []
+
+
+def test_made_for_you_none_may_follow_the_label_on_the_same_line(tmp_path):
+    report = _v3(tmp_path, **{"**Made for you:**\n" + MADE_ITEMS: "**Made for you:** None.\n"})
+    assert [i for i in report.issues if i.category == "card"] == []
+
+
+def test_one_way_and_conflicts_both_fire_on_one_line(tmp_path):
+    both = {"- D3 [made]": "- D3 [made, one-way]", "add a role column.": "add a role column. Conflicts: CLAUDE.md."}
+    assert {i.rule for i in _v3(tmp_path, **both).errors} == {"one_way_made", "conflicts_made"}
+
+
+def test_brief_missing_error(tmp_path):
+    errors = _fires_only(_v3(tmp_path, **{"## Brief": "## Summary"}), "brief_missing")
+    assert errors[0].line == 0
+
+
+def test_brief_not_first_error(tmp_path):
+    _fires_only(_v3(tmp_path, **{"## Brief\n": "## Overview\nShare links.\n\n## Brief\n"}), "brief_not_first")
+
+
+def test_global_constraints_missing_error(tmp_path):
+    report = _v3(tmp_path, **{"## Global Constraints": "## Constraints"})
+    assert "global_constraints_missing" in {i.rule for i in report.errors}
+
+
+def test_title_missing_error(tmp_path):
+    _fires_only(_v3(tmp_path, **{"# PLAN: Wishlist: share a list by link": "# Wishlist plan"}), "title_missing")
+
+
+def test_dline_format_error(tmp_path):
+    _fires_only(_v3(tmp_path, **{"- D3 [made]": "- D3 [mde]"}), "dline_format")
+    # an [ask] body must read "<question>? Default: <d>. Why: <w>. If wrong: <c>."
+    report = _v3(tmp_path / "b", **{" Why: protects the surprise invariant.": ""})
+    assert "dline_format" in {i.rule for i in report.errors}
+
+
+def test_card_errors_carry_the_line_of_their_cause(tmp_path):
+    plan = v3_plan(tmp_path, **{"Default: after 30 days.": "Default: after 7 days."})
+    text = plan.read_text(encoding="utf-8")
+    report = vp.validate_plan(plan)
+    assert [i.line for i in report.errors] == [_line_of(text, "- D1 [ask]")]
+
+
+def test_every_card_rule_has_a_test():
+    names = {n for n in globals() if n.startswith("test_") and n.endswith("_error")}
+    assert [r for r in CARD_RULES if f"test_{r}_error" not in names] == []
+
+
+def test_two_run_items_error(tmp_path):
+    # Two terse Run items cost 4 words; question 2's reason gives 2 back so the budgets stay quiet
+    two_runs = {
+        Q3: "3. Run \u2192 **inline** (r; or subagent-driven)\n4. Run \u2192 **inline** (r; or subagent-driven)",
+        "(protects the surprise invariant;": "(protects invariant;",
+    }
+    _fires_only(_v3(tmp_path, **two_runs), "run_not_last")
+
+
+def test_one_way_made_item_on_the_card_is_reported_once(tmp_path):
+    # D4 is listed under Made for you; being one-way is the only thing wrong with it
+    _fires_only(_v3(tmp_path, **{"- D4 [made]": "- D4 [made, one-way]"}), "one_way_made")
+
+
+def test_conflicts_marker_is_only_an_error_on_made_lines(tmp_path):
+    ask = {" If wrong: one flag.": " If wrong: one flag. Conflicts: CLAUDE.md Terraform default."}
+    assert [i for i in _v3(tmp_path, **ask).issues if i.category == "card"] == []
+
+
+def test_answered_dline_needs_no_question(tmp_path):
+    # An approved plan may keep a [you: ...] line for a question that left the card
+    extra = "- D6 [you: 7 days] Retain views? Default: 30 days. Why: cheap. If wrong: one flag.\n- Do not change:"
+    assert [i for i in _v3(tmp_path, **{"- Do not change:": extra}).issues if i.category == "card"] == []
+
+
+@pytest.mark.parametrize(
+    "heading, title",
+    [
+        ("# PLAN: Wishlist: share", "Wishlist: share"),
+        ("# PLAN \u2014 Dash title", "Dash title"),
+        ("# PLAN - Hyphen title  ", "Hyphen title"),
+        ("#   PLAN:Tight", "Tight"),
+        ("# PLANNING: x", None),
+        ("## PLAN: x", None),
+        ("# Plan: x", None),
+    ],
+)
+def test_plan_title(heading, title):
+    assert vp.plan_title(["---", "slug: s", "---", "", heading, "body"]) == title
+
+
+def test_plan_title_skips_fenced_code_and_frontmatter():
+    assert vp.plan_title(["---", "# PLAN: in frontmatter", "---", "```", "# PLAN: in fence", "```"]) is None
+    assert vp.plan_title(["```", "# PLAN: in fence", "```", "# PLAN: real"]) == "real"
+
+
+def test_ask_line_is_the_gc9_text():
+    assert vp.ask_line("Wishlist: share") == '**Approve "Wishlist: share"?** Reply go to take every default, or answer by number.'
+
+
+# parse_card and parse_dlines
+
+
+def test_parse_card_reads_the_fixture(tmp_path):
+    plan = v3_plan(tmp_path)
+    text = plan.read_text(encoding="utf-8")
+    card = vp.parse_card(text.splitlines())
+    assert card.questions == [
+        vp.Question(1, "Share links expire?", "after 30 days", "limits leaked links", "one config value", False, False, _line_of(text, "1. Share")),
+        vp.Question(2, "Link viewers see claimed items?", "no", "protects the surprise invariant", "one flag", False, False, _line_of(text, "2. Link")),
+        vp.Question(3, "Run", "subagent-driven", "5 independent tasks", "inline", True, False, _line_of(text, "3. Run")),
+    ]
+    assert card.made == [
+        ("D4", "Token is 128-bit random, stored hashed", "rotate all tokens"),
+        ("D5", "Viewer reuses the list component", "one file"),
+    ]
+    assert list(card.fields) == list(vp.CARD_LABELS)
+    assert card.fields["**Ships as:**"].text == "1 PR, feat/share-link \u2192 origin/main"
+    assert card.fields["**Delivers:**"].text == "A signed-in user can share a read-only wishlist link with anyone."
+    assert card.fields["**Flags:**"].text == "none"
+    assert card.fields["**Flags:**"].line == _line_of(text, "**Flags:**")
+    assert card.brief_start == _line_of(text, "## Brief")
+    brief = card.brief_text.splitlines()
+    assert brief[0] == "**Needs your call:**" and brief[-1] == "**Flags:** none" and len(brief) == 11
+
+
+def test_parse_card_brief_stops_at_rule_and_skips_blank_and_quote_lines(tmp_path):
+    lines = [
+        "# PLAN: x", "", "## Brief", "> guidance", "", "**Flags:** none", "", "---", "**Size:** after the rule", "## Next", "**Delivers:** no",
+    ]
+    card = vp.parse_card(lines)
+    assert card.brief_text == "**Flags:** none"
+    assert card.brief_start == 3
+    assert list(card.fields) == ["**Flags:**"]
+    # without a rule line, the next level-2 heading ends the Brief
+    assert vp.parse_card(["## Brief", "**Flags:** none", "## Next", "**Size:** later"]).brief_text == "**Flags:** none"
+    # a plan with no Brief parses to an empty card
+    empty = vp.parse_card(["# PLAN: x", "", "## Notes", "text"])
+    assert (empty.questions, empty.made, empty.fields, empty.brief_text, empty.brief_start) == ([], [], {}, "", 0)
+
+
+def test_parse_card_ignores_a_brief_heading_inside_a_fence_or_frontmatter():
+    lines = ["---", "## Brief", "---", "# PLAN: x", "```", "## Brief", "**Flags:** none", "```", "## Brief", "**Flags:** auth"]
+    card = vp.parse_card(lines)
+    assert card.fields["**Flags:**"].text == "auth" and card.brief_start == 9
+
+
+def test_parse_card_marks_answered_questions(tmp_path):
+    lines = _plan_lines(tmp_path, **{"\u2192 **no**": "\u2192 **you: no**", "\u2192 **subagent-driven**": "\u2192 **you: inline**"})
+    q = vp.parse_card(lines).questions
+    assert [(x.answered, x.default) for x in q] == [(False, "after 30 days"), (True, "no"), (True, "inline")]
+
+
+def test_parse_dlines_reads_every_tag(tmp_path):
+    lines = _plan_lines(
+        tmp_path,
+        **{"- D3 [made]": "- D3 [made, one-way]", "- D2 [ask]": "- D2 [you: no, never]", "- Do not change:": "- D6 [you: 7 days] Q? Default: x. Why: y. If wrong: z.\n- Do not change:"},
+    )
+    dlines = vp.parse_dlines(lines)
+    assert list(dlines) == ["D1", "D2", "D3", "D4", "D5", "D6"]
+    assert [d.tag for d in dlines.values()] == ["ask", "you: no, never", "made, one-way", "made", "made", "you: 7 days"]
+    assert dlines["D1"].default == "after 30 days"
+    assert dlines["D1"].text.startswith("Share links expire? Default:")
+    assert dlines["D3"].default == "" and dlines["D3"].text.startswith("A share link grants read access only.")
+    assert dlines["D6"].default == "x"
+    assert dlines["D1"].line == _line_of("\n".join(lines), "- D1 [ask]")
+
+
+def test_parse_dlines_is_scoped_to_global_constraints_and_skips_fences():
+    lines = [
+        "## Notes", "- D9 [ask] Q? Default: a. Why: b. If wrong: c.", "## Global Constraints", "```", "- D8 [made] fenced. Why: a. If wrong: b.", "```",
+        "- D1 [made] real. Why: a. If wrong: b.", "### Sub", "- D2 [made] still inside. Why: a. If wrong: b.", "## Next", "- D7 [made] outside. Why: a. If wrong: b.",
+    ]
+    assert list(vp.parse_dlines(lines)) == ["D1", "D2"]
+    assert vp.parse_dlines(["# PLAN: x"]) == {}
+
+
+# dispatch
+
+
+def test_legacy_plan_gets_no_card_checks_and_keeps_check_brief(tmp_path):
+    bad = {"schema: plan/v3": "schema: plan/v2", "**Flags:** none": "**Flags:** banana"}
+    legacy = _v3(tmp_path, **bad)
+    assert not [i for i in legacy.issues if i.category == "card"]
+    assert [i.category for i in legacy.issues].count("legacy") == 1
+    # check_brief ran: the card has none of its three labels
+    assert any(i.category == "brief" and "**Changes:**" in i.message for i in legacy.issues)
+
+
+def test_v3_plan_does_not_run_check_brief(tmp_path):
+    assert not [i for i in _v3(tmp_path).issues if i.category == "brief"]
