@@ -62,13 +62,17 @@ g() {
 }
 
 # The script under test gets the same four settings through the environment
-# (the env form of -c), so its own git calls can commit and merge.
+# (the env form of -c), so its own git calls can commit and merge. A fifth,
+# pull.rebase=true, makes a diverged `git pull` succeed by rebasing unless the
+# script passes --ff-only itself, so a pull that lost its flag shows up as a
+# changed base instead of hiding behind git's own "reconcile" error.
 ws() {
-  env GIT_CONFIG_COUNT=4 \
+  env GIT_CONFIG_COUNT=5 \
     GIT_CONFIG_KEY_0=user.name GIT_CONFIG_VALUE_0=test \
     GIT_CONFIG_KEY_1=user.email GIT_CONFIG_VALUE_1=test@example.com \
     GIT_CONFIG_KEY_2=commit.gpgsign GIT_CONFIG_VALUE_2=false \
     GIT_CONFIG_KEY_3=init.defaultBranch GIT_CONFIG_VALUE_3=main \
+    GIT_CONFIG_KEY_4=pull.rebase GIT_CONFIG_VALUE_4=true \
     bash "$TARGET" "$@"
 }
 
@@ -666,6 +670,41 @@ assert_eq "tracked files clean" "" "$(g -C "$REPO" status --porcelain -uno)"
 assert_eq "tests never ran, so no MERGED" no "$(has MERGED)"
 finish
 
+# A checkout that git refuses must stop the run. Carrying on would merge into
+# whatever the main checkout is on (here `other`) and report that as a merge of
+# the base. Two real causes: the base is held by a second worktree, and an
+# untracked file that the base tracks.
+begin "merge-local: checkout failure refuses without merging"
+new_feature
+park_main
+OTHER_SHA="$(g -C "$REPO" rev-parse other)"
+g -C "$REPO" worktree add -q "$SB/wm" main || die "worktree add wm on main"
+merge_in "$WT" main feat/w -- true
+assert_eq "base held by another worktree: exit" 1 "$RC"
+assert_contains "base held: REFUSED" "check out" "$(kv REFUSED)"
+assert_eq "base held: no MERGED" no "$(has MERGED)"
+assert_eq "base held: base unchanged" "$MAIN_SHA" "$(g -C "$REPO" rev-parse main)"
+assert_eq "base held: other unchanged" "$OTHER_SHA" "$(g -C "$REPO" rev-parse other)"
+assert_eq "base held: main checkout untouched" other "$(g -C "$REPO" symbolic-ref --short HEAD)"
+assert_eq "base held: branch not merged" no "$(is_merged feat/w other)"
+new_feature
+park_main
+g -C "$REPO" checkout -q main || die "checkout main"
+commit_file "$REPO" clash.txt tracked "add clash"
+MAIN_SHA="$(g -C "$REPO" rev-parse main)"
+g -C "$REPO" checkout -q other || die "checkout other"
+OTHER_SHA="$(g -C "$REPO" rev-parse other)"
+printf 'mine\n' >"$REPO/clash.txt"
+merge_in "$WT" main feat/w -- true
+assert_eq "untracked clash: exit" 1 "$RC"
+assert_contains "untracked clash: REFUSED" "check out" "$(kv REFUSED)"
+assert_eq "untracked clash: no MERGED" no "$(has MERGED)"
+assert_eq "untracked clash: base unchanged" "$MAIN_SHA" "$(g -C "$REPO" rev-parse main)"
+assert_eq "untracked clash: other unchanged" "$OTHER_SHA" "$(g -C "$REPO" rev-parse other)"
+assert_eq "untracked clash: file kept" mine "$(cat "$REPO/clash.txt")"
+assert_eq "untracked clash: branch not merged" no "$(is_merged feat/w other)"
+finish
+
 # ── Cases: merge-local and the approved local-only plan ───────────────────────
 
 # A PR-based repo can be merged locally only when the plan the user approved
@@ -681,18 +720,6 @@ write_plan "$SB/PLAN.md" '"in-progress"' "$WT" local-only
 merge_in "$WT" main feat/w --plan "$SB/PLAN.md" -- true
 assert_eq "worktree path, quoted in-progress: exit" 0 "$RC"
 assert_eq "worktree path: merged" yes "$(is_merged feat/w main)"
-new_feature remote
-cat >"$SB/PLAN.md" <<EOF
----
-status: approved
-delivery:  # where it ships
-  - mode: local-only
-    remote: none
----
-EOF
-merge_in "$WT" main feat/w --plan "$SB/PLAN.md" -- true
-assert_eq "item without repo, commented delivery: exit" 0 "$RC"
-assert_eq "item without repo: merged" yes "$(is_merged feat/w main)"
 new_feature remote
 cat >"$SB/PLAN.md" <<EOF
 ---
@@ -751,6 +778,31 @@ refuse_with "another repo"
 # From the worktree, "." would canonicalize to the worktree itself.
 write_plan "$SB/PLAN.md" approved "." local-only
 refuse_with "relative repo"
+# Every delivery item in a plan names its repo. An item that does not, or names
+# it with an empty value, is malformed and approves nothing: in a plan that
+# covers several repos it could not say which one it meant.
+cat >"$SB/PLAN.md" <<EOF
+---
+status: approved
+delivery:  # where it ships
+  - mode: local-only
+    remote: none
+---
+EOF
+refuse_with "item without repo, commented delivery"
+write_plan "$SB/PLAN.md" approved "" local-only
+refuse_with "item with an empty repo"
+cat >"$SB/PLAN.md" <<EOF
+---
+status: approved
+delivery:
+  - repo: $SB/elsewhere
+    mode: local-only
+  - mode: local-only
+    remote: none
+---
+EOF
+refuse_with "item without repo beside another repo's item"
 printf -- '---\nstatus: approved\n---\n# Legacy plan\n' >"$SB/PLAN.md"
 refuse_with "legacy plan without delivery"
 cat >"$SB/PLAN.md" <<EOF
@@ -801,6 +853,26 @@ merge_in "$WT" main feat/w --plan "$SB/PLAN.md" -- true
 assert_eq "exit" 0 "$RC"
 assert_eq "upstream commit is in main" yes "$(is_merged "$UPSTREAM_SHA" main)"
 assert_eq "feat/w is in main" yes "$(is_merged feat/w main)"
+finish
+
+# When the base and its upstream have both moved, the pull cannot fast-forward.
+# The merge must not run on that stale base. `ws` sets pull.rebase=true, so a
+# pull without --ff-only would rebase main onto the upstream and succeed.
+begin "merge-local: diverged upstream refuses"
+new_feature remote
+g clone -q "$SB/origin.git" "$SB/clone" || die "clone origin"
+commit_file "$SB/clone" upstream.txt upstream "add upstream"
+g -C "$SB/clone" push -q origin main || die "push upstream commit"
+commit_file "$REPO" local.txt local "add local"
+MAIN_SHA="$(g -C "$REPO" rev-parse main)"
+write_plan "$SB/PLAN.md" approved "$REPO" local-only
+merge_in "$WT" main feat/w --plan "$SB/PLAN.md" -- true
+assert_eq "exit" 1 "$RC"
+assert_contains "REFUSED" "fast-forward" "$(kv REFUSED)"
+assert_eq "no MERGED" no "$(has MERGED)"
+assert_eq "base unchanged" "$MAIN_SHA" "$(g -C "$REPO" rev-parse main)"
+assert_eq "branch not merged" no "$(is_merged feat/w main)"
+assert_eq "tracked files clean" "" "$(g -C "$REPO" status --porcelain -uno)"
 finish
 
 # ── Cases: merge-local preconditions ──────────────────────────────────────────

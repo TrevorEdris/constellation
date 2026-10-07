@@ -57,8 +57,10 @@
 #          - frontmatter `status` is approved or in-progress (an inline
 #            `# comment` and quotes are ignored), and
 #          - the block-form `delivery:` list has an item with `mode: local-only`
-#            whose `repo` is absent or an absolute path that resolves to
-#            MAIN_ROOT or WORKTREE_PATH.
+#            whose `repo` is an absolute path that resolves to MAIN_ROOT or
+#            WORKTREE_PATH. An item with no `repo`, or an empty one, does not
+#            qualify: every delivery item names its repo, and in a plan that
+#            covers several repos a repo-less item would approve all of them.
 #        A missing file, a legacy plan without `delivery:`, flow form or
 #        anything unreadable does not qualify: it fails closed to exit 4.
 #     3. Uncommitted changes to tracked files in MAIN_ROOT -> BLOCKING= lines,
@@ -229,7 +231,7 @@ approved_local_only() {
     case "$line" in
       R:*)
         repo="${line#R:}"
-        [ -n "$repo" ] || return 0
+        [ -n "$repo" ] || continue
         case "$repo" in
           /*) ;;
           *) continue ;;
