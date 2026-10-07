@@ -7,9 +7,10 @@
 # `grep -q` under pipefail reported "no PR history" for a repo that had it.
 # merge-local adds its own: a local merge into a repo that ships by PR, a
 # checkout run in the worktree where the base is already taken, and a plan flag
-# taken on trust. Every case here builds a real git repo and runs the real
-# script, so the exact code the agent runs is what gets tested. No network, no
-# `gh`.
+# taken on trust. cleanup adds more: a branch deleted before the worktree that
+# holds it is removed, and git's force flag deleting a file the user had not
+# committed. Every case here builds a real git repo and runs the real script, so
+# the exact code the agent runs is what gets tested. No network, no `gh`.
 #
 # Usage: test-workspace.sh        (any working directory)
 #
@@ -123,6 +124,16 @@ merge_in() {
   ERR="$(cat "$TMP/stderr")"
 }
 
+# cleanup_in <dir> [args...] — run `workspace.sh cleanup` from <dir>.
+# Sets OUT, ERR, RC.
+cleanup_in() {
+  local dir="$1"
+  shift
+  OUT="$(cd "$dir" && ws cleanup "$@" 2>"$TMP/stderr")"
+  RC=$?
+  ERR="$(cat "$TMP/stderr")"
+}
+
 # kv <KEY> — the value of KEY=value from the last run's stdout.
 kv() {
   sed -n "s/^$1=//p" <<<"$OUT"
@@ -179,6 +190,18 @@ is_merged() {
 # exists <path> — "yes" or "no".
 exists() {
   if [ -e "$1" ]; then echo yes; else echo no; fi
+}
+
+# has_branch <branch> — "yes" when <branch> is a local branch of $REPO.
+has_branch() {
+  if g -C "$REPO" show-ref --verify --quiet "refs/heads/$1"; then echo yes; else echo no; fi
+}
+
+# land_feature — fast-forward main to feat/w, the state after a finished merge.
+# cleanup only removes work that main already holds. Call it while the main
+# checkout is still on main.
+land_feature() {
+  g -C "$REPO" merge -q --ff-only feat/w || die "merge feat/w into main"
 }
 
 # write_plan <file> <status> <repo> <mode> — a plan whose single delivery item
@@ -927,6 +950,315 @@ assert_eq "missing branch: exit" 2 "$RC"
 assert_contains "missing branch: REFUSED" "nosuch" "$(kv REFUSED)"
 assert_eq "main checkout untouched" other "$(g -C "$REPO" symbolic-ref --short HEAD)"
 assert_eq "base unchanged" "$MAIN_SHA" "$(g -C "$REPO" rev-parse main)"
+finish
+
+# ── Cases: cleanup ────────────────────────────────────────────────────────────
+
+# Order matters twice over. `branch -d` before removal exits 1 (git will not
+# delete a branch a worktree has checked out), so the worktree goes first. And
+# the whole run ends with one registered worktree: the main checkout.
+begin "cleanup: removes worktree, then deletes branch"
+new_feature
+land_feature
+cleanup_in "$REPO" "$WT" feat/w
+assert_eq "exit" 0 "$RC"
+assert_eq "REMOVED_WORKTREE" "$WT" "$(kv REMOVED_WORKTREE)"
+assert_eq "DELETED_BRANCH" feat/w "$(kv DELETED_BRANCH)"
+assert_eq "keys, in order" "REMOVED_WORKTREE,DELETED_BRANCH" \
+  "$(sed 's/=.*//' <<<"$OUT" | paste -sd, -)"
+assert_eq "worktree directory gone" no "$(exists "$WT")"
+assert_eq "branch gone" no "$(has_branch feat/w)"
+assert_eq "one worktree left" 1 "$(g -C "$REPO" worktree list | wc -l | tr -d ' ')"
+assert_eq "the work is still on main" yes "$(exists "$REPO/feature.txt")"
+finish
+
+# Removing a worktree with an untracked file needs git's force flag, and force
+# deletes the file. The script must stop first and name every file in the way,
+# one by one (-uall), so the user can decide.
+begin "cleanup: untracked file refuses and names it"
+new_feature
+land_feature
+printf 'note\n' >"$WT/notes.md"
+mkdir "$WT/dir"
+printf 'inner\n' >"$WT/dir/a.txt"
+cleanup_in "$REPO" "$WT" feat/w
+assert_eq "exit" 3 "$RC"
+assert_eq "BLOCKING names each file" "?? dir/a.txt"$'\n'"?? notes.md" "$(kv BLOCKING)"
+assert_contains "REFUSED" "uncommitted" "$(kv REFUSED)"
+assert_eq "nothing reported removed" no "$(has REMOVED_WORKTREE)"
+assert_eq "file survives" note "$(cat "$WT/notes.md")"
+assert_eq "nested file survives" inner "$(cat "$WT/dir/a.txt")"
+assert_eq "worktree survives" yes "$(exists "$WT")"
+assert_eq "branch survives" yes "$(has_branch feat/w)"
+finish
+
+begin "cleanup: modified tracked file refuses"
+new_feature
+land_feature
+printf 'edit\n' >"$WT/feature.txt"
+cleanup_in "$REPO" "$WT" feat/w
+assert_eq "exit" 3 "$RC"
+assert_eq "BLOCKING" " M feature.txt" "$(kv BLOCKING)"
+assert_eq "nothing reported removed" no "$(has REMOVED_WORKTREE)"
+assert_eq "edit survives" edit "$(cat "$WT/feature.txt")"
+assert_eq "worktree survives" yes "$(exists "$WT")"
+assert_eq "branch survives" yes "$(has_branch feat/w)"
+finish
+
+# --discard decides what happens to the branch, never to uncommitted work.
+begin "cleanup: --discard does not override uncommitted files"
+new_feature
+printf 'note\n' >"$WT/notes.md"
+cleanup_in "$REPO" "$WT" feat/w --discard --confirm discard
+assert_eq "exit" 3 "$RC"
+assert_eq "BLOCKING" "?? notes.md" "$(kv BLOCKING)"
+assert_eq "file survives" note "$(cat "$WT/notes.md")"
+assert_eq "worktree survives" yes "$(exists "$WT")"
+assert_eq "branch survives" yes "$(has_branch feat/w)"
+finish
+
+# Removing the directory a shell stands in deletes that shell's cwd. The agent
+# must be told where to stand first.
+begin "cleanup: refuses from inside the worktree"
+new_feature
+land_feature
+mkdir "$WT/sub"
+cleanup_in "$WT" "$WT" feat/w
+assert_eq "at the root: exit" 2 "$RC"
+assert_eq "at the root: REFUSED" "cd $REPO first" "$(kv REFUSED)"
+cleanup_in "$WT/sub" "$WT" feat/w
+assert_eq "in a subdirectory: exit" 2 "$RC"
+assert_eq "in a subdirectory: REFUSED" "cd $REPO first" "$(kv REFUSED)"
+assert_eq "worktree survives" yes "$(exists "$WT")"
+assert_eq "branch survives" yes "$(has_branch feat/w)"
+finish
+
+# A host (IDE, harness) that placed the worktree removes it itself. Nothing about
+# the worktree is inspected, so even a dirty, unmerged one is left alone.
+# Git can refuse a removal the status check let through: a worktree with an
+# initialized submodule reads clean, yet git will not remove it without its
+# force flag. The script reports the refusal and stops with everything in place;
+# it does not take the force flag on the user's behalf.
+begin "cleanup: git refusing the removal stops with everything in place"
+new_repo
+g init -q "$SB/libsrc" || die "git init libsrc"
+commit "$SB/libsrc" "lib init"
+g -c protocol.file.allow=always -C "$REPO" submodule add -q "$SB/libsrc" libs/sub \
+  >/dev/null 2>&1 || die "submodule add"
+g -C "$REPO" commit -q -m "add submodule" || die "commit submodule"
+add_wt repo/.worktrees/w feat/w
+g -c protocol.file.allow=always -C "$WT" submodule update --init -q \
+  >/dev/null 2>&1 || die "submodule update"
+assert_eq "setup: status reads clean" "" "$(g -C "$WT" status --porcelain -uall)"
+cleanup_in "$REPO" "$WT" feat/w
+assert_eq "exit" 1 "$RC"
+assert_contains "REFUSED" "refused to remove" "$(kv REFUSED)"
+assert_contains "git's reason reaches stderr" "submodules" "$ERR"
+assert_eq "nothing reported removed" no "$(has REMOVED_WORKTREE)"
+assert_eq "nothing reported deleted" no "$(has DELETED_BRANCH)"
+assert_eq "worktree survives" yes "$(exists "$WT/libs/sub")"
+assert_eq "branch survives" yes "$(has_branch feat/w)"
+finish
+
+begin "cleanup: host-owned worktree left in place"
+new_repo
+add_wt wt-sibling feat/s
+commit_file "$WT" s.txt s "add s"
+printf 'note\n' >"$WT/notes.md"
+cleanup_in "$REPO" "$WT" feat/s
+assert_eq "exit" 0 "$RC"
+assert_eq "LEFT_IN_PLACE" "$WT" "$(kv LEFT_IN_PLACE)"
+assert_eq "nothing reported removed" no "$(has REMOVED_WORKTREE)"
+assert_eq "nothing reported deleted" no "$(has DELETED_BRANCH)"
+assert_eq "worktree survives" yes "$(exists "$WT/notes.md")"
+assert_eq "branch survives" yes "$(has_branch feat/s)"
+finish
+
+# The merged check runs before anything is touched, so the refusal leaves the
+# worktree whole instead of half-cleaned. It judges against what the main
+# checkout has checked out, which is where merge-local leaves the base.
+begin "cleanup: unmerged branch refuses before removing"
+new_feature
+cleanup_in "$REPO" "$WT" feat/w
+assert_eq "exit" 1 "$RC"
+assert_contains "REFUSED" "not merged" "$(kv REFUSED)"
+assert_eq "nothing reported removed" no "$(has REMOVED_WORKTREE)"
+assert_eq "worktree survives" yes "$(exists "$WT")"
+assert_eq "branch survives" yes "$(has_branch feat/w)"
+new_feature
+park_main
+g -C "$REPO" branch -f main feat/w || die "advance main to feat/w"
+cleanup_in "$REPO" "$WT" feat/w
+assert_eq "merged into main but main checkout is elsewhere: exit" 1 "$RC"
+assert_contains "merged elsewhere: REFUSED" "not merged" "$(kv REFUSED)"
+assert_eq "merged elsewhere: worktree survives" yes "$(exists "$WT")"
+assert_eq "merged elsewhere: branch survives" yes "$(has_branch feat/w)"
+finish
+
+begin "cleanup --discard --confirm discard: force-deletes unmerged branch"
+new_feature
+cleanup_in "$REPO" "$WT" feat/w --discard --confirm discard
+assert_eq "exit" 0 "$RC"
+assert_eq "REMOVED_WORKTREE" "$WT" "$(kv REMOVED_WORKTREE)"
+assert_eq "DELETED_BRANCH" feat/w "$(kv DELETED_BRANCH)"
+assert_eq "worktree directory gone" no "$(exists "$WT")"
+assert_eq "branch gone" no "$(has_branch feat/w)"
+assert_eq "the work never reached main" no "$(exists "$REPO/feature.txt")"
+finish
+
+# The ritual is the typed word, not the flag.
+begin "cleanup --discard without confirm refuses"
+new_feature
+cleanup_in "$REPO" "$WT" feat/w --discard
+assert_eq "no --confirm: exit" 2 "$RC"
+assert_contains "no --confirm: REFUSED" "--confirm discard" "$(kv REFUSED)"
+cleanup_in "$REPO" "$WT" feat/w --discard --confirm yes
+assert_eq "wrong word: exit" 2 "$RC"
+assert_contains "wrong word: REFUSED" "--confirm discard" "$(kv REFUSED)"
+assert_eq "worktree survives" yes "$(exists "$WT")"
+assert_eq "branch survives" yes "$(has_branch feat/w)"
+finish
+
+begin "cleanup: branch mismatch refuses"
+new_feature
+land_feature
+g -C "$REPO" branch feat/other || die "branch feat/other"
+cleanup_in "$REPO" "$WT" feat/other
+assert_eq "wrong branch: exit" 2 "$RC"
+assert_contains "wrong branch: REFUSED" "feat/w" "$(kv REFUSED)"
+assert_eq "wrong branch: worktree survives" yes "$(exists "$WT")"
+assert_eq "wrong branch: feat/w survives" yes "$(has_branch feat/w)"
+assert_eq "wrong branch: feat/other survives" yes "$(has_branch feat/other)"
+add_wt repo/.worktrees/d --detach
+cleanup_in "$REPO" "$WT" feat/w
+assert_eq "detached worktree: exit" 2 "$RC"
+assert_contains "detached worktree: REFUSED" "detached" "$(kv REFUSED)"
+assert_eq "detached worktree: survives" yes "$(exists "$WT")"
+finish
+
+# Removal deletes ignored files (.env, node_modules/) without a word. The script
+# lists them before it removes anything, so the report names what is now gone.
+begin "cleanup: ignored files are reported"
+new_feature
+commit_file "$WT" .gitignore $'.env\nnode_modules/' "ignore local files"
+land_feature
+printf 'SECRET=1\n' >"$WT/.env"
+mkdir "$WT/node_modules"
+printf 'x\n' >"$WT/node_modules/pkg.js"
+cleanup_in "$REPO" "$WT" feat/w
+assert_eq "exit" 0 "$RC"
+assert_eq "IGNORED, one per entry" ".env"$'\n'"node_modules/" "$(kv IGNORED)"
+assert_eq "IGNORED precedes REMOVED_WORKTREE" "IGNORED,IGNORED,REMOVED_WORKTREE,DELETED_BRANCH" \
+  "$(sed 's/=.*//' <<<"$OUT" | paste -sd, -)"
+assert_eq "worktree directory gone" no "$(exists "$WT")"
+assert_eq "branch gone" no "$(has_branch feat/w)"
+finish
+
+# Without ignored files, no IGNORED line.
+begin "cleanup: clean worktree reports nothing ignored"
+new_feature
+land_feature
+cleanup_in "$REPO" "$WT" feat/w
+assert_eq "exit" 0 "$RC"
+assert_eq "DELETED_BRANCH" feat/w "$(kv DELETED_BRANCH)"
+assert_eq "IGNORED absent" no "$(has IGNORED)"
+finish
+
+# No worktree to remove: the main checkout stays, only the branch goes.
+begin "cleanup: main checkout path deletes only the branch"
+new_repo
+commit_file "$REPO" tracked.txt base "add tracked"
+g -C "$REPO" checkout -q -b feat/x || die "checkout feat/x"
+commit_file "$REPO" feature.txt feature "add feature"
+g -C "$REPO" checkout -q main || die "checkout main"
+cleanup_in "$REPO" "$REPO" feat/x
+assert_eq "unmerged: exit" 1 "$RC"
+assert_contains "unmerged: REFUSED" "not merged" "$(kv REFUSED)"
+assert_eq "unmerged: branch survives" yes "$(has_branch feat/x)"
+g -C "$REPO" merge -q --ff-only feat/x || die "merge feat/x"
+printf 'scratch\n' >"$REPO/scratch.txt"
+cleanup_in "$REPO" "$REPO" feat/x
+assert_eq "merged: exit" 0 "$RC"
+assert_eq "merged: DELETED_BRANCH" feat/x "$(kv DELETED_BRANCH)"
+assert_eq "merged: no REMOVED_WORKTREE" no "$(has REMOVED_WORKTREE)"
+assert_eq "merged: branch gone" no "$(has_branch feat/x)"
+assert_eq "merged: main checkout intact" yes "$(exists "$REPO/tracked.txt")"
+assert_eq "merged: untracked file there is not touched" yes "$(exists "$REPO/scratch.txt")"
+finish
+
+# git will not delete the branch a checkout holds. The refusal says the branch
+# was kept.
+begin "cleanup: branch checked out in the main checkout refuses"
+new_repo
+g -C "$REPO" checkout -q -b feat/x || die "checkout feat/x"
+cleanup_in "$REPO" "$REPO" feat/x
+assert_eq "exit" 1 "$RC"
+assert_eq "KEPT_BRANCH" feat/x "$(kv KEPT_BRANCH)"
+assert_eq "no DELETED_BRANCH" no "$(has DELETED_BRANCH)"
+assert_eq "branch survives" yes "$(has_branch feat/x)"
+finish
+
+begin "cleanup --discard --confirm discard: force-deletes in the main checkout too"
+new_repo
+g -C "$REPO" checkout -q -b feat/x || die "checkout feat/x"
+commit_file "$REPO" feature.txt feature "add feature"
+g -C "$REPO" checkout -q main || die "checkout main"
+cleanup_in "$REPO" "$REPO" feat/x --discard --confirm discard
+assert_eq "exit" 0 "$RC"
+assert_eq "DELETED_BRANCH" feat/x "$(kv DELETED_BRANCH)"
+assert_eq "branch gone" no "$(has_branch feat/x)"
+finish
+
+# The path has to be a worktree of the repository the caller stands in. A plain
+# directory, a missing one, another repository's worktree, or a subdirectory of
+# a worktree is not.
+begin "cleanup: path must be a worktree of this repository"
+new_feature
+land_feature
+mkdir -p "$SB/plain" "$WT/sub"
+cleanup_in "$REPO" "$SB/plain" feat/w
+assert_eq "plain directory: exit" 2 "$RC"
+assert_contains "plain directory: REFUSED" "not a worktree" "$(kv REFUSED)"
+cleanup_in "$REPO" "$SB/missing" feat/w
+assert_eq "missing path: exit" 2 "$RC"
+assert_contains "missing path: REFUSED" "not a worktree" "$(kv REFUSED)"
+cleanup_in "$REPO" "$WT/sub" feat/w
+assert_eq "subdirectory of a worktree: exit" 2 "$RC"
+assert_contains "subdirectory: REFUSED" "not a worktree" "$(kv REFUSED)"
+g init -q "$SB/other" || die "git init other"
+commit "$SB/other" "other init"
+cleanup_in "$REPO" "$SB/other" main
+assert_eq "other repository: exit" 2 "$RC"
+assert_contains "other repository: REFUSED" "not a worktree" "$(kv REFUSED)"
+assert_eq "worktree survives" yes "$(exists "$WT")"
+assert_eq "branch survives" yes "$(has_branch feat/w)"
+assert_eq "other repository intact" yes "$(exists "$SB/other/.git")"
+finish
+
+begin "cleanup: usage errors exit 2"
+new_feature
+land_feature
+cleanup_usage() { # <label> <args...> — expect exit 2, usage on stderr, nothing on stdout
+  local label="$1"
+  shift
+  cleanup_in "$REPO" "$@"
+  assert_eq "$label: exit" 2 "$RC"
+  assert_eq "$label: stdout" "" "$OUT"
+  assert_contains "$label: stderr" "cleanup <worktree-path> <branch>" "$ERR"
+}
+cleanup_usage "no args"
+cleanup_usage "no branch" "$WT"
+cleanup_usage "option-like path" -x feat/w
+cleanup_usage "option-like branch" "$WT" -x
+cleanup_usage "unknown flag" "$WT" feat/w --bogus
+cleanup_usage "--confirm without a value" "$WT" feat/w --discard --confirm
+cleanup_usage "--confirm without --discard" "$WT" feat/w --confirm discard
+mkdir -p "$TMP/notrepo"
+cleanup_in "$TMP/notrepo" "$WT" feat/w
+assert_eq "outside a repo: exit" 2 "$RC"
+assert_contains "outside a repo: stderr" "inside a git repository" "$ERR"
+assert_eq "worktree survives" yes "$(exists "$WT")"
+assert_eq "branch survives" yes "$(has_branch feat/w)"
 finish
 
 # ── Summary ───────────────────────────────────────────────────────────────────

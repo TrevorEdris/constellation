@@ -15,9 +15,17 @@
 # locally without the user's approval, so the script both runs the steps and
 # checks the approval.
 #
+# cleanup exists because removal goes wrong in order-sensitive ways too: git
+# will not delete a branch while a worktree holds it, removing the directory
+# the shell stands in strands the shell, git's own force flag deletes files the
+# user never committed, and a plain removal silently deletes ignored files
+# (.env, node_modules/). The script checks each of these before it removes
+# anything and never forces.
+#
 # Usage:
 #   workspace.sh detect [<base>]
 #   workspace.sh merge-local <base> <branch> [--plan <PLAN.md>] -- <test command...>
+#   workspace.sh cleanup <worktree-path> <branch> [--discard --confirm discard]
 #
 # detect
 #   Run it inside the workspace, before any `cd`. Prints these lines, always all
@@ -76,22 +84,61 @@
 #   The branch and any worktree are never touched. Git's own output and the test
 #   command's output go to stderr so stdout stays KEY=value lines.
 #
-# Other keys printed by merge-local, one per line:
+# cleanup
+#   Remove a finished worktree, then delete its branch. Run it from the main
+#   checkout (or anywhere outside <worktree-path>), after merge-local or after
+#   the pull request merged. Steps, in order:
+#     1. <worktree-path> must be a worktree of the repository you stand in
+#        (the top of one, not a subdirectory), else exit 2. Detect the workspace
+#        from inside it, as detect does.
+#     2. A linked worktree must be on <branch>, else exit 2. If detect says
+#        CLEANUP=host (a harness or IDE owns it) print LEFT_IN_PLACE= and exit
+#        0 without inspecting or touching anything.
+#     3. <path> that is the main checkout skips the worktree steps; only the
+#        branch is deleted. Any other path must not contain the current
+#        directory: REFUSED=cd <MAIN_ROOT> first, exit 2.
+#     4. --discard needs --confirm discard; the typed word is the ritual that
+#        permits force-deleting an unmerged branch. Without --discard the
+#        branch must already be an ancestor of the main checkout's HEAD, else
+#        exit 1 before anything is touched.
+#     5. Uncommitted files in the worktree (tracked changes and every untracked
+#        file) -> BLOCKING= lines, exit 3, nothing removed. --discard does not
+#        override this: it concerns the branch, not the files.
+#     6. Print IGNORED= for each ignored path (.env, node_modules/): removing the
+#        worktree deletes them, so the report must name them first.
+#     7. `worktree remove` (never forced), `worktree prune`, then `branch -d`
+#        (`-D` with --discard --confirm discard). The worktree goes first
+#        because git refuses to delete a branch a worktree has checked out.
+#   Git's own output goes to stderr so stdout stays KEY=value lines.
+#
+# Other keys printed by merge-local and cleanup, one per line:
 #     PREVIOUS_BRANCH=  branch MAIN_ROOT was on before the checkout
-#     BLOCKING=         one porcelain status line per changed tracked file
+#     BLOCKING=         one porcelain status line per file that blocks: changed
+#                       tracked files (merge-local); those plus every untracked
+#                       file (cleanup)
 #     REFUSED=          why it stopped
 #     UNDO=             `git -C <MAIN_ROOT> reset --merge <sha>`
 #     KEPT_BRANCH=      <branch>, kept because the merged result failed
+#                       (merge-local) or git would not delete it (cleanup)
 #     MERGED=           the sha <base> points at after a good merge
+#     IGNORED=          one ignored path in the worktree about to be removed
+#     REMOVED_WORKTREE= the worktree path, once git has removed it
+#     DELETED_BRANCH=   <branch>, once deleted
+#     LEFT_IN_PLACE=    the worktree path, when the host owns it
 #
 # Output goes to stdout as KEY=value lines; problems go to stderr.
 #
 # Exit codes:
 #   0  - Done
-#   1  - A git step failed or was refused (checkout, pull, merge)
+#   1  - A git step failed or was refused (checkout, pull, merge, worktree
+#        remove, branch delete), or cleanup's branch is not merged
 #   2  - Usage error, or a precondition failed: outside a git work tree, no
-#        provable main checkout, <base> or <branch> not a local branch
-#   3  - Uncommitted changes to tracked files block the merge
+#        provable main checkout, <base> or <branch> not a local branch,
+#        cleanup's path not a worktree of this repository or on another branch,
+#        run from inside the worktree to remove, --discard without its
+#        confirmation
+#   3  - Uncommitted files block: tracked changes block the merge; any
+#        uncommitted file, untracked ones included, blocks the removal
 #   4  - PR-based repo and no approved local-only plan: push and open a PR instead
 #   5  - The merged result fails its tests (the merge stays; run UNDO= to undo it)
 #
@@ -104,6 +151,7 @@ set -uo pipefail
 usage() {
   echo "Usage: workspace.sh detect [<base>]"
   echo "       workspace.sh merge-local <base> <branch> [--plan <PLAN.md>] -- <test command...>"
+  echo "       workspace.sh cleanup <worktree-path> <branch> [--discard --confirm discard]"
 }
 
 usage_exit() {
@@ -478,6 +526,159 @@ cmd_merge_local() {
   echo "MERGED=$(git -C "$main_root" rev-parse HEAD)"
 }
 
+cmd_cleanup() {
+  [ $# -ge 2 ] || usage_exit
+  local path="$1" branch="$2" discard=0 confirm=""
+  shift 2
+  case "$path" in
+    "" | -*) usage_exit ;;
+  esac
+  case "$branch" in
+    "" | -*) usage_exit ;;
+  esac
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --discard)
+        discard=1
+        shift
+        ;;
+      --confirm)
+        [ $# -ge 2 ] || usage_exit
+        confirm="$2"
+        shift 2
+        ;;
+      *) usage_exit ;;
+    esac
+  done
+  if [ "$discard" -eq 0 ] && [ -n "$confirm" ]; then
+    usage_exit
+  fi
+
+  # The path must be a worktree of the repository the caller stands in. Asking
+  # this repository for its worktree list settles that: another repository's
+  # directory, a plain directory and a subdirectory of a worktree are not in it.
+  local listed
+  if ! listed="$(git worktree list --porcelain 2>/dev/null)"; then
+    echo "workspace.sh: cleanup must run inside a git repository" >&2
+    exit 2
+  fi
+  local wt line listed_path found=0
+  if wt="$(canon "$path")"; then
+    while IFS= read -r line; do
+      case "$line" in
+        "worktree "*)
+          listed_path="$(canon "${line#worktree }")" || continue
+          if [ "$listed_path" = "$wt" ]; then
+            found=1
+            break
+          fi
+          ;;
+      esac
+    done <<<"$listed"
+  fi
+  if [ "$found" -eq 0 ]; then
+    echo "REFUSED=$path is not a worktree of this repository"
+    exit 2
+  fi
+
+  local detected isolation wt_branch main_root cleanup_mode
+  detected="$(cd "$wt" && cmd_detect)" || exit 2
+  isolation="$(field ISOLATION "$detected")"
+  wt_branch="$(field BRANCH "$detected")"
+  main_root="$(field MAIN_ROOT "$detected")"
+  cleanup_mode="$(field CLEANUP "$detected")"
+
+  if [ "$isolation" = worktree ]; then
+    if [ "$wt_branch" != "$branch" ]; then
+      echo "REFUSED=$wt is on ${wt_branch:-a detached HEAD}, not $branch"
+      exit 2
+    fi
+    # Whoever placed this worktree removes it. Leave it and its branch alone,
+    # whatever state they are in.
+    if [ "$cleanup_mode" = host ]; then
+      echo "LEFT_IN_PLACE=$wt"
+      exit 0
+    fi
+  fi
+
+  if ! git -C "$main_root" show-ref --verify --quiet "refs/heads/$branch"; then
+    echo "REFUSED=$branch is not a local branch"
+    exit 2
+  fi
+
+  # Deleting the directory the caller stands in strands the caller.
+  local here
+  if [ "$wt" != "$main_root" ]; then
+    here="$(pwd -P)" || here=""
+    case "$here/" in
+      "$wt"/*)
+        echo "REFUSED=cd $main_root first"
+        exit 2
+        ;;
+    esac
+  fi
+
+  # The typed word is the ritual that permits force-deleting an unmerged branch.
+  if [ "$discard" -eq 1 ] && [ "$confirm" != discard ]; then
+    echo "REFUSED=--discard force-deletes the branch; it needs --confirm discard"
+    exit 2
+  fi
+
+  # Judged before anything is removed, so a refusal leaves the worktree whole.
+  if [ "$discard" -eq 0 ] \
+    && ! git -C "$main_root" merge-base --is-ancestor "refs/heads/$branch" HEAD; then
+    echo "REFUSED=$branch is not merged into the HEAD of $main_root; nothing was removed"
+    exit 1
+  fi
+
+  if [ "$wt" != "$main_root" ]; then
+    local dirty ignored
+    if ! dirty="$(git -C "$wt" status --porcelain -uall)"; then
+      echo "REFUSED=cannot read the status of $wt"
+      exit 1
+    fi
+    if [ -n "$dirty" ]; then
+      while IFS= read -r line; do
+        echo "BLOCKING=$line"
+      done <<<"$dirty"
+      echo "REFUSED=$wt has uncommitted files; nothing was removed"
+      exit 3
+    fi
+
+    # Removal deletes these without a word; name them while they still exist.
+    if ! ignored="$(git -C "$wt" status --porcelain --ignored)"; then
+      echo "REFUSED=cannot read the ignored files of $wt"
+      exit 1
+    fi
+    while IFS= read -r line; do
+      case "$line" in
+        '!! '*) echo "IGNORED=${line#'!! '}" ;;
+      esac
+    done <<<"$ignored"
+
+    # Never overridden: when git refuses, the user decides what happens next.
+    if ! git -C "$main_root" worktree remove "$wt" >&2; then
+      echo "REFUSED=git refused to remove $wt; leave it and tell the user"
+      exit 1
+    fi
+    echo "REMOVED_WORKTREE=$wt"
+    if ! git -C "$main_root" worktree prune >&2; then
+      echo "REFUSED=git worktree prune failed; $wt is already removed"
+      echo "KEPT_BRANCH=$branch"
+      exit 1
+    fi
+  fi
+
+  local delete_flag=-d
+  [ "$discard" -eq 0 ] || delete_flag=-D
+  if ! git -C "$main_root" branch "$delete_flag" -- "$branch" >&2; then
+    echo "REFUSED=git refused to delete branch $branch"
+    echo "KEPT_BRANCH=$branch"
+    exit 1
+  fi
+  echo "DELETED_BRANCH=$branch"
+}
+
 case "${1:-}" in
   detect)
     shift
@@ -486,6 +687,10 @@ case "${1:-}" in
   merge-local)
     shift
     cmd_merge_local "$@"
+    ;;
+  cleanup)
+    shift
+    cmd_cleanup "$@"
     ;;
   "")
     usage >&2
