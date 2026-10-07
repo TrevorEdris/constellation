@@ -120,18 +120,25 @@ def test_frontmatter_missing_description_and_name_mismatch(tmp_path):
 def test_section_sign_reports_line(tmp_path):
     root = make_tree(tmp_path)
     (root / "docs").mkdir()
-    # Two signs on line 2 still yield a single violation for that line.
-    body = f"clean line\ntwo {SECTION_SIGN} signs {SECTION_SIGN} here\nclean line\n"
+    # Two signs on line 2 still yield a single violation for that line; line 4
+    # holds its own, so the rule is one violation per offending line, not per file.
+    body = (
+        "clean line\n"
+        f"two {SECTION_SIGN} signs {SECTION_SIGN} here\n"
+        "clean line\n"
+        f"another {SECTION_SIGN} here\n"
+    )
     (root / "docs" / "x.md").write_text(body, encoding="utf-8")
 
     proc = run(root, "--check")
     lines = check_lines(proc)
     assert proc.returncode == 1
     hits = [ln for ln in lines if ln.startswith("docs/x.md:")]
-    assert len(hits) == 1, lines
+    assert len(hits) == 2, lines
     assert hits[0].startswith("docs/x.md:2: section-sign:"), hits[0]
+    assert hits[1].startswith("docs/x.md:4: section-sign:"), hits[1]
     assert SECTION_SIGN not in proc.stdout
-    assert lines[-1] == "LINT FAILED (1)"
+    assert lines[-1] == "LINT FAILED (2)"
 
 
 def test_failures_sorted_and_counted(tmp_path):
