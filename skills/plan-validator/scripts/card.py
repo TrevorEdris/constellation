@@ -54,6 +54,7 @@ from typing import Callable, NamedTuple, Optional
 
 from validate_plan import (
     CARD_PAST_APPROVAL_STATUSES,
+    NEEDS_LABEL,
     SHIPS_LABEL,
     Card,
     DLine,
@@ -569,10 +570,16 @@ def _bold_answer(text: str, is_run: bool, answer: str) -> str:
 
     The card reads `->` as `→`, so the line is matched in that form, but only the bold is rewritten: a `->`
     anywhere on the line, the card's own arrow included, is left as written. Trailing spaces stay.
+
+    The validator accepts the question on the `**Needs your call:**` line itself, after the label and any spaces,
+    so the line is matched from there and the label stays as written.
     """
     core = text.rstrip()
     shown = core.replace("->", "→")
-    match = (_RUN_RE if is_run else _QUESTION_RE).match(shown)
+    head = len(NEEDS_LABEL) if shown.startswith(NEEDS_LABEL) else 0
+    if head:
+        head = len(shown) - len(shown[head:].lstrip())
+    match = (_RUN_RE if is_run else _QUESTION_RE).match(shown[head:])
     group = 2 if is_run else 3
     # shown is core with each `->` one character shorter: raw[i] is where shown[i] starts in core
     raw = []
@@ -581,7 +588,7 @@ def _bold_answer(text: str, is_run: bool, answer: str) -> str:
         raw.append(at)
         at += 2 if core.startswith("->", at) else 1
     raw.append(len(core))
-    start, end = raw[match.start(group)], raw[match.end(group)]
+    start, end = raw[head + match.start(group)], raw[head + match.end(group)]
     return f"{core[:start]}{_ANSWER_PREFIX}{answer}{core[end:]}{text[len(core) :]}"
 
 

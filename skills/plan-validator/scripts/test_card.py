@@ -778,10 +778,10 @@ LOGGED_RE = re.compile(r"\*\*(\d{4}-\d{2}-\d{2})\*\* — (?=Approved|Change requ
 
 
 def _you(line: str, answer: str) -> str:
-    """line with its [ask] tag or its **bold** default replaced by the user's answer."""
+    """line with its [ask] tag or its **bold** default (the bold after the card's arrow) replaced by the user's answer."""
     if "[ask]" in line:
         return line.replace("[ask]", f"[you: {answer}]")
-    return re.sub(r"\*\*(.+?)\*\*", lambda m: f"**you: {answer}**", line, count=1)
+    return re.sub(r"(?<=[→>] )\*\*(.+?)\*\*", lambda m: f"**you: {answer}**", line, count=1)
 
 
 def _awaiting(tmp_path, **replace) -> Path:
@@ -1035,6 +1035,43 @@ def test_an_answer_rewrites_only_the_bold_not_a_nearby_arrow(tmp_path, edits, re
     assert vp.validate_plan(plan).passed
 
 
+NEEDS = "**Needs your call:**"
+Q1 = "1. Share links expire? → **after 30 days** (limits leaked links; if wrong: one config value)\n"
+
+
+@pytest.mark.parametrize(
+    ("edits", "line"),
+    [
+        # The validator reads a question that follows the label on its own line, and render accepts the plan,
+        # so approve has to find the question there too
+        ({f"{NEEDS}\n1.": f"{NEEDS} 1."}, f"{NEEDS} {Q1}"),
+        # the validator skips any spaces after the label; so does approve
+        ({f"{NEEDS}\n1.": f"{NEEDS}   1."}, f"{NEEDS}   {Q1}"),
+        # a `->` is one character shorter in the text the validator matches than on the line, label or not
+        ({f"{NEEDS}\n1. Share links expire? →": f"{NEEDS} 1. Share links expire? ->"}, f"{NEEDS} {Q1.replace('? →', '? ->')}"),
+    ],
+)
+def test_an_answer_to_a_question_on_the_label_line_rewrites_only_its_bold(tmp_path, edits, line):
+    plan = _awaiting(tmp_path, **edits)
+    before = plan.read_bytes()
+    assert line.encode() in before, "the scenario's question line is in the plan as written"
+
+    (out, code), _ = _decide(plan, "1 after 7 days, go", _session(tmp_path))
+
+    assert code == 0, out
+    # The label's own bold is not the answer: only the bold after the arrow changes
+    assert _changed(before, plan.read_bytes()) == [
+        (STATUS_AWAITING, STATUS_APPROVED),
+        (line, _you(line, "after 7 days")),
+        (D1_ASK, _you(D1_ASK, "after 7 days")),
+        (D2_ASK, _you(D2_ASK, "no")),
+    ]
+    assert _you(line, "after 7 days").startswith(NEEDS), "the scenario keeps its label"
+    answered = [(q.n, q.default) for q in _plan_card(plan).questions if q.answered]
+    assert answered == [(1, "after 7 days")], "the validator still reads the rewritten line as an answered question"
+    assert vp.validate_plan(plan).passed
+
+
 def test_approve_sha_matches_render_footer(tmp_path):
     plan = v3_plan(tmp_path)
     rendered, _, _ = card.render(plan)
@@ -1114,6 +1151,22 @@ def test_log_is_verbatim_multiline(tmp_path):
 
     assert code == 0
     assert b'  > go, "ok"\n  >   thanks  \n' in session.read_bytes(), "quotes, the newline and both lines' spaces are as typed"
+
+
+@pytest.mark.skipif(not hasattr(time, "tzset"), reason="needs time.tzset")
+@pytest.mark.parametrize("zone", ["Pacific/Kiritimati", "Pacific/Pago_Pago"])
+def test_log_date_is_local_date(tmp_path, local_tz, zone):
+    # The two zones are 25 hours apart, so UTC cannot match both: a UTC date fails in at least one of them, at any hour
+    local_tz(zone)
+    plan = _awaiting(tmp_path)
+    session = _session(tmp_path)
+
+    (out, code), days = _decide(plan, "go", session)
+
+    assert code == 0, out
+    logged = set(LOGGED_RE.findall(session.read_text(encoding="utf-8")))
+    assert logged, "the approval is logged with a date"
+    assert logged <= days, f"entry dated {logged}; the local date in {zone} is {days}"
 
 
 def test_reply_via_quoted_heredoc_is_verbatim(tmp_path):
