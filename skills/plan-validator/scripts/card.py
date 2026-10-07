@@ -33,8 +33,9 @@ logs the reply, verbatim, under `## Decisions` in SESSION.md, and acts on it:
 
 Exit codes:
     0  - render: the card was printed (or the plan needs no approval); approve: the plan is approved
-    1  - the plan is invalid, legacy or not ready for approval, or a file cannot be read or written:
-         the reasons are on stderr
+    1  - the plan is invalid, legacy or not ready for approval, approving would leave a plan that
+         no longer validates (an answer with a step number, "remote checked" or "local only" in it),
+         or a file cannot be read or written: the reasons are on stderr
     2  - approve: the reply asks for a change; the plan is untouched
     3  - approve: the reply is unclear; the plan is untouched and the user is asked to confirm
     64 - usage error
@@ -564,15 +565,24 @@ def _edit_line(lines: list[str], line_no: int, edit: Callable[..., str], *args) 
 
 
 def _bold_answer(text: str, is_run: bool, answer: str) -> str:
-    """A numbered card line with its bold default replaced by `you: <answer>`.
+    """A numbered card line with its bold default replaced by `you: <answer>`; every other byte of the line stays.
 
-    Trailing spaces stay. A `->` on the line is written `→`, which is how the card reads it anyway.
+    The card reads `->` as `→`, so the line is matched in that form, but only the bold is rewritten: a `->`
+    anywhere on the line, the card's own arrow included, is left as written. Trailing spaces stay.
     """
     core = text.rstrip()
     shown = core.replace("->", "→")
     match = (_RUN_RE if is_run else _QUESTION_RE).match(shown)
     group = 2 if is_run else 3
-    return f"{shown[: match.start(group)]}{_ANSWER_PREFIX}{answer}{shown[match.end(group) :]}{text[len(core) :]}"
+    # shown is core with each `->` one character shorter: raw[i] is where shown[i] starts in core
+    raw = []
+    at = 0
+    while at < len(core):
+        raw.append(at)
+        at += 2 if core.startswith("->", at) else 1
+    raw.append(len(core))
+    start, end = raw[match.start(group)], raw[match.end(group)]
+    return f"{core[:start]}{_ANSWER_PREFIX}{answer}{core[end:]}{text[len(core) :]}"
 
 
 def _retag(text: str, value: str) -> str:
@@ -616,6 +626,38 @@ def _approved_plan(raw: str, card: Card, dlines: dict[str, DLine], answers: dict
             continue
         _edit_line(lines, dline.line, _retag, value)
     return _with_status("".join(lines), APPROVED_STATUS)
+
+
+def _answer_problems(before: ValidationReport, approved_text: str) -> str:
+    """Why the plan with the user's answers written in no longer validates: whole lines for stderr, "" when it still does.
+
+    An answer is the user's own words, and it lands in the Brief and in a D-line, where the validator has rules
+    about wording: a step number, "remote checked" or "local only" is rejected wherever it appears. So the
+    approved text is validated before anything is written (R1: an approved plan still validates). The delivery
+    repos are not probed again: `before`, the report that let the card through, has just read them.
+
+    `before` passed, so every error in the result is the answers' doing. With no error, the score has fallen
+    below the PASS line, and the warnings `before` did not have are the cause. OSError when the text cannot be checked.
+    """
+    with tempfile.TemporaryDirectory(prefix="card-check-") as scratch:
+        candidate = Path(scratch) / "PLAN.md"
+        with open(candidate, "w", encoding="utf-8", newline="") as fh:
+            fh.write(approved_text)
+        after = validate_plan(candidate, probe=False)
+    if after.passed:
+        return ""
+    if after.errors:
+        found = "".join(_finding("ERROR", issue) for issue in after.errors)
+    else:
+        known = {(issue.category, issue.message, issue.line) for issue in before.warnings}
+        found = f"ERROR [score] validator score would fall from {before.score} to {after.score}/100, below 70 (NEEDS WORK)\n"
+        found += "".join(
+            _finding("WARN", issue) for issue in after.warnings if (issue.category, issue.message, issue.line) not in known
+        )
+    return (
+        "ERROR [answer] approving this reply would leave a plan that no longer validates, so nothing was written. "
+        f"Ask the user to reword their answer:\n{found}"
+    )
 
 
 def _decision_entry(kind: str, sha7: str, plan: str, answers: dict[int, str], reply: str) -> str:
@@ -662,7 +704,10 @@ def approve(path, reply: str, session_md) -> tuple[str, int]:
 
     Refused (1), with nothing written, when SESSION.md is not a file, the plan is invalid,
     legacy or below PASS (the delivery repos are probed again, as render does), or its status
-    is not awaiting-approval (a draft is told to render the card first).
+    is not awaiting-approval (a draft is told to render the card first). Also refused, with nothing
+    written (the reply is not logged), when approving would leave a plan that no longer validates:
+    an answer that holds a step number, "remote checked" or "local only" is the usual cause, and the
+    findings say which line (the plan with the answers in it is validated before any write).
 
     Otherwise the card's sha7 is taken from the Brief as it stands, the reply is classified and
     its Run answer checked, and the reply is logged under `## Decisions` in SESSION.md:
@@ -707,8 +752,13 @@ def approve(path, reply: str, session_md) -> tuple[str, int]:
     if kind == APPROVE:
         try:
             new_plan = _approved_plan(loaded.raw, card, parse_dlines(lines), answers)
+            problems = _answer_problems(loaded.report, new_plan)
         except ValueError as exc:
             return str(exc), EXIT_REFUSED
+        except OSError as exc:
+            return f"ERROR [io] Cannot check the approved plan before writing it: {_why(exc)}\n", EXIT_REFUSED
+        if problems:
+            return problems, EXIT_REFUSED
 
     try:
         write_atomic(session, new_session)

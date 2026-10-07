@@ -923,6 +923,118 @@ def test_approved_plan_still_validates(tmp_path):
     assert card.render(plan) == (f'"{TITLE}" is approved; no approval needed.\n', "", 0)
 
 
+@pytest.mark.parametrize(
+    ("reply", "category", "message", "lines"),
+    [
+        # Each answer is a clean numbered answer to the classifier; the plan it would leave breaks one validator rule
+        ("1 see step 3, go", "card", "Brief must be plain language: no step numbers.", 1),
+        ("1 remote checked, go", "card", "Brief must not contain 'remote checked'", 1),
+        ("2 local only, go", "delivery", "The plan says 'local only' but no delivery has mode: local-only", 2),
+    ],
+)
+def test_an_answer_that_leaves_an_invalid_plan_is_refused(tmp_path, reply, category, message, lines):
+    # R1: whatever the user answers, the approved plan must still validate. The answers are the user's own words,
+    # so a phrase the validator rejects (a step number, "remote checked", "local only") is caught here, before any write
+    plan = _awaiting(tmp_path)
+    session = _session(tmp_path)
+    plan_before, session_before = plan.read_bytes(), session.read_bytes()
+    assert card.classify_reply(reply, 3, plan).kind == "approve", "the classifier alone cannot see the problem"
+
+    out, code = card.approve(plan, reply, session)
+
+    assert code == 1
+    header, *found = out.splitlines()
+    assert header.startswith("ERROR [answer] ") and "no longer validates" in header and "nothing was written" in header, out
+    assert len(found) == lines and all(f"ERROR [{category}] line " in line and message in line for line in found), out
+    assert (plan.read_bytes(), session.read_bytes()) == (plan_before, session_before)
+    assert sorted(os.listdir(tmp_path)) == ["PLAN.md", "SESSION.md", "repo"], "no temp file is left behind"
+    # A plain answer to the same question goes through
+    assert card.approve(plan, "1 after 7 days, 2 yes, go", session)[1] == 0
+    assert vp.validate_plan(plan).passed
+
+
+
+def test_an_answer_that_drops_the_score_below_pass_is_refused(tmp_path):
+    # "Still validates" means a pass, not just no errors: here a plan at 71 takes "as needed" twice (Brief and D-line)
+    # and loses 4 points to the vague-language cap, with no error anywhere
+    fixture = (FIXTURES / "v3-valid-PLAN.md").read_text(encoding="utf-8")
+
+    def section(title):
+        start = fixture.index(f"## {title}\n")
+        end = fixture.find("\n## ", start)
+        return fixture[start : end + 1 if end != -1 else None]
+
+    edits = {section(title): "" for title in ("Estimated PR size", "Risks & assumptions", "Traceability", "Git strategy")}
+    edits["will not be built here."] = "will not be built here, probably, somehow, etc."
+    plan = _awaiting(tmp_path, **edits)
+    before = vp.validate_plan(plan)
+    assert (before.score, before.errors) == (71, []), "the scenario no longer sits just above the PASS line"
+    session = _session(tmp_path)
+    plan_before, session_before = plan.read_bytes(), session.read_bytes()
+
+    out, code = card.approve(plan, "1 as needed, go", session)
+
+    assert code == 1
+    header, score, *new = out.splitlines()
+    assert header.startswith("ERROR [answer] ") and "no longer validates" in header, out
+    assert score == "ERROR [score] validator score would fall from 71 to 67/100, below 70 (NEEDS WORK)"
+    plan_lines = plan.read_text(encoding="utf-8").splitlines()
+    answered = [next(n for n, text in enumerate(plan_lines, 1) if text.startswith(start)) for start in ("1. ", "- D1 ")]
+    assert [line.split(": ")[0] for line in new] == [f"WARN [vagueness] line {n}" for n in answered], "only the new findings"
+    assert all(line.endswith('Vague language: "as needed"') for line in new), out
+    assert (plan.read_bytes(), session.read_bytes()) == (plan_before, session_before)
+    assert card.approve(plan, "1 after 7 days, go", session)[1] == 0
+
+
+def test_approve_refuses_when_the_approved_plan_cannot_be_checked(tmp_path, monkeypatch):
+    plan = _awaiting(tmp_path)
+    session = _session(tmp_path)
+    plan_before, session_before = plan.read_bytes(), session.read_bytes()
+
+    def no_space(*args, **kwargs):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(card.tempfile, "TemporaryDirectory", no_space)
+
+    out, code = card.approve(plan, "go", session)
+
+    assert (out, code) == ("ERROR [io] Cannot check the approved plan before writing it: No space left on device\n", 1)
+    assert (plan.read_bytes(), session.read_bytes()) == (plan_before, session_before)
+
+
+@pytest.mark.parametrize(
+    ("edits", "reply", "line", "answer"),
+    [
+        # a `->` inside the line, ahead of the bold, stays as written
+        ({"(protects the surprise invariant;": "(protects a -> b invariant;"}, "2 no, go", Q2.replace("the surprise", "a -> b"), "no"),
+        # a `->` after the bold stays too
+        ({"(5 independent tasks;": "(5 -> independent tasks;"}, "3 inline, go", Q3.replace("5 independent", "5 -> independent"), "inline"),
+        # the card's own arrow may be `->`: the validator reads it as the arrow, and approve leaves it
+        ({"claimed items? → **no**": "claimed items? -> **no**"}, "2 yes, go", Q2.replace("? →", "? ->"), "yes"),
+        ({"3. Run → **subagent-driven**": "3. Run -> **subagent-driven**"}, "3 subagent, go", Q3.replace("Run →", "Run ->"), "subagent-driven"),
+    ],
+)
+def test_an_answer_rewrites_only_the_bold_not_a_nearby_arrow(tmp_path, edits, reply, line, answer):
+    # GC4 reads `->` as the arrow, which is a parsing rule: only the bold becomes **you: <answer>**, and every other byte stays
+    plan = _awaiting(tmp_path, **edits)
+    before = plan.read_bytes()
+    assert line.encode() in before, "the scenario's question line is in the plan as written"
+
+    (out, code), _ = _decide(plan, reply, _session(tmp_path))
+
+    assert code == 0, out
+    assert _changed(before, plan.read_bytes()) == [
+        (STATUS_AWAITING, STATUS_APPROVED),
+        (line, _you(line, answer)),
+        (D1_ASK, _you(D1_ASK, "after 30 days")),
+        (D2_ASK, _you(D2_ASK, "yes" if reply.startswith("2 yes") else "no")),
+    ]
+    assert "->" in _you(line, answer), "the scenario keeps its `->`"
+    answered = [q for q in _plan_card(plan).questions if q.answered]
+    assert [q.default for q in answered] == [answer], "the validator still reads the rewritten line as an answered question"
+    assert vp.validate_plan(plan).passed
+
+
 def test_approve_sha_matches_render_footer(tmp_path):
     plan = v3_plan(tmp_path)
     rendered, _, _ = card.render(plan)
