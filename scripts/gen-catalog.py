@@ -17,6 +17,9 @@ Every violation prints as <relpath>:<line>: <rule>: <message>. Lints (constellat
     line names as constellation:<x>
   - bare-script: a code span or fence line that starts with a bundled scripts/<name>.(sh|py|js|cjs)
     path, or runs one with the wrong interpreter, must name bash/sh, python3 or node first
+  - upstream-missing / upstream-missing-row / upstream-bad-row: UPSTREAM.md exists, has the
+    exact table header, gives every top-level skill a row, and every row has an existing path,
+    a known origin and a Synced cell that fits it
 Adding a skill = drop skills/<name>/SKILL.md; the catalog auto-registers it. No manifest edit.
 """
 import argparse
@@ -61,6 +64,12 @@ INTERPRETERS = {"bash", "sh", "zsh", "python", "python2", "python3", "node"}
 SCRIPT_INTERPRETERS = {"sh": ("bash", "sh"), "py": ("python3",), "js": ("node",), "cjs": ("node",)}
 # Files that name bundled scripts bare on purpose; S12 deletes the file and this entry.
 SCRIPT_LINT_EXEMPT = {"skills/brainstorming/references/visual-companion.md"}
+
+# UPSTREAM.md provenance table. A row is | `path` | origin | upstream path | synced | notes |
+UPSTREAM_HEADER = "| Constellation path | Origin | Upstream path | Synced | Notes |"
+UPSTREAM_ROW = re.compile(r"^\|\s*`([^`]+)`\s*\|\s*([a-z+]+)\s*\|[^|]*\|\s*(\S+)\s*\|")
+UPSTREAM_ORIGINS = ("superpowers", "superpowers+fotw", "fotw", "constellation")
+COMMIT = re.compile(r"^[0-9a-f]{7,40}$")
 
 FENCE_OPEN = re.compile(r"^\s*(`{3,}(?=[^`]*$)|~{3,})")
 CODE_SPAN = re.compile(r"(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)")
@@ -290,6 +299,53 @@ def lint_scripts(root):
     return out
 
 
+def upstream_row_problems(root, path, origin, synced):
+    """Return what is wrong with one UPSTREAM.md row, as messages; an empty list means valid."""
+    problems = []
+    if not (root / path).exists():
+        problems.append(f"{path} does not exist")
+    if origin not in UPSTREAM_ORIGINS:
+        problems.append(f"origin {origin} must be one of {', '.join(UPSTREAM_ORIGINS)}")
+    elif origin.startswith("superpowers"):
+        if not COMMIT.match(synced):
+            problems.append(f"Synced {synced} must be a bare 7 to 40 character hex commit"
+                            f" for origin {origin}")
+    elif synced != "-":
+        problems.append(f"Synced {synced} must be - for origin {origin}")
+    return problems
+
+
+def lint_upstream(root, skills):
+    """Check UPSTREAM.md: the table header, each row, and a row for every top-level skill.
+
+    A missing or changed header is one violation at line 1. Skills without a row are reported at
+    the header line, or at line 1 when there is no header.
+    """
+    path = root / "UPSTREAM.md"
+    if not path.is_file():
+        return [("UPSTREAM.md", 1, "upstream-missing",
+                 "UPSTREAM.md is missing; it records where each skill came from")]
+    lines = path.read_text(encoding="utf-8", errors="ignore").split("\n")
+    out = []
+    header_line = next((n for n, line in enumerate(lines, 1) if line.rstrip() == UPSTREAM_HEADER), None)
+    if header_line is None:
+        header_line = 1
+        out.append(("UPSTREAM.md", 1, "upstream-bad-row",
+                    f'table header must be exactly "{UPSTREAM_HEADER}"'))
+    covered = set()
+    for n, line in enumerate(lines, 1):
+        m = UPSTREAM_ROW.match(line)
+        if m:
+            covered.add(m.group(1))
+            out += [("UPSTREAM.md", n, "upstream-bad-row", msg)
+                    for msg in upstream_row_problems(root, *m.groups())]
+    for name, _, _ in skills:
+        if f"skills/{name}/" not in covered:
+            out.append(("UPSTREAM.md", header_line, "upstream-missing-row",
+                        f"no row for skills/{name}/"))
+    return out
+
+
 def render(skills):
     lines = [
         "# Constellation Catalog",
@@ -331,6 +387,7 @@ def main(argv=None):
         + lint_skill_refs(root)
         + lint_paths(root)
         + lint_scripts(root)
+        + lint_upstream(root, skills)
     )
 
     if not args.check:

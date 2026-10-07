@@ -51,6 +51,7 @@ def make_tree(tmp_path):
     write_skill(tmp_path, "alpha")
     (tmp_path / "agents").mkdir()
     (tmp_path / "agents" / "beta.md").write_text("# beta\n", encoding="utf-8")
+    write_upstream(tmp_path, upstream_row("skills/alpha/"), upstream_row("agents/"))
     regen(tmp_path)
     return tmp_path
 
@@ -65,6 +66,31 @@ def write(root, rel, text):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
     return path
+
+
+UPSTREAM_HEADER = "| Constellation path | Origin | Upstream path | Synced | Notes |"
+# write_upstream puts the header on line 9 and the first row on line 11.
+HEADER_LINE = 9
+FIRST_ROW = 11
+
+
+def upstream_row(path, origin="fotw", synced="-"):
+    return f"| `{path}` | {origin} | `{path}` | {synced} | |"
+
+
+def write_upstream(root, *rows, header=UPSTREAM_HEADER):
+    """Write root/UPSTREAM.md: a Departures list, then the table; header=None omits its header."""
+    lines = ["# Upstream Provenance", "", "## Departures", "", "1. A departure.", "", "## Rows", ""]
+    if header is not None:
+        lines.append(header)
+    lines += ["| --- | --- | --- | --- | --- |", *rows, ""]
+    write(root, "UPSTREAM.md", "\n".join(lines))
+
+
+def add_upstream_row(root, path):
+    """Append a valid row to the table, which is the last thing write_upstream writes."""
+    with open(root / "UPSTREAM.md", "a", encoding="utf-8") as f:
+        f.write(upstream_row(path) + "\n")
 
 
 def assert_stale(proc):
@@ -121,6 +147,8 @@ def test_frontmatter_missing_description_and_name_mismatch(tmp_path):
     root = make_tree(tmp_path)
     write_skill(root, "nodesc", description=None)
     write_skill(root, "mismatch", fm_name="other")
+    add_upstream_row(root, "skills/nodesc/")
+    add_upstream_row(root, "skills/mismatch/")
     regen(root)
 
     proc = run(root, "--check")
@@ -436,6 +464,7 @@ def test_missing_reference_path(tmp_path):
 def test_path_resolves_via_named_skill(tmp_path):
     root = make_tree(tmp_path)
     write_skill(root, "gamma")
+    add_upstream_row(root, "skills/gamma/")
     write(root, "skills/gamma/references/guide.md", "# guide\n")
     write_skill(root, "alpha", body="See the `references/guide.md` guide in `constellation:gamma`.\n")
     regen(root)
@@ -515,4 +544,99 @@ def test_agent_files_are_linted(tmp_path):
         bare("agents/beta.md", 1, "scripts/y.py", "python3"),
         "agents/beta.md:1: missing-path: references/nope.md not found in agents",
         "agents/beta.md:1: missing-path: scripts/y.py not found in agents",
+    )
+
+
+# --- UPSTREAM.md provenance table ----------------------------------------------------------
+
+HEADER_MESSAGE = f'table header must be exactly "{UPSTREAM_HEADER}"'
+SHA_MESSAGE = "must be a bare 7 to 40 character hex commit for origin"
+
+
+def test_missing_upstream_file(tmp_path):
+    root = make_tree(tmp_path)
+    (root / "UPSTREAM.md").unlink()
+    proc = run(root, "--check")
+    lines = check_lines(proc)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert lines[0].startswith("UPSTREAM.md:1: upstream-missing:"), lines
+    assert lines[-1] == "LINT FAILED (1)"
+
+
+def test_skill_without_row(tmp_path):
+    root = make_tree(tmp_path)
+    write_skill(root, "delta")
+    regen(root)
+    assert_fails(
+        run(root, "--check"),
+        f"UPSTREAM.md:{HEADER_LINE}: upstream-missing-row: no row for skills/delta/",
+    )
+
+
+def test_row_with_missing_path(tmp_path):
+    root = make_tree(tmp_path)
+    write_upstream(root, upstream_row("skills/alpha/"), upstream_row("skills/ghost/"))
+    assert_fails(
+        run(root, "--check"),
+        f"UPSTREAM.md:{FIRST_ROW + 1}: upstream-bad-row: skills/ghost/ does not exist",
+    )
+
+
+def test_superpowers_row_needs_sha(tmp_path):
+    root = make_tree(tmp_path)
+    for synced in ("-", "`7e51643`"):
+        write_upstream(root, upstream_row("skills/alpha/", "superpowers", synced))
+        assert_fails(
+            run(root, "--check"),
+            f"UPSTREAM.md:{FIRST_ROW}: upstream-bad-row: Synced {synced} {SHA_MESSAGE} superpowers",
+        )
+    write_upstream(root, upstream_row("skills/alpha/", "superpowers", "7e51643"))
+    assert_clean(run(root, "--check"))
+
+
+def test_origin_and_synced_pairs(tmp_path):
+    root = make_tree(tmp_path)
+    for origin, synced in (
+        ("superpowers", "7e51643"),
+        ("superpowers", "0123456789abcdef0123456789abcdef01234567"),
+        ("superpowers+fotw", "8ca22db"),
+        ("fotw", "-"),
+        ("constellation", "-"),
+    ):
+        write_upstream(root, upstream_row("skills/alpha/", origin, synced))
+        assert_clean(run(root, "--check"))
+
+    for origin, synced, message in (
+        ("superpowers", "7e5164", SHA_MESSAGE),  # 6 hex digits
+        ("superpowers", "0123456789abcdef0123456789abcdef012345678", SHA_MESSAGE),  # 41
+        ("superpowers+fotw", "7E51643", SHA_MESSAGE),
+        ("fotw", "7e51643", "must be - for origin fotw"),
+        ("constellation", "7e51643", "must be - for origin constellation"),
+        ("vendor", "-", "origin vendor must be one of"),
+    ):
+        write_upstream(root, upstream_row("skills/alpha/", origin, synced))
+        proc = run(root, "--check")
+        lines = check_lines(proc)
+        assert proc.returncode == 1, (origin, synced, proc.stdout)
+        assert lines[0].startswith(f"UPSTREAM.md:{FIRST_ROW}: upstream-bad-row:"), lines
+        assert message in lines[0], lines
+        assert lines[-1] == "LINT FAILED (1)", lines
+
+
+def test_header_row_missing(tmp_path):
+    root = make_tree(tmp_path)
+    for header in (None, "| Constellation path | Origin | Upstream | Synced | Notes |"):
+        write_upstream(root, upstream_row("skills/alpha/"), header=header)
+        assert_fails(run(root, "--check"), f"UPSTREAM.md:1: upstream-bad-row: {HEADER_MESSAGE}")
+
+
+def test_missing_row_reports_at_line_1_when_header_missing(tmp_path):
+    root = make_tree(tmp_path)
+    write_skill(root, "delta")
+    regen(root)
+    write_upstream(root, upstream_row("skills/alpha/"), header=None)
+    assert_fails(
+        run(root, "--check"),
+        f"UPSTREAM.md:1: upstream-bad-row: {HEADER_MESSAGE}",
+        "UPSTREAM.md:1: upstream-missing-row: no row for skills/delta/",
     )
