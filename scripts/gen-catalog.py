@@ -1,22 +1,26 @@
 #!/usr/bin/env python3
-"""Generate CATALOG.md from skills/ and lint skill frontmatter.
+"""Generate CATALOG.md from skills/ and lint the plugin tree.
 
-  python scripts/gen-catalog.py          # regenerate CATALOG.md
-  python scripts/gen-catalog.py --check  # lint only; exit 1 on any violation
+  python3 scripts/gen-catalog.py                # regenerate CATALOG.md; violations print as warnings
+  python3 scripts/gen-catalog.py --check        # lint only; exit 1 on any violation
+  python3 scripts/gen-catalog.py --root DIR     # operate on DIR instead of the repo root
 
-Lints (constellation house rules):
-  - every skill has name + description frontmatter
-  - description is triggering-conditions only (starts with "Use when"); no workflow summary
-  - no section-sign character anywhere in any tracked markdown
+Every violation prints as <relpath>:<line>: <rule>: <message>. Lints (constellation house rules):
+  - frontmatter: every skill has a description that starts with "Use when" (triggering
+    conditions only, no workflow summary), and its name matches its directory
+  - section-sign: no section-sign character in skill bodies or docs/*.md (one violation per line)
+  - catalog-stale: CATALOG.md is missing or differs from what this script would generate
 Adding a skill = drop skills/<name>/SKILL.md; the catalog auto-registers it. No manifest edit.
 """
-import os
+import argparse
 import re
 import sys
+from pathlib import Path
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SKILLS = os.path.join(ROOT, "skills")
-SECTION_SIGN = "§"
+DEFAULT_ROOT = Path(__file__).resolve().parent.parent
+# Built from its code point so this source never holds the character it forbids.
+SECTION_SIGN = chr(0xA7)
+REGEN_HINT = "run python3 scripts/gen-catalog.py"
 
 
 def parse_frontmatter(text):
@@ -34,45 +38,58 @@ def parse_frontmatter(text):
     return fm
 
 
-def discover():
+def discover(root):
+    """Return (dir name, frontmatter name, description) for each skills/<name>/SKILL.md."""
     out = []
-    for name in sorted(os.listdir(SKILLS)):
-        d = os.path.join(SKILLS, name)
-        sk = os.path.join(d, "SKILL.md")
-        if name == "_shared" or not os.path.isfile(sk):
+    for d in sorted((root / "skills").iterdir(), key=lambda p: p.name):
+        sk = d / "SKILL.md"
+        if d.name == "_shared" or not sk.is_file():
             continue
-        with open(sk, encoding="utf-8") as f:
-            fm = parse_frontmatter(f.read())
-        out.append((name, fm.get("name", name), fm.get("description", "")))
+        fm = parse_frontmatter(sk.read_text(encoding="utf-8"))
+        out.append((d.name, fm.get("name", d.name), fm.get("description", "")))
     return out
 
 
-def lint(skills):
-    errs = []
+def lint_frontmatter(skills):
+    out = []
     for name, sk_name, desc in skills:
+        rel = f"skills/{name}/SKILL.md"
         if not desc:
-            errs.append(f"{name}: missing description")
+            out.append((rel, 1, "frontmatter", "missing description"))
         elif not desc.lower().startswith("use when"):
-            errs.append(f"{name}: description must start with 'Use when' (triggering conditions only)")
+            out.append((rel, 1, "frontmatter",
+                        "description must start with 'Use when' (triggering conditions only)"))
         if sk_name != name:
-            errs.append(f"{name}: frontmatter name '{sk_name}' != directory name")
-    # section-sign scan over AUTHORED content only (skill bodies + our docs).
-    # Vendored third-party reference material (e.g. bundled Wikipedia guides) is
-    # exempt: the no-section-sign rule governs authored output, not vendored data.
-    authored = []
-    for name, _, _ in skills:
-        authored.append(os.path.join(SKILLS, name, "SKILL.md"))
-    docs_dir = os.path.join(ROOT, "docs")
-    if os.path.isdir(docs_dir):
-        for fn in os.listdir(docs_dir):
-            if fn.endswith(".md"):
-                authored.append(os.path.join(docs_dir, fn))
-    for p in authored:
-        if os.path.isfile(p):
-            with open(p, encoding="utf-8", errors="ignore") as f:
-                if SECTION_SIGN in f.read():
-                    errs.append(f"{os.path.relpath(p, ROOT)}: contains the section-sign character")
-    return errs
+            out.append((rel, 1, "frontmatter", f"name '{sk_name}' != directory name '{name}'"))
+    return out
+
+
+def lint_section_sign(root, skills):
+    # Scan AUTHORED content only (skill bodies + our docs). Vendored third-party
+    # reference material (e.g. bundled Wikipedia guides) is exempt: the rule governs
+    # authored output, not vendored data.
+    paths = [root / "skills" / name / "SKILL.md" for name, _, _ in skills]
+    docs = root / "docs"
+    if docs.is_dir():
+        paths += sorted(p for p in docs.glob("*.md") if p.is_file())
+    out = []
+    for p in paths:
+        text = p.read_text(encoding="utf-8", errors="ignore")
+        for n, line in enumerate(text.split("\n"), 1):
+            if SECTION_SIGN in line:
+                out.append((p.relative_to(root).as_posix(), n, "section-sign",
+                            "contains the section-sign character; write 'section' instead"))
+    return out
+
+
+def lint_catalog(root, skills):
+    catalog = root / "CATALOG.md"
+    if not catalog.is_file():
+        return [("CATALOG.md", 1, "catalog-stale", f"CATALOG.md is missing; {REGEN_HINT}")]
+    if catalog.read_bytes() != render(skills).encode("utf-8"):
+        return [("CATALOG.md", 1, "catalog-stale",
+                 f"CATALOG.md does not match skills/; {REGEN_HINT}")]
+    return []
 
 
 def render(skills):
@@ -92,26 +109,41 @@ def render(skills):
     return "\n".join(lines)
 
 
-def main():
-    skills = discover()
-    check = "--check" in sys.argv
-    errs = lint(skills)
-    if check:
-        if errs:
-            print("LINT FAILED:")
-            for e in errs:
-                print("  -", e)
-            sys.exit(1)
-        print(f"LINT OK ({len(skills)} skills)")
-        return
-    with open(os.path.join(ROOT, "CATALOG.md"), "w", encoding="utf-8") as f:
-        f.write(render(skills))
-    print(f"Wrote CATALOG.md ({len(skills)} skills)")
-    if errs:
-        print("WARNINGS:")
-        for e in errs:
-            print("  -", e)
+def format_violation(v):
+    rel, line, rule, message = v
+    return f"{rel}:{line}: {rule}: {message}"
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="Generate CATALOG.md and lint the plugin tree.")
+    ap.add_argument("--check", action="store_true", help="lint only; exit 1 on any violation")
+    ap.add_argument("--root", type=Path, default=DEFAULT_ROOT,
+                    help="repo root to operate on (default: parent of scripts/)")
+    args = ap.parse_args(argv)
+    root = args.root
+
+    skills = discover(root)
+    if not args.check:
+        (root / "CATALOG.md").write_bytes(render(skills).encode("utf-8"))
+        print(f"Wrote CATALOG.md ({len(skills)} skills)")
+    violations = sorted(
+        lint_frontmatter(skills) + lint_section_sign(root, skills) + lint_catalog(root, skills)
+    )
+
+    if not args.check:
+        if violations:
+            print("WARNINGS:")
+            for v in violations:
+                print("  - " + format_violation(v))
+        return 0
+    for v in violations:
+        print(format_violation(v))
+    if violations:
+        print(f"LINT FAILED ({len(violations)})")
+        return 1
+    print(f"LINT OK ({len(skills)} skills)")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
