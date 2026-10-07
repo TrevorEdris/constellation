@@ -12,6 +12,11 @@ Every violation prints as <relpath>:<line>: <rule>: <message>. Lints (constellat
   - catalog-stale: CATALOG.md is missing or differs from what this script would generate
   - unknown-skill-ref: every constellation:<x> reference in the plugin's skills, agents, hooks,
     docs, scripts and config names a top-level skills/<x>/SKILL.md or an agents/<x>.md
+  - missing-path: every references/, scripts/ or assets/ path in a code span or fence of a skill
+    or agent file exists next to that file, in its skill directory, or in a skill the same
+    line names as constellation:<x>
+  - bare-script: a code span or fence line that starts with a bundled scripts/<name>.(sh|py|js|cjs)
+    path, or runs one with the wrong interpreter, must name bash/sh, python3 or node first
 Adding a skill = drop skills/<name>/SKILL.md; the catalog auto-registers it. No manifest edit.
 """
 import argparse
@@ -41,6 +46,29 @@ EXCLUDED_NAMES = ("CHANGELOG.md", "test_*.py", "*.test.js", "test-*.sh")
 # Only a bare constellation:<name> counts. A preceding word character, slash, dot or hyphen
 # means the text is part of a path, URL or longer identifier, not a skill reference.
 SKILL_REF = re.compile(r"(?<![\w/.-])constellation:([A-Za-z0-9][A-Za-z0-9_-]*)")
+
+# Path lint: a code-formatted token that looks like a bundled file reference.
+PATH_TOKEN = re.compile(r"^(?:\.\./)*(?:references|scripts|assets)/[A-Za-z0-9_./-]+$")
+
+# Script lint: a bundled script path, optionally behind a <placeholder>, ${VAR}, ~, /, ./ or ../.
+SCRIPT_TOKEN = re.compile(
+    r"^(?:<[^<>\n]*>/|\$\{?\w+\}?/|~/|/|\./|(?:\.\./)+)?"
+    r"(?:[\w.-]+/)*scripts/[\w.-]+\.(sh|py|js|cjs)$"
+)
+# Interpreter words that take a script operand, and which of them each extension accepts.
+# The first accepted word is the one the violation message recommends.
+INTERPRETERS = {"bash", "sh", "zsh", "python", "python2", "python3", "node"}
+SCRIPT_INTERPRETERS = {"sh": ("bash", "sh"), "py": ("python3",), "js": ("node",), "cjs": ("node",)}
+# Files that name bundled scripts bare on purpose; S12 deletes the file and this entry.
+SCRIPT_LINT_EXEMPT = {"skills/brainstorming/references/visual-companion.md"}
+
+FENCE_OPEN = re.compile(r"^\s*(`{3,}(?=[^`]*$)|~{3,})")
+CODE_SPAN = re.compile(r"(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)")
+# A whitespace-separated token, except that a <placeholder> (which may hold spaces) is one piece.
+TOKEN = re.compile(r"(?:<[^<>\n]*>|\S)+")
+TOKEN_LEAD = re.compile(r"^(?:\$\(|[\"'(])+")
+TOKEN_TRAIL = re.compile(r"[\"');,.:]+$")
+ASSIGNMENT = re.compile(r"^[A-Za-z_]\w*=")
 
 
 def parse_frontmatter(text):
@@ -159,6 +187,109 @@ def lint_skill_refs(root):
     return out
 
 
+def iter_code_segments(text):
+    """Yield (line_no, segment, full_line) for each code unit in Markdown text.
+
+    A unit is one line inside a fenced block (the fence lines themselves excluded) or one
+    inline code span outside fences. full_line is the whole source line, so a lint can read
+    context that sits outside the backticks, such as a constellation:<x> naming the skill.
+    A fence closes on a line of the same character at least as long as its opener, so a
+    shorter fence nested in a longer one stays code.
+    """
+    fence = None  # (character, length) while inside a fenced block
+    for n, line in enumerate(text.split("\n"), 1):
+        m = FENCE_OPEN.match(line)
+        if fence is None:
+            if m:
+                fence = (m.group(1)[0], len(m.group(1)))
+            else:
+                for span in CODE_SPAN.finditer(line):
+                    yield n, span.group(2), line
+        elif m and m.group(1)[0] == fence[0] and len(m.group(1)) >= fence[1] \
+                and not line.strip().strip(fence[0]):
+            fence = None
+        else:
+            yield n, line, line
+
+
+def tokens(segment):
+    """Split a code segment into shell-ish words with surrounding quotes and punctuation trimmed.
+
+    A <placeholder> stays one word even when it holds spaces. Words that become empty are dropped.
+    """
+    words = (TOKEN_TRAIL.sub("", TOKEN_LEAD.sub("", w)) for w in TOKEN.findall(segment))
+    return [w for w in words if w]
+
+
+def iter_markdown_units(root):
+    """Yield (relpath, line_no, segment, full_line) for each code unit in skill and agent docs."""
+    for p in iter_files(root, "markdown"):
+        rel = p.relative_to(root)
+        text = p.read_text(encoding="utf-8", errors="ignore")
+        for n, segment, full_line in iter_code_segments(text):
+            yield rel, n, segment, full_line
+
+
+def lint_paths(root):
+    """One violation per references/, scripts/ or assets/ token that names no existing file.
+
+    A token resolves next to its file, in its top skill directory, or in skills/<x>/ for any
+    constellation:<x> on the same line. Placeholder-prefixed tokens never match, so are not checked.
+    """
+    out = []
+    for rel, n, segment, full_line in iter_markdown_units(root):
+        candidates = [t for t in tokens(segment) if PATH_TOKEN.match(t)]
+        if not candidates:
+            continue
+        bases = [(root / rel).parent]
+        if rel.parts[0] == "skills" and len(rel.parts) > 2:
+            bases.append(root / "skills" / rel.parts[1])
+        bases += [root / "skills" / m.group(1) for m in SKILL_REF.finditer(full_line)]
+        for t in candidates:
+            if not any((b / t).exists() for b in bases):
+                where = ", ".join(sorted({b.relative_to(root).as_posix() for b in bases}))
+                out.append((rel.as_posix(), n, "missing-path", f"{t} not found in {where}"))
+    return out
+
+
+def bare_script(segment):
+    """Return (script, recommended interpreter) if the segment runs a script wrongly, else None.
+
+    Only the first word is judged: the script itself, or an interpreter whose first operand is a
+    script the interpreter does not run. Later words and prose are not checked.
+    """
+    words = tokens(segment)
+    while words and (words[0] in ("$", ">") or ASSIGNMENT.match(words[0])):
+        words.pop(0)
+    if not words:
+        return None
+    if SCRIPT_TOKEN.match(words[0]):
+        script, runner = words[0], None
+    elif words[0] in INTERPRETERS:
+        operand = next((w for w in words[1:] if not w.startswith("-")), "")
+        if not SCRIPT_TOKEN.match(operand):
+            return None
+        script, runner = operand, words[0]
+    else:
+        return None
+    accepted = SCRIPT_INTERPRETERS[script.rsplit(".", 1)[1]]
+    return None if runner in accepted else (script, accepted[0])
+
+
+def lint_scripts(root):
+    """One violation per code unit that starts with a bundled script path or runs one wrongly."""
+    out = []
+    for rel, n, segment, _ in iter_markdown_units(root):
+        if rel.as_posix() in SCRIPT_LINT_EXEMPT:
+            continue
+        found = bare_script(segment)
+        if found:
+            script, interp = found
+            out.append((rel.as_posix(), n, "bare-script",
+                        f'{script} must be run as "{interp} {script}"'))
+    return out
+
+
 def render(skills):
     lines = [
         "# Constellation Catalog",
@@ -198,6 +329,8 @@ def main(argv=None):
         + lint_section_sign(root, skills)
         + lint_catalog(root, skills)
         + lint_skill_refs(root)
+        + lint_paths(root)
+        + lint_scripts(root)
     )
 
     if not args.check:

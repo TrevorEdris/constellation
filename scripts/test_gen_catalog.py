@@ -23,14 +23,20 @@ def run(root, *args):
     )
 
 
-def write_skill(root, name, description="Use when testing the catalog generator", fm_name=None):
-    """Write skills/<name>/SKILL.md; description=None omits the field."""
+def write_skill(root, name, description="Use when testing the catalog generator", fm_name=None,
+                body=None):
+    """Write skills/<name>/SKILL.md; description=None omits the field.
+
+    A body lands after the heading, so its first line is line 8 of the file.
+    """
     d = root / "skills" / name
     d.mkdir(parents=True, exist_ok=True)
     lines = ["---", f"name: {fm_name or name}"]
     if description is not None:
         lines.append(f"description: {description}")
     lines += ["---", "", f"# {name}", ""]
+    if body is not None:
+        lines.append(body)
     (d / "SKILL.md").write_text("\n".join(lines), encoding="utf-8")
 
 
@@ -277,3 +283,174 @@ def test_ref_pattern_boundaries_and_one_violation_per_ref(tmp_path):
     assert lines[0].startswith("docs/x.md:2: unknown-skill-ref: constellation:one"), lines
     assert lines[1].startswith("docs/x.md:2: unknown-skill-ref: constellation:two"), lines
     assert lines[-1] == "LINT FAILED (2)"
+
+
+# --- path and bundled-script lints in code spans and fences -------------------------------
+
+DOC = "skills/alpha/references/g.md"
+
+
+def add_scripts(root):
+    """Create the bundled scripts the docs below mention, so only the lint under test fires."""
+    for name in ("x.sh", "y.py", "z.cjs"):
+        write(root, f"skills/alpha/scripts/{name}", "")
+
+
+def bare(rel, line, token, interp):
+    return f'{rel}:{line}: bare-script: {token} must be run as "{interp} {token}"'
+
+
+def assert_fails(proc, *expected):
+    """Exit 1 with exactly these violation lines, then the count line."""
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert check_lines(proc) == [*expected, f"LINT FAILED ({len(expected)})"]
+
+
+def assert_clean(proc, skills=1):
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert check_lines(proc) == [f"LINT OK ({skills} skills)"]
+
+
+def test_bare_script_in_span(tmp_path):
+    root = make_tree(tmp_path)
+    add_scripts(root)
+    write(root, DOC, "Intro.\n\nRun `scripts/x.sh --flag` first.\n")
+    assert_fails(run(root, "--check"), bare(DOC, 3, "scripts/x.sh", "bash"))
+
+
+def test_bare_script_in_fence(tmp_path):
+    root = make_tree(tmp_path)
+    add_scripts(root)
+    write(root, DOC, "Run:\n\n```sh\nscripts/x.sh\n```\n")
+    assert_fails(run(root, "--check"), bare(DOC, 4, "scripts/x.sh", "bash"))
+
+
+def test_python_must_be_python3(tmp_path):
+    root = make_tree(tmp_path)
+    add_scripts(root)
+    write(root, DOC, "Run `python scripts/y.py` first.\n")
+    assert_fails(run(root, "--check"), bare(DOC, 1, "scripts/y.py", "python3"))
+
+
+def test_wrong_interpreter(tmp_path):
+    root = make_tree(tmp_path)
+    add_scripts(root)
+    write(root, DOC, "Run `python3 scripts/x.sh` first.\n")
+    assert_fails(run(root, "--check"), bare(DOC, 1, "scripts/x.sh", "bash"))
+
+
+def test_interpreted_scripts_pass(tmp_path):
+    root = make_tree(tmp_path)
+    add_scripts(root)
+    write(root, DOC, (
+        "Spans: `bash scripts/x.sh`, `sh scripts/x.sh`, `$ bash scripts/x.sh`,\n"
+        "`python3 -u scripts/y.py`, `node scripts/z.cjs` and\n"
+        '`python3 "${CLAUDE_PLUGIN_ROOT}/skills/alpha/scripts/y.py"`.\n'
+        "\n"
+        "```\n"
+        "$ bash scripts/x.sh\n"
+        "python3 -u scripts/y.py\n"
+        "```\n"
+    ))
+    assert_clean(run(root, "--check"))
+
+
+def test_placeholder_prefixed_script_with_interpreter_passes(tmp_path):
+    root = make_tree(tmp_path)
+    write(root, DOC, (
+        "`python3 <plugin root>/skills/alpha/scripts/y.py render <abs PLAN>`\n"
+        '`python3 "<root>/skills/alpha/scripts/y.py" render "<path>"`\n'
+        '`GITHUB_TOKEN= gh pr create --body "$(bash <git-workflow>/scripts/x.sh)"`\n'
+    ))
+    assert_clean(run(root, "--check"))
+
+
+def test_placeholder_prefixed_script_without_interpreter_flagged(tmp_path):
+    root = make_tree(tmp_path)
+    write(root, DOC, (
+        "`<plugin root>/skills/alpha/scripts/y.py render`\n"
+        '`"<root>/skills/alpha/scripts/y.py"`\n'
+    ))
+    assert_fails(
+        run(root, "--check"),
+        bare(DOC, 1, "<plugin root>/skills/alpha/scripts/y.py", "python3"),
+        bare(DOC, 2, "<root>/skills/alpha/scripts/y.py", "python3"),
+    )
+
+
+def test_prose_and_later_mentions_not_flagged(tmp_path):
+    root = make_tree(tmp_path)
+    add_scripts(root)
+    write(root, DOC, (
+        "The scripts/x.sh helper does the work.\n"
+        "\n"
+        "Run `cd skills/alpha && scripts/x.sh` from the repo root.\n"
+    ))
+    assert_clean(run(root, "--check"))
+
+
+def test_exempt_file_skipped(tmp_path):
+    root = make_tree(tmp_path)
+    write(root, "skills/brainstorming/scripts/x.sh", "")
+    write(root, "skills/brainstorming/references/visual-companion.md", "Run `scripts/x.sh`.\n")
+    assert_clean(run(root, "--check"))
+
+
+def test_missing_reference_path(tmp_path):
+    root = make_tree(tmp_path)
+    write_skill(root, "alpha", body="Read `references/nope.md` for details.\n")
+    proc = run(root, "--check")
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    lines = check_lines(proc)
+    assert lines[0].startswith("skills/alpha/SKILL.md:8: missing-path: references/nope.md"), lines
+    assert lines[-1] == "LINT FAILED (1)"
+
+
+def test_path_resolves_via_named_skill(tmp_path):
+    root = make_tree(tmp_path)
+    write_skill(root, "gamma")
+    write(root, "skills/gamma/references/guide.md", "# guide\n")
+    write_skill(root, "alpha", body="See the `references/guide.md` guide in `constellation:gamma`.\n")
+    regen(root)
+    assert_clean(run(root, "--check"), skills=2)
+
+
+def test_prompts_assignments_and_flags_do_not_hide_scripts(tmp_path):
+    root = make_tree(tmp_path)
+    add_scripts(root)
+    write(root, DOC, (
+        "```\n"
+        "$ scripts/x.sh\n"
+        "> python scripts/y.py\n"
+        "NODE_ENV=test scripts/z.cjs\n"
+        "python -u scripts/y.py\n"
+        "```\n"
+    ))
+    assert_fails(
+        run(root, "--check"),
+        bare(DOC, 2, "scripts/x.sh", "bash"),
+        bare(DOC, 3, "scripts/y.py", "python3"),
+        bare(DOC, 4, "scripts/z.cjs", "node"),
+        bare(DOC, 5, "scripts/y.py", "python3"),
+    )
+
+
+def test_tilde_and_nested_fences_hold_code(tmp_path):
+    root = make_tree(tmp_path)
+    add_scripts(root)
+    write(root, DOC, (
+        "~~~\n"
+        "scripts/x.sh\n"
+        "~~~\n"
+        "\n"
+        "````md\n"
+        "```\n"
+        "scripts/y.py\n"
+        "```\n"
+        "````\n"
+    ))
+    assert_fails(
+        run(root, "--check"),
+        bare(DOC, 2, "scripts/x.sh", "bash"),
+        bare(DOC, 7, "scripts/y.py", "python3"),
+    )
