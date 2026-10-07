@@ -193,6 +193,32 @@ function latestCustomTitle(transcriptPath) {
   return title;
 }
 
+// A transcript entry's `entrypoint` names the client that wrote it. sdk-cli is
+// what `claude -p` reports; sdk-py and sdk-ts are the Agent SDK clients.
+const HEADLESS_ENTRYPOINTS = new Set(['sdk-cli', 'sdk-py', 'sdk-ts']);
+
+/** The `entrypoint` of the first transcript entry that carries one, or null. */
+function transcriptEntrypoint(transcriptPath) {
+  for (const line of readLines(transcriptPath)) {
+    let obj;
+    try { obj = JSON.parse(line); } catch { continue; }
+    if (obj && typeof obj.entrypoint === 'string' && obj.entrypoint) return obj.entrypoint;
+  }
+  return null;
+}
+
+/**
+ * True for a run no person is watching (`claude -p`, the Agent SDK), which
+ * should not litter the sessions root with a journal. CLAUDE_CODE_ENTRYPOINT
+ * decides when set; otherwise the transcript's first entrypoint does.
+ * CONSTELLATION_SCAFFOLD=always turns the skip off.
+ */
+function isHeadless(env, transcriptPath) {
+  if (env.CONSTELLATION_SCAFFOLD === 'always') return false;
+  const entrypoint = env.CLAUDE_CODE_ENTRYPOINT || transcriptEntrypoint(transcriptPath);
+  return HEADLESS_ENTRYPOINTS.has(entrypoint);
+}
+
 const NOISE_RE = /^(<local-command|<command-name|<command-message|<command-args|Caveat:|<system-reminder|\[Request interrupted)/;
 function extractText(content) {
   if (typeof content === 'string') return content;
@@ -226,5 +252,5 @@ module.exports = {
   sessionRoot, today, parseFrontmatter, readSafe, readHead,
   isValidSessionId, pointerPath, readPointer, bindSession,
   resolveSessionDir, inferPhase, sessionIdFromStdin,
-  latestCustomTitle, firstRealPromptText, detectTicket, slugifyTitle, extractText,
+  isHeadless, latestCustomTitle, firstRealPromptText, detectTicket, slugifyTitle, extractText,
 };
