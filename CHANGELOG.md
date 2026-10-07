@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.5 — 2026-10-07
+
+- feat(writing-plans): hand off every plan as a 120-word approval card
+
 ## 0.2.4 — 2026-10-07
 
 - feat(plan-validator): classify chat replies and record approvals
