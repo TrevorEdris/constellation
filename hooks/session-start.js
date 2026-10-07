@@ -7,24 +7,26 @@
  * When the session already has a journal dir, the journal line follows the
  * router and the dir is recorded as announced. This is what restores the line
  * after a compaction, which drops the one the prompt hook said earlier. With a
- * missing or invalid session id, or no dir, there is no journal line and no marker.
+ * missing or invalid session id, no dir, or a headless run (`claude -p`, the
+ * Agent SDK; CONSTELLATION_SCAFFOLD=always lifts that), there is no journal
+ * line and no marker.
  *
  * @hook {"event":"SessionStart","matcher":"startup|clear|compact","description":"Injects the using-constellation router at session start"}
  */
 const fs = require('fs');
 const path = require('path');
 const {
-  sessionRoot, resolveSessionDir, isValidSessionId, writeMarker, journalLine,
+  sessionRoot, resolveSessionDir, isValidSessionId, isHeadless, writeMarker, journalLine,
 } = require('./lib/session');
 
 const PLUGIN_ROOT = path.dirname(__dirname);
 
-/** The journal line for this session, or '' when it has no id or no dir yet. Records the dir as announced. */
+/** The journal line for this session, or '' when it has no id, no dir yet, or is headless. Records the dir as announced. */
 function journalSuffix(input) {
   let payload;
   try { payload = JSON.parse(input || '{}'); } catch { return ''; }
   const sessionId = payload && payload.session_id;
-  if (!isValidSessionId(sessionId)) return '';
+  if (!isValidSessionId(sessionId) || isHeadless(process.env, payload.transcript_path)) return '';
   const root = sessionRoot();
   const dir = resolveSessionDir(root, { sessionId });
   if (!dir) return '';

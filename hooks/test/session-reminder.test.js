@@ -29,8 +29,8 @@ function remind(env, sessionId, extra = {}) {
   }, env);
 }
 
-function start(env, sessionId, source = 'startup') {
-  return runHook('session-start.js', { hook_event_name: 'SessionStart', source, session_id: sessionId }, env);
+function start(env, sessionId, source = 'startup', extra = {}) {
+  return runHook('session-start.js', { hook_event_name: 'SessionStart', source, session_id: sessionId, ...extra }, env);
 }
 
 function postCompact(env, sessionId, summary) {
@@ -143,15 +143,26 @@ test('headless never emits the pending line', () => {
   assert.equal(contextOf(remind(always, 'sess-1')), pendingLine(always.SESSION_ROOT));
 });
 
-test('a headless run that later has a journal is told where it is', () => {
-  const env = hookEnv({ CLAUDE_CODE_ENTRYPOINT: 'sdk-cli' });
-  const root = env.SESSION_ROOT;
-  assert.deepEqual(remind(env, 'sess-1').json, {});
+test('a headless run is never told where a journal is', () => {
+  // A headless run gets no journal, so a dir that resolves for it (a resumed
+  // session's pointer) is not announced and no marker is written.
+  const byEnv = hookEnv({ CLAUDE_CODE_ENTRYPOINT: 'sdk-cli' });
+  const byTranscript = hookEnv();
+  for (const [env, extra] of [[byEnv, {}], [byTranscript, { transcript_path: writeTranscript('sdk-ts') }]]) {
+    const root = env.SESSION_ROOT;
+    const dir = makeSessionDir(root);
+    assert.ok(bindSession(root, 'sess-1', dir));
+    assert.deepEqual(remind(env, 'sess-1', extra).json, {});
+    assert.deepEqual(remind(env, 'sess-1', extra).json, {});
+    assert.equal(readMarker(root, 'sess-1'), null, 'a headless run writes no marker');
+  }
 
-  const dir = makeSessionDir(root);
-  assert.ok(bindSession(root, 'sess-1', dir));
-  assert.equal(contextOf(remind(env, 'sess-1')), journalLine(dir));
-  assert.deepEqual(remind(env, 'sess-1').json, {});
+  // CONSTELLATION_SCAFFOLD=always lifts the skip, as it does for the Stop hook.
+  const always = hookEnv({ CLAUDE_CODE_ENTRYPOINT: 'sdk-cli', CONSTELLATION_SCAFFOLD: 'always' });
+  const dir = makeSessionDir(always.SESSION_ROOT);
+  assert.ok(bindSession(always.SESSION_ROOT, 'sess-1', dir));
+  assert.equal(contextOf(remind(always, 'sess-1')), journalLine(dir));
+  assert.deepEqual(remind(always, 'sess-1').json, {});
 });
 
 test('reminder with a missing or invalid id prints {} and touches nothing', () => {
@@ -213,6 +224,29 @@ test('session-start on compact re-injects the journal', () => {
   // Another compaction wipes what the reminder said, so the marker must not silence session-start.
   assert.ok(contextOf(start(env, 'sess-1', 'compact')).endsWith(journalLine(dir)));
   assert.deepEqual(remind(env, 'sess-1').json, {});
+});
+
+test('session-start in a headless run adds no journal line', () => {
+  const routerEnd = '</EXTREMELY_IMPORTANT>';
+  const byEnv = hookEnv({ CLAUDE_PLUGIN_ROOT: PLUGIN_DIR, CLAUDE_CODE_ENTRYPOINT: 'sdk-cli' });
+  const byTranscript = hookEnv({ CLAUDE_PLUGIN_ROOT: PLUGIN_DIR });
+  for (const [env, extra] of [[byEnv, {}], [byTranscript, { transcript_path: writeTranscript('sdk-cli') }]]) {
+    const root = env.SESSION_ROOT;
+    const dir = makeSessionDir(root);
+    assert.ok(bindSession(root, 'sess-1', dir));
+
+    const ctx = contextOf(start(env, 'sess-1', 'compact', extra));
+    assert.ok(ctx.includes('You have constellation skills.'), 'the router is still injected');
+    assert.ok(ctx.endsWith(routerEnd), `nothing after the router: ${ctx.slice(-200)}`);
+    assert.ok(!ctx.includes('Session journal:'));
+    assert.equal(readMarker(root, 'sess-1'), null, 'a headless run writes no marker');
+  }
+
+  // CONSTELLATION_SCAFFOLD=always lifts the skip.
+  const always = hookEnv({ CLAUDE_PLUGIN_ROOT: PLUGIN_DIR, CLAUDE_CODE_ENTRYPOINT: 'sdk-cli', CONSTELLATION_SCAFFOLD: 'always' });
+  const dir = makeSessionDir(always.SESSION_ROOT);
+  assert.ok(bindSession(always.SESSION_ROOT, 'sess-1', dir));
+  assert.ok(contextOf(start(always, 'sess-1', 'compact')).endsWith(`${routerEnd}\n\n${journalLine(dir)}`));
 });
 
 test('session-start without a dir or with an invalid id adds no journal line', () => {

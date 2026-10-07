@@ -5,10 +5,12 @@
  * on every prompt. <root>/.sessions/<id>.announced records what it was last
  * told: a dir, or `pending`.
  *
+ *   - a headless run (`claude -p`, the Agent SDK) gets no journal: stay silent,
+ *     unless CONSTELLATION_SCAFFOLD=always
  *   - a session dir resolves and differs from the marker: say where it is, and
  *     record the dir (this also fires when the session is bound to a new dir)
- *   - no dir, no marker, and not a headless run: promise that one is coming
- *     (the Stop hook scaffolds it or adopts the agent's own), and record `pending`
+ *   - no dir and no marker: promise that one is coming (the Stop hook
+ *     scaffolds it or adopts the agent's own), and record `pending`
  *   - anything else: stay silent
  *
  * session-start.js says the journal line again after a compaction, which wipes
@@ -29,6 +31,7 @@ function emit(message) {
 
 /** The line to tell the agent now, or null when it already knows. Records what it returns. */
 function nextAnnouncement(root, sessionId, transcriptPath) {
+  if (isHeadless(process.env, transcriptPath)) return null;
   const marker = readMarker(root, sessionId);
   const dir = resolveSessionDir(root, { sessionId });
   if (dir) {
@@ -36,7 +39,7 @@ function nextAnnouncement(root, sessionId, transcriptPath) {
     writeMarker(root, sessionId, dir);
     return journalLine(dir);
   }
-  if (marker !== null || isHeadless(process.env, transcriptPath)) return null;
+  if (marker !== null) return null;
   writeMarker(root, sessionId, PENDING);
   return pendingLine(root);
 }

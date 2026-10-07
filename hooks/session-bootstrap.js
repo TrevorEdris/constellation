@@ -8,11 +8,11 @@
  *
  * Order: no valid session id or no transcript does nothing; a session that
  * already resolves (rebinding its pointer if only a scan found it) is left
- * alone; a first prompt that names a PLAN inside the root binds the session to
- * that PLAN's dir; a dir the agent made by hand this session is stamped with
- * the session id and bound; headless runs (`claude -p`, the Agent SDK) are
- * skipped unless CONSTELLATION_SCAFFOLD=always; anything else is scaffolded by
- * new-session.sh.
+ * alone; headless runs (`claude -p`, the Agent SDK) get no journal and do
+ * nothing more, unless CONSTELLATION_SCAFFOLD=always; a first prompt that names
+ * a PLAN inside the root binds the session to that PLAN's dir; a dir the agent
+ * made by hand this session is stamped with the session id and bound; anything
+ * else is scaffolded by new-session.sh.
  *
  * @hook {"event":"Stop","matcher":"","description":"Auto-scaffolds a SESSION.md from the real session title"}
  */
@@ -71,6 +71,11 @@ async function main() {
     return;
   }
 
+  // Headless runs get no journal. This comes before PLAN binding and adoption:
+  // workflow subagents are briefed with a PLAN path under the root, and binding
+  // each of them would aim all of them at that one dir's SESSION.md.
+  if (isHeadless(process.env, transcriptPath)) { console.log('{}'); return; }
+
   // A first prompt that names a PLAN inside the root puts the session in that
   // PLAN's dir. Binding comes first (and stamping, below, only after it), so a
   // pointer that cannot be written leaves the dir untouched and falls through.
@@ -85,8 +90,6 @@ async function main() {
     console.log('{}');
     return;
   }
-
-  if (isHeadless(process.env, transcriptPath)) { console.log('{}'); return; }
 
   const title = latestCustomTitle(transcriptPath) || firstPrompt;
   if (!title) { console.log('{}'); return; }

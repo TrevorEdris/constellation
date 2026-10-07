@@ -240,7 +240,8 @@ function transcriptEntrypoint(transcriptPath) {
 
 /**
  * True for a run no person is watching (`claude -p`, the Agent SDK), which
- * should not litter the sessions root with a journal. CLAUDE_CODE_ENTRYPOINT
+ * gets no journal: the Stop hook neither scaffolds, adopts nor binds a dir for
+ * it, and the reminder and session-start stay silent about one. CLAUDE_CODE_ENTRYPOINT
  * decides when set; otherwise the transcript's first entrypoint does.
  * CONSTELLATION_SCAFFOLD=always turns the skip off.
  */
