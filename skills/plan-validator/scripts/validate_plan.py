@@ -11,6 +11,12 @@ Usage:
 Exit codes:
     0 — PASS (score >= 70, no blocking issues)
     1 — NEEDS WORK (score < 70 or blocking issues found)
+
+Schema dispatch: a plan whose frontmatter says exactly `schema: plan/v3` gets
+errors for card, delivery, placeholder and step findings. Every other plan is
+legacy: the same checks as before, new checks as warnings, plus one `legacy`
+warning. No new check changes the score, so a legacy plan's PASS/NEEDS WORK
+status never changes because of the v3 work.
 """
 
 import argparse
@@ -19,11 +25,17 @@ import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any, NamedTuple, Optional
 
 
 # ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
+
+
+# Categories a human reviewer should see on the approval card; every other
+# category is for the agent that wrote the plan.
+HUMAN_CATEGORIES = frozenset({"git", "brief", "card", "delivery"})
 
 
 @dataclass
@@ -34,6 +46,11 @@ class Issue:
     category: str
     message: str
     line: int = 0
+
+    @property
+    def audience(self) -> str:
+        """Who should act on this finding: "human" or "agent"."""
+        return "human" if self.category in HUMAN_CATEGORIES else "agent"
 
 
 @dataclass
@@ -149,6 +166,211 @@ def section_content(lines: list[str], start: int, end: int) -> str:
     if start == 0:
         return ""
     return "\n".join(lines[start:end])
+
+
+# ---------------------------------------------------------------------------
+# Frontmatter parsing and schema dispatch
+# ---------------------------------------------------------------------------
+
+SCHEMA_V3 = "plan/v3"
+STATUS_TOKENS = ("draft", "awaiting-approval", "approved", "in-progress", "complete")
+
+
+class FrontmatterProblem(NamedTuple):
+    """Something in the frontmatter that is tolerated in legacy plans and an error in v3."""
+
+    code: str  # "inline-comment" | "syntax" | "unterminated"
+    line: int  # 1-indexed line in the file
+    message: str
+
+
+class Frontmatter(NamedTuple):
+    """Result of parse_frontmatter; unpacks as (data, end_line, problems).
+
+    data: top-level keys. Scalars are str, `null`/`~`/empty are None, flow and
+        block lists are list[str], and a block list of `key: value` items is
+        list[dict]. Values stay strings; callers convert (e.g. `prs`).
+    end_line: 1-indexed line of the closing `---`, so lines[end_line:] is the
+        body. 0 when the file has no (complete) frontmatter.
+    """
+
+    data: dict[str, Any]
+    end_line: int
+    problems: list[FrontmatterProblem]
+
+
+_KEY_RE = re.compile(r"^([A-Za-z_][\w-]*):(?:[ \t]+(.*))?$")
+_DASH_RE = re.compile(r"^(\s*)-(?:(\s+)(.*))?$")
+_COMMENT_RE = re.compile(r"(?:^|\s)#")
+_EMPTY = object()  # a value with no text at all (a block list may follow)
+
+
+def _unquote(text: str) -> str:
+    text = text.strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "'\"":
+        return text[1:-1]
+    return text
+
+
+def _parse_value(raw: str, key: str, line_no: int, problems: list[FrontmatterProblem]) -> Any:
+    """Parse the text after `key:`; returns str, list[str], None or _EMPTY.
+
+    An unquoted value's inline ` #` comment is stripped and recorded as a
+    problem. A quoted value is taken verbatim up to its closing quote.
+    """
+    text = raw.strip()
+    if text[:1] in ("'", '"'):
+        close = text.find(text[0], 1)
+        if close != -1:
+            return text[1:close]
+    comment = _COMMENT_RE.search(text)
+    if comment:
+        problems.append(
+            FrontmatterProblem(
+                "inline-comment",
+                line_no,
+                f"Inline '#' comment after '{key}:'. Remove it; v3 frontmatter values take no trailing comments.",
+            )
+        )
+        text = text[: comment.start()].rstrip()
+    if not text:
+        return _EMPTY
+    if text.startswith("["):
+        if not text.endswith("]"):
+            problems.append(FrontmatterProblem("syntax", line_no, f"Unclosed list for '{key}:'; put a flow list on one line."))
+            return text
+        return [_unquote(item) for item in text[1:-1].split(",") if item.strip()]
+    if text in ("null", "~"):
+        return None
+    return text
+
+
+def _none_if_empty(value: Any) -> Any:
+    return None if value is _EMPTY else value
+
+
+def _parse_block_list(
+    lines: list[str], start: int, end: int, key: str, problems: list[FrontmatterProblem]
+) -> tuple[Optional[list[Any]], int]:
+    """Parse the block list under `key:` from lines[start:end].
+
+    Returns (items, next_index); items is None when no list items follow. Items
+    are scalars or dicts of `key: value` pairs. Anything deeper is a problem.
+    """
+    items: list[Any] = []
+    current: Optional[dict[str, Any]] = None
+    key_col = 0
+    dash_indent: Optional[int] = None
+    i = start
+    while i < end:
+        raw = lines[i].rstrip()
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            i += 1
+            continue
+        indent = len(raw) - len(raw.lstrip())
+        dash = _DASH_RE.match(raw)
+        if indent == 0 and not dash:
+            break  # the next top-level key
+        line_no = i + 1
+        if dash:
+            if dash_indent is None:
+                dash_indent = len(dash.group(1))
+            if len(dash.group(1)) != dash_indent:
+                problems.append(FrontmatterProblem("syntax", line_no, f"Inconsistent list indentation under '{key}:'."))
+                current = None
+            else:
+                content = dash.group(3) or ""
+                pair = _KEY_RE.match(content)
+                if pair:
+                    current = {}
+                    items.append(current)
+                    key_col = dash_indent + 1 + len(dash.group(2))
+                    current[pair.group(1)] = _none_if_empty(
+                        _parse_value(pair.group(2) or "", pair.group(1), line_no, problems)
+                    )
+                else:
+                    current = None
+                    items.append(_none_if_empty(_parse_value(content, key, line_no, problems)))
+        else:
+            pair = _KEY_RE.match(stripped)
+            if current is not None and indent == key_col and pair:
+                current[pair.group(1)] = _none_if_empty(
+                    _parse_value(pair.group(2) or "", pair.group(1), line_no, problems)
+                )
+            else:
+                problems.append(
+                    FrontmatterProblem("syntax", line_no, f"Cannot parse line under '{key}:'; use a flat block list.")
+                )
+        i += 1
+    return (items or None), i
+
+
+def parse_frontmatter(text: str) -> Frontmatter:
+    """Parse the leading `---` frontmatter block: block YAML, no nesting beyond a list of items."""
+    lines = text.splitlines()
+    if not lines or lines[0].rstrip() != "---":
+        return Frontmatter({}, 0, [])
+    end = next((n for n in range(1, len(lines)) if lines[n].rstrip() == "---"), None)
+    if end is None:
+        return Frontmatter({}, 0, [FrontmatterProblem("unterminated", 1, "Frontmatter opens with '---' but never closes.")])
+
+    data: dict[str, Any] = {}
+    problems: list[FrontmatterProblem] = []
+    i = 1
+    while i < end:
+        raw = lines[i].rstrip()
+        i += 1
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        pair = _KEY_RE.match(raw)
+        if not pair:
+            problems.append(FrontmatterProblem("syntax", i, f"Cannot parse frontmatter line: {raw.strip()!r}"))
+            continue
+        key = pair.group(1)
+        value = _parse_value(pair.group(2) or "", key, i, problems)
+        if value is _EMPTY:
+            items, i = _parse_block_list(lines, i, end, key, problems)
+            value = items
+        data[key] = value
+    return Frontmatter(data, end + 1, problems)
+
+
+def is_v3(fm: Frontmatter) -> bool:
+    """True only for the exact schema `plan/v3`; every other plan is legacy."""
+    return fm.data.get("schema") == SCHEMA_V3
+
+
+def check_schema(fm: Frontmatter, report: ValidationReport) -> None:
+    """Dispatch on schema. Adds findings only; it never changes the score."""
+    if not is_v3(fm):
+        schema = fm.data.get("schema")
+        label = schema if isinstance(schema, str) and schema else "none"
+        report.issues.append(
+            Issue(
+                severity="warning",
+                category="legacy",
+                message=(
+                    f"Legacy plan (schema: {label}). The approval-card checks report as warnings only "
+                    f"and never change the score. Use 'schema: {SCHEMA_V3}' to get the card gate."
+                ),
+            )
+        )
+        return
+
+    for problem in fm.problems:
+        report.issues.append(Issue(severity="error", category="schema", message=problem.message, line=problem.line))
+
+    status = fm.data.get("status")
+    if status not in STATUS_TOKENS:
+        shown = f"got '{status}'" if isinstance(status, str) else "it is missing"
+        report.issues.append(
+            Issue(
+                severity="error",
+                category="schema",
+                message=f"status must be one of {', '.join(STATUS_TOKENS)}; {shown}.",
+            )
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -363,7 +585,7 @@ def check_oversized_code_blocks(lines: list[str], report: ValidationReport) -> N
                 report.issues.append(
                     Issue(
                         severity="warning",
-                        category="scope",
+                        category="code-size",
                         message=f"Code block at line {block_start} is {block_lines} lines. Plans should describe changes, not implement them.",
                         line=block_start,
                     )
@@ -722,19 +944,19 @@ def render_text(report: ValidationReport, verbose: bool = False) -> str:
         out.append(f"\nERRORS ({len(report.errors)}):")
         for issue in report.errors:
             loc = f" [line {issue.line}]" if issue.line else ""
-            out.append(f"  [ERROR] [{issue.category}]{loc} {issue.message}")
+            out.append(f"  [ERROR] [{issue.category}] ({issue.audience}){loc} {issue.message}")
 
     if report.warnings:
         out.append(f"\nWARNINGS ({len(report.warnings)}):")
         for issue in report.warnings:
             loc = f" [line {issue.line}]" if issue.line else ""
-            out.append(f"  [WARN]  [{issue.category}]{loc} {issue.message}")
+            out.append(f"  [WARN]  [{issue.category}] ({issue.audience}){loc} {issue.message}")
 
     infos = [i for i in report.issues if i.severity == "info"]
     if verbose and infos:
         out.append(f"\nINFO ({len(infos)}):")
         for issue in infos:
-            out.append(f"  [INFO]  [{issue.category}] {issue.message}")
+            out.append(f"  [INFO]  [{issue.category}] ({issue.audience}) {issue.message}")
 
     if not report.issues:
         out.append("\nNo issues found.")
@@ -752,6 +974,7 @@ def render_json(report: ValidationReport) -> str:
             {
                 "severity": i.severity,
                 "category": i.category,
+                "audience": i.audience,
                 "message": i.message,
                 "line": i.line or None,
             }
@@ -768,8 +991,12 @@ def render_json(report: ValidationReport) -> str:
 # ---------------------------------------------------------------------------
 
 
-def validate_plan(path: Path) -> ValidationReport:
-    """Run all checks on a plan file and return the aggregated report."""
+def validate_plan(path: Path, probe: bool = True) -> ValidationReport:
+    """Run all checks on a plan file and return the aggregated report.
+
+    probe: reserved for the live git-remote probe of v3 delivery repos, which
+    arrives with the delivery checks. No check reads it yet.
+    """
     report = ValidationReport(path=str(path))
 
     if not path.exists():
@@ -796,6 +1023,8 @@ def validate_plan(path: Path) -> ValidationReport:
         return report
 
     lines = content.splitlines()
+
+    check_schema(parse_frontmatter(content), report)
 
     check_target_repos(lines, report)
     check_files_to_modify(lines, report)
