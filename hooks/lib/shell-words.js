@@ -18,7 +18,10 @@
  *   }
  *
  * parse(), commandOf() and gitCmd() are layered on top of scan; they are described before their
- * code near the end of this file, and they are what the guard rules call.
+ * code near the end of this file, and they are what the guard rules call. They fail closed: what
+ * the parser does not model in full (`env -S`, nesting past the depth cap, input past the size
+ * cap, a scan `overflow`) is reported as `unparsed`, never read by a guess, so the guard asks
+ * instead of letting it pass.
  *
  * A segment is one simple command: the text between unquoted `; && || | |& &`, newline, `(`
  * and `)`. `{`, `}` and `!` stay ordinary words (a later layer strips them in command
@@ -573,10 +576,10 @@ function skipTo(src, j, q) {
 
 // ---------------------------------------------------------------------------------------------
 // Parser layer. scan() reads one piece of shell text; the code below finds the commands that hide
-// inside a command (substitutions, `sh -c`, `eval`, `env -S`, `xargs`, `find -exec`) and reads
-// the command word behind prefixes such as `sudo` and `env`.
+// inside a command (substitutions, `sh -c`, `eval`, `xargs`, `find -exec`) and reads the command
+// word behind prefixes such as `sudo` and `env`.
 //
-//   parse(cmd)     -> { segments: Segment[], unparsed: null | 'size' | 'depth' }
+//   parse(cmd)     -> { segments: Segment[], unparsed: null | 'size' | 'depth' | 'env -S' }
 //   commandOf(ws)  -> { cmd, args }
 //   gitCmd(args)   -> { sub, args, dir }
 //
@@ -585,10 +588,23 @@ function skipTo(src, j, q) {
 //     via:      'top' | 'subst' | 'shell-c' | 'xargs' | 'find-exec'
 //     parent:   number | null  `position` of the segment this one came from (null at top level)
 //     depth:    number         0 at top level, 1 more for each body re-parsed
+//     unparsed: null | 'env -S'  why this segment runs text that was not read (null: nothing unread)
 //   }
 //
 // `pipeline` ids come from one counter per parse. An xargs or find-exec child takes its parent's
 // id (it runs inside that pipeline); a substitution or `-c` body gets fresh ids of its own.
+//
+// Fail closed. This layer reads only the grammar it models, and it never guesses at the rest: a
+// construct it does not fully model is reported as `unparsed` instead of being read in some
+// approximate way, because a wrong reading can lose a command word or an operand, which hides a
+// command from the rules. The guard turns any `unparsed` into an ask. A false alarm costs one
+// prompt; a missed command can cost a secret. So `env -S STR` is not split into words (env's rules
+// for STR are not the shell's, and the words after STR join it): the segment stays an `env`
+// segment, gets `unparsed: 'env -S'`, and STR is never scanned for child commands.
+//
+// A caller must check the parse result's `unparsed`, which covers everything. A segment's own
+// `unparsed` only says which segment ran the unread text, and today only `env -S` sets it; `size`,
+// `depth` and a scan `overflow` are reported on the result alone.
 //
 // Limits. Only the first 64 KiB (UTF-16 code units) of the text is scanned; longer input sets
 // `unparsed: 'size'`. A body that would sit past depth 3 is skipped and sets `unparsed: 'depth'`.
@@ -596,6 +612,12 @@ function skipTo(src, j, q) {
 // in that case every segment the scan did return is kept, and its bodies are still re-parsed within
 // the depth cap: a deny-tier command in the parsed part must stay visible. The first reason set
 // wins. A caller that sees `unparsed` should add its own "could not fully read this" ask.
+//
+// Not modelled and not flagged (known gaps, left to the rules): commands that run their arguments
+// but are not on the list above (`ssh host CMD`, `su -c`, `watch`, `script -c`, `parallel`), a
+// script fed to a shell on stdin (`echo CMD | sh`, `sh <<EOF`), and the options of `env` and the
+// other prefix commands beyond the tables below (`env -P`, `env -a`, a lone `env -`, abbreviated
+// long options other than `env --split-string`).
 // ---------------------------------------------------------------------------------------------
 
 const MAX_INPUT = 64 * 1024;
@@ -632,21 +654,24 @@ function addBody(src, via, parent, depth, ctx) {
 }
 
 function addSegment(raw, pipeline, via, parent, depth, ctx) {
-  const seg = Object.assign({}, raw, { pipeline, position: ctx.segments.length, via, parent, depth });
+  const seg = Object.assign({}, raw, { pipeline, position: ctx.segments.length, via, parent, depth, unparsed: null });
   ctx.segments.push(seg);
   // A substitution runs while the words are expanded, so its commands come before the segment's own.
   for (const body of raw.substs) addBody(body, 'subst', seg.position, depth + 1, ctx);
   for (const e of hiddenCommands(raw.words)) {
-    if (e.src !== undefined) {
+    if (e.unparsed !== undefined) {
+      // Text this segment runs and the parser does not read: say so on the segment and the result.
+      seg.unparsed = e.unparsed;
+      skip(ctx, e.unparsed);
+    } else if (e.src !== undefined) {
       addBody(e.src, e.via, seg.position, depth + 1, ctx);
     } else if (depth + 1 > MAX_DEPTH) {
       skip(ctx, 'depth');
     } else {
-      // The words are already split and unquoted, so the child is built from them directly. xargs
-      // and find-exec children stay in their parent's pipeline; an env -S child is a `-c` style
-      // body and gets an id of its own.
+      // The words are already split and unquoted, so the child is built from them directly. It runs
+      // inside its parent's pipeline.
       const child = { words: e.words, redirects: [], substs: [] };
-      addSegment(child, e.fresh ? ctx.pipelines++ : seg.pipeline, e.via, seg.position, depth + 1, ctx);
+      addSegment(child, seg.pipeline, e.via, seg.position, depth + 1, ctx);
     }
   }
 }
@@ -656,8 +681,8 @@ const FIND_EXEC = new Set(['-exec', '-execdir', '-ok', '-okdir']);
 
 /**
  * The commands a segment runs through its arguments: {via, src} for text to scan (`-c` strings,
- * eval) or {via, words} for a command already split into words (xargs, find -exec, env -S; `fresh`
- * asks for a pipeline id of its own).
+ * eval), {via, words} for a command already split into words (xargs, find -exec), or
+ * {unparsed} for text the parser does not read and must not guess at (`env -S`).
  */
 function hiddenCommands(words) {
   const { cmd, args } = commandOf(words);
@@ -667,20 +692,11 @@ function hiddenCommands(words) {
   }
   // eval joins its arguments with spaces and runs the result, so `eval cat x` and `eval "cat x"` agree.
   if (cmd === 'eval') return args.length ? [{ via: 'shell-c', src: args.join(' ') }] : [];
-  if (cmd === 'env') {
-    // env splits STR itself (see splitEnvString) and appends the words after it (`env -S 'echo a' b`
-    // runs `echo a b`), so the child is those words, never shell text. The appended words start
-    // right after STR, not after env's options: `env -S cat -u f` hands `-u f` to cat, and so does
-    // a second -S (`env -S cat -S x f` runs `cat -S x f`): only the first -S counts.
-    const o = readOptions(args, 0, PREFIXES.get('env'));
-    const str = o.values.S;
-    if (str === undefined) return [];
-    // env reads options at the start of STR itself (`env -S '-i cat' f` runs `cat f`), so a STR that
-    // starts with one gets an `env` of its own for commandOf to strip them.
-    const split = splitEnvString(str);
-    const words = (split.length && split[0][0] === '-' ? ['env'] : []).concat(split, args.slice(o.ends.S));
-    return words.length ? [{ via: 'shell-c', words, fresh: true }] : [];
-  }
+  // Fail closed. env splits STR by rules of its own and appends the words after it, and a guess at
+  // those rules can lose a command word or an operand, so STR is not read: the segment stays `env`
+  // and is reported unparsed. commandOf returns `env` for exactly this case (an -S option with its
+  // string), and for a bare `env` or `env -i`, which have no -S.
+  if (cmd === 'env') return readOptions(args, 0, PREFIXES.get('env')).values.S === undefined ? [] : [{ unparsed: 'env -S' }];
   if (cmd === 'xargs') {
     const rest = args.slice(readOptions(args, 0, XARGS).next);
     return [{ via: 'xargs', words: rest.length ? rest : ['echo'] }];
@@ -749,13 +765,21 @@ function opts(short, long) {
   return { short, long: long || {}, operands: 0 };
 }
 
+// env's long options with a value. GNU getopt accepts any unambiguous prefix of a long option, and
+// only `--split-string` starts with `s`, so every prefix of it (`--split`, `--s`) is -S too. Taking
+// the spelling for -S is the safe direction: the segment is reported unparsed (see hiddenCommands).
+const SPLIT_STRING = 'split-string';
+const ENV_LONG = { unset: 'u', chdir: 'C' };
+for (let n = 1; n <= SPLIT_STRING.length; n++) ENV_LONG[SPLIT_STRING.slice(0, n)] = 'S';
+
 // Prefixes commandOf strips: commands that run another command given as their trailing words.
 // Matched by basename, so `/usr/bin/env` counts. `operands` is how many plain words follow the
 // options before the command (timeout's duration).
 const PREFIXES = new Map([
   ['sudo', opts('ughpCDrtUT', { user: 'u', group: 'g', host: 'h', prompt: 'p', 'close-from': 'C', chdir: 'D', role: 'r', type: 't', 'other-user': 'U', 'command-timeout': 'T' })],
-  // -S takes a string for the shell (see hiddenCommands); commandOf stops there.
-  ['env', opts('uCS', { unset: 'u', chdir: 'C', 'split-string': 'S' })],
+  // -S takes a string that env splits itself. It is not read: commandOf stops at an env that has
+  // it, and parse() reports the segment unparsed (see hiddenCommands).
+  ['env', opts('uCS', ENV_LONG)],
   ['command', opts('')],
   ['builtin', opts('')],
   ['nohup', opts('')],
@@ -774,58 +798,13 @@ const XARGS = opts('ILnPdEsa', { 'arg-file': 'a', delimiter: 'd', 'max-args': 'n
 const basename = (w) => w.slice(w.lastIndexOf('/') + 1);
 
 /**
- * Split the STRING of `env -S` into words the way env does, which is not the way a shell does:
- * blanks and newlines separate words, '..' and ".." group (a backslash escapes the next character
- * inside "..", and outside any quotes), `\_` separates words, a `#` that starts a word or a `\c`
- * ends the string, and `; | & < > ( ` are ordinary characters. It expands nothing, so `${VAR}`
- * stays literal, which is the safe reading. Escapes env gives a meaning to (`\n`, `\t`) are read as
- * the plain character: only the command word and the word count matter here.
- */
-function splitEnvString(s) {
-  const words = [];
-  let cur = null; // the word being built; null between words
-  let q = ''; // the open quote character, or ''
-  for (let i = 0; i < s.length; i++) {
-    const c = s[i];
-    if (q) {
-      if (c === q) q = '';
-      else if (c === '\\' && q === '"' && i + 1 < s.length) cur += s[++i];
-      else cur += c;
-    } else if (c === "'" || c === '"') {
-      q = c;
-      if (cur === null) cur = '';
-    } else if (c === '\\') {
-      i++;
-      if (s[i] === 'c') break;
-      if (s[i] === '_') {
-        if (cur !== null) words.push(cur);
-        cur = null;
-      } else if (i < s.length) {
-        cur = (cur === null ? '' : cur) + s[i];
-      }
-    } else if (/\s/.test(c)) {
-      if (cur !== null) words.push(cur);
-      cur = null;
-    } else if (c === '#' && cur === null) {
-      break;
-    } else {
-      cur = (cur === null ? '' : cur) + c;
-    }
-  }
-  if (cur !== null) words.push(cur);
-  return words;
-}
-
-/**
  * Read the options that start at words[i]. Returns the index of the first word that is not an
  * option (after an optional `--`) and the values taken, keyed by the option's letter. Short
  * options may be clustered (`-Eu root`); a valued one takes the rest of its cluster (`-uroot`) or
- * else the next word. When an option repeats, the first value is the one kept; `ends` holds, per
- * valued option, the index just past that first value.
+ * else the next word. When an option repeats, the first value is the one kept.
  */
 function readOptions(words, i, spec) {
   const values = {};
-  const ends = {};
   while (i < words.length) {
     const w = words[i];
     if (w === '--') { i++; break; }
@@ -839,7 +818,7 @@ function readOptions(words, i, spec) {
         if (eq !== -1) v = w.slice(eq + 1);
         else if (i < words.length) v = words[i++];
         const key = spec.long[name];
-        if (v !== undefined && values[key] === undefined) { values[key] = v; ends[key] = i; }
+        if (v !== undefined && values[key] === undefined) values[key] = v;
       }
       continue;
     }
@@ -848,11 +827,11 @@ function readOptions(words, i, spec) {
       let v;
       if (k + 1 < w.length) v = w.slice(k + 1);
       else if (i < words.length) v = words[i++];
-      if (v !== undefined && values[w[k]] === undefined) { values[w[k]] = v; ends[w[k]] = i; }
+      if (v !== undefined && values[w[k]] === undefined) values[w[k]] = v;
       break;
     }
   }
-  return { next: i, values, ends };
+  return { next: i, values };
 }
 
 /**
@@ -860,8 +839,9 @@ function readOptions(words, i, spec) {
  * `NAME=value` words, the reserved words `if then else elif do while until ! { }`, and the
  * prefix commands in PREFIXES with their options. `cmd` is the basename. When nothing is left
  * after a prefix, the prefix is the command (bare `env`, `sudo`, `time`), with the words after it
- * as `args`; with no words at all (or only assignments) `cmd` is ''. `env -S STRING` is also left
- * as `env`: its string, followed by the words after it, is a command line that parse() reads.
+ * as `args`; with no words at all (or only assignments) `cmd` is ''. `env -S STRING` (or
+ * `--split-string`, abbreviated or not) is also left as `env`, with every word after `env` as
+ * `args`: the string is not read, and parse() reports that segment unparsed.
  */
 function commandOf(words) {
   const w = Array.isArray(words) ? words : [];

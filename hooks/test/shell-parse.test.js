@@ -1,7 +1,8 @@
 'use strict';
 // Tests for the parser layer of hooks/lib/shell-words.js: parse() re-reads the places where a
-// command hides another command (substitutions, `sh -c`, `eval`, `env -S`, `xargs`, `find -exec`),
-// commandOf() finds the command word behind prefixes like `sudo` and `env`, and gitCmd() skips
+// command hides another command (substitutions, `sh -c`, `eval`, `xargs`, `find -exec`) and fails
+// closed on what it does not model (`env -S`, depth, size): those are marked unparsed, never guessed
+// at. commandOf() finds the command word behind prefixes like `sudo` and `env`, and gitCmd() skips
 // git's global options. Every test drives the real functions on real command text.
 //
 // Corpus tables stay inline in this file: `node --test` runs any non-test .js under hooks/test/.
@@ -58,6 +59,9 @@ test('parse keeps the tokenizer fields on every segment', () => {
   assert.deepEqual(sub.words, ['cat', '.env']);
   assert.deepEqual(sub.substs, []);
   assert.equal(typeof top.pipeline, 'number');
+  // A segment that hides nothing unread says so: `unparsed` is null, not missing.
+  assert.equal(top.unparsed, null);
+  assert.equal(sub.unparsed, null);
 });
 
 test('position, parent and depth follow a depth-first, source-order walk', () => {
@@ -294,96 +298,149 @@ test('eval joins its arguments the way the shell does and parses the result', ()
   assert.equal(segs('echo eval cat x').length, 1);
 });
 
-test('env -S runs its string through the shell', () => {
+test('env -S is not read: its segment is unparsed and has no child', () => {
+  // env splits STR by rules of its own, not the shell's, and the words after STR join it. The parser
+  // does not emulate that. It keeps the env segment, marks it `unparsed: 'env -S'` (and the parse
+  // result with it) and never scans STR for commands, so a wrong reading cannot hide one. The guard
+  // turns the mark into an ask.
+  const envOnly = (cmd) => {
+    const r = parse(cmd);
+    assert.equal(r.unparsed, 'env -S', cmd);
+    const shown = r.segments.map((s) => s.words.join(' ')).join(' / ');
+    assert.equal(r.segments.length, 1, `${JSON.stringify(cmd)}: expected no child segment, got ${shown}`);
+    const [env] = r.segments;
+    assert.equal(cmdOf(env), 'env', cmd);
+    assert.equal(env.unparsed, 'env -S', cmd);
+    assert.equal(env.via, 'top', cmd);
+    return env;
+  };
+
+  // Every spelling of -S: alone, clustered, attached, joined, long, and abbreviated the way GNU
+  // getopt allows (`--split` is `--split-string`).
   for (const cmd of [
     "env -S 'cat x'",
     "env -i -S 'cat x'",
     "env -S'cat x'",
     "env -iS 'cat x'",
+    "env -i0S 'cat x'",
+    "env -iS'cat x'",
     "env --split-string='cat x'",
     "env --split-string 'cat x'",
+    "env --split='cat x'",
+    "env --split 'cat x'",
+    "env --split-str='cat x'",
+    "env --s 'cat x'",
     "sudo env -S 'cat x'",
+    "sudo -u root env -i -S 'cat x'",
+    "nohup env -S 'cat x'",
+    "FOO=1 env -S 'cat x'",
+    "env -u FOO -S'cat x' y",
+    "env -i env -S 'cat x'",
+    // With words after STR, which env appends to the split string, and with odd STR.
+    'env -S cat ~/.ssh/id_rsa',
+    "env -S 'cat x' y z",
+    "env -S '' rm -rf ~",
+    "env -S 'FOO=1' cat x",
+    'env -S cat -u x',
+    'env -S cat -- x',
+    'env -S cat -S x ~/.ssh/id_rsa',
+    "env -S '-i cat' x",
+    "env -S ''",
+    "env -S '#c'",
+    // An empty or comment-only STR followed by env's own options (env re-reads them).
+    "env -S '' -i cat /x/f",
+    "env -S ' ' -u FOO cat /x/f",
+    "env -S '#c' -i cat /x/f",
+    "env -S '\\c' -- cat /x/f",
+    "env -S '' -i -u A cat /x/f",
+  ]) envOnly(cmd);
+
+  // Characters a shell reads as comments, redirects, pipes or separators are plain text inside the
+  // quoted STR, and nothing turns them into a second segment or a redirect.
+  for (const cmd of [
+    "env -S 'cat #' ~/.ssh/id_rsa",
+    "env -S 'cat #c' ~/.ssh/id_rsa",
+    "env -S 'cat a #c' x",
+    "env -S 'cat\n' ~/.ssh/id_rsa",
+    "env -S 'cat >' x",
+    "env -S 'cat <' ~/.ssh/id_rsa",
+    "env -S 'cat |' x",
+    "env -S 'cat &' x",
+    "env -S 'cat (' x",
+    "env -S 'cat a;b' x",
+    "env -S 'cat \\c' x",
+    "env -S 'cat \"#\" x'",
+    "env -S 'cat x#y' z",
+    "env -S 'cat a\\_b' x",
+    "env -S 'cat \"a\\\"b\" c'",
+    "env -S cat ';' '>' x",
   ]) {
-    const cat = only(cmd, 'cat');
-    assert.equal(cat.via, 'shell-c', cmd);
-    assert.deepEqual(cat.words, ['cat', 'x'], cmd);
+    const env = envOnly(cmd);
+    assert.deepEqual(env.redirects, [], cmd);
   }
-  // env appends the words after STR to the split string (`env -S 'echo a' b` prints `a b`), so the
-  // command that really runs keeps those words as its arguments. Each is one literal word, never
-  // re-split or re-expanded: the quoted `a b` stays a single argument.
-  for (const [cmd, name, args] of [
-    ['env -S cat ~/.ssh/id_rsa', 'cat', ['~/.ssh/id_rsa']],
-    ["env -S '' rm -rf ~", 'rm', ['-rf', '~']],
-    ["env -S 'FOO=1' cat .env", 'cat', ['.env']],
-    ["env -S 'echo a' b", 'echo', ['a', 'b']],
-    ["env -S cat 'a b'", 'cat', ['a b']],
-    ["env -S 'cat x' y z", 'cat', ['x', 'y', 'z']],
-    ['env -i -S cat .env', 'cat', ['.env']],
-    ["env -u FOO -S'cat x' y", 'cat', ['x', 'y']],
-    // Words after STR belong to the child, even ones that look like env's own options: real env
-    // runs `cat -u f` here, so `f` must stay visible (`-u` and `-C` take a value for env itself).
-    ['env -S cat -u .env', 'cat', ['-u', '.env']],
-    ['env -S sed -C ~/.aws/credentials', 'sed', ['-C', '~/.aws/credentials']],
-    ['env -S cat -- .env', 'cat', ['--', '.env']],
-    ["sudo env -S cat '$HOME/.aws/credentials'", 'cat', ['$HOME/.aws/credentials']],
-    ["env --split-string=cat 'it'\\''s'", 'cat', ["it's"]],
-    // Only the first -S names the string; real env hands a later -S (or --split-string=x) to the
-    // child as a plain word, so `env -S cat -S x f` runs `cat -S x f` and `f` must stay visible.
-    ['env -S echo -S x y', 'echo', ['-S', 'x', 'y']],
-    ['env -S cat -S x ~/.ssh/id_rsa', 'cat', ['-S', 'x', '~/.ssh/id_rsa']],
-    ['env -S cat --split-string=x .env', 'cat', ['--split-string=x', '.env']],
-    // A STR that starts with env options is read by env itself: `env -S '-i cat' .env` runs `cat .env`.
-    ["env -S '-i cat' .env", 'cat', ['.env']],
-    ["env -S' -i cat' .env", 'cat', ['.env']],
-    ["env --split-string='-u FOO cat' .env", 'cat', ['.env']],
+
+  // A backslash inside single quotes in STR: env keeps `\'` inside the quote, a shell closes it.
+  // Whichever is right, the parser does not choose: no `cat` segment, and the key path stays an
+  // operand of the unparsed env segment instead of vanishing into a comment.
+  const key = envOnly('env -S "cat \'\\\' #\' ~/.ssh/id_rsa"');
+  assert.deepEqual(key.words, ['env', '-S', "cat '\\' #' ~/.ssh/id_rsa"]);
+  assert.deepEqual(envOnly('env -S "cat \'\\\' #" some/key/file').words, ['env', '-S', "cat '\\' #", 'some/key/file']);
+  assert.deepEqual(envOnly('env -S "PA \'a\\\'b c\'" z').words, ['env', '-S', "PA 'a\\'b c'", 'z']);
+  assert.deepEqual(envOnly('env -S "PA x \'a\\\' b\'" z').words, ['env', '-S', "PA x 'a\\' b'", 'z']);
+  assert.deepEqual(envOnly('env -S "PA \'\\\\\' b" z').words, ['env', '-S', "PA '\\' b", 'z']);
+
+  // Nested inside anything that runs text or words, the env segment is still marked and still has
+  // no child, and the segments around it are not marked.
+  for (const [cmd, via] of [
+    ["bash -c \"env -S 'cat x'\"", 'shell-c'],
+    ["sh -lc \"env -S 'cat x'\"", 'shell-c'],
+    ["eval \"env -S 'cat x'\"", 'shell-c'],
+    ["echo $(env -S 'cat x')", 'subst'],
+    ["echo `env -S 'cat x'`", 'subst'],
+    ["xargs env -S 'cat x'", 'xargs'],
+    ["find . -exec env -S 'cat x' {} \\;", 'find-exec'],
+    ["find . -exec env -S 'cat x' {} +", 'find-exec'],
+    ["sh -c 'if true; then env -S \"cat x\"; fi'", 'shell-c'],
   ]) {
-    const child = only(cmd, name);
-    assert.equal(child.via, 'shell-c', cmd);
-    assert.deepEqual(commandOf(child.words).args, args, cmd);
+    const r = parse(cmd);
+    assert.equal(r.unparsed, 'env -S', cmd);
+    const env = r.segments.find((s) => cmdOf(s) === 'env');
+    assert.ok(env, cmd);
+    assert.equal(env.via, via, cmd);
+    assert.equal(env.unparsed, 'env -S', cmd);
+    assert.ok(r.segments.every((s) => cmdOf(s) !== 'cat'), cmd);
+    assert.ok(r.segments.every((s) => s.parent !== env.position), `${cmd}: env has a child`);
+    assert.deepEqual(r.segments.filter((s) => s !== env && s.unparsed !== null), [], cmd);
   }
-  // env splits STR itself, not the way a shell does: blanks and newlines separate words, quotes
-  // and a backslash group, a `#` that starts a word (or `\c`) ends the string, and `; | & < > (`
-  // are ordinary characters. The words after STR are appended to the split string, so they must
-  // never land in a comment, a redirect or a second command. Each row is one shell-c child (plus
-  // the env segment) with exactly the words real env runs.
-  for (const [cmd, name, args] of [
-    ["env -S 'cat #' ~/.ssh/id_rsa", 'cat', ['~/.ssh/id_rsa']],
-    ["env -S 'cat #c' ~/.ssh/id_rsa", 'cat', ['~/.ssh/id_rsa']],
-    ["env -S 'cat a #c' x", 'cat', ['a', 'x']],
-    ["env -S 'cat\n' ~/.ssh/id_rsa", 'cat', ['~/.ssh/id_rsa']],
-    ["env -S 'cat >' x", 'cat', ['>', 'x']],
-    ["env -S 'cat <' ~/.ssh/id_rsa", 'cat', ['<', '~/.ssh/id_rsa']],
-    ["env -S 'cat |' x", 'cat', ['|', 'x']],
-    ["env -S 'cat &' x", 'cat', ['&', 'x']],
-    ["env -S 'cat (' x", 'cat', ['(', 'x']],
-    ["env -S 'cat a;b' x", 'cat', ['a;b', 'x']],
-    ["env -S 'cat \\c' x", 'cat', ['x']],
-    ["env -S 'cat \"#\" x'", 'cat', ['#', 'x']],
-    // A `#` inside a word is literal, `\_` separates words, and a backslash escapes inside "..".
-    ["env -S 'cat x#y' z", 'cat', ['x#y', 'z']],
-    ["env -S 'cat a\\_b' x", 'cat', ['a', 'b', 'x']],
-    ["env -S 'cat \"a\\\"b\" c'", 'cat', ['a"b', 'c']],
+
+  // The parse result keeps the first reason it saw; the env segment is marked either way.
+  assert.equal(parse('env -S x ; ' + nest(4, 'x', bashC)).unparsed, 'env -S');
+  const late = parse(nest(4, 'x', bashC) + ' ; env -S x');
+  assert.equal(late.unparsed, 'depth');
+  assert.equal(late.segments.filter((s) => s.unparsed === 'env -S').length, 1);
+  const padded = parse('env -S x ' + ' '.repeat(70000));
+  assert.equal(padded.unparsed, 'size');
+  assert.equal(padded.segments[0].unparsed, 'env -S');
+
+  // No -S, no mark: env just runs its command, and an S that is a value or a command word is not -S.
+  for (const cmd of [
+    'env -u FOO cat x',
+    'env -i',
+    'env -i FOO=1 cat x',
+    'env -u Scat x',
+    'env -uS cat x',
+    'env -C S cat x',
+    'env --unset=S cat x',
+    'env cat -S x',
+    'env -- -S x',
+    'env -u -S x cat',
+    'echo env -S x',
+    'cat x',
   ]) {
-    const all = segs(cmd);
-    assert.equal(all.length, 2, `${JSON.stringify(cmd)}: ${all.map((s) => s.words.join(' ')).join(' / ')}`);
-    assert.equal(all[1].via, 'shell-c', cmd);
-    assert.equal(all[1].parent, 0, cmd);
-    assert.notEqual(all[1].pipeline, all[0].pipeline, cmd); // a `-c` style body gets a fresh id
-    assert.equal(cmdOf(all[1]), name, cmd);
-    assert.deepEqual(commandOf(all[1].words).args, args, cmd);
-    assert.deepEqual(all[1].redirects, [], cmd);
+    const r = parse(cmd);
+    assert.equal(r.unparsed, null, cmd);
+    assert.ok(r.segments.every((s) => s.unparsed === null), cmd);
   }
-  // An empty or comment-only STR with nothing after it runs no command: no child segment.
-  assert.equal(segs("env -S ''").length, 1);
-  assert.equal(segs("env -S '#c'").length, 1);
-  // The leftover words cannot start a second command or a redirect: `;` and `>` stay literal.
-  assert.deepEqual(shape("env -S cat ';' '>' x").slice(1), ['1:shell-c:0:1:cat ; > x']);
-  assert.deepEqual(segs("env -S cat '>' x")[1].redirects, []);
-  // Without -S, env just runs its command; no body to parse.
-  assert.equal(segs('env -u FOO cat x').filter((s) => s.via === 'shell-c').length, 0);
-  assert.equal(segs('env -i').length, 1);
-  // The value of -u is not a split string, even when it starts with S.
-  assert.equal(segs('env -u Scat x').filter((s) => s.via === 'shell-c').length, 0);
 });
 
 test('commit message', () => {
@@ -475,8 +532,11 @@ test('parse accepts anything and returns the documented shape', () => {
     for (let k = Math.floor(rand() * 30); k > 0; k--) cmd += pieces[Math.floor(rand() * pieces.length)] + ' ';
     const r = parse(cmd);
     const ctx = JSON.stringify(cmd);
-    assert.ok([null, 'size', 'depth'].includes(r.unparsed), ctx);
+    assert.ok([null, 'size', 'depth', 'env -S'].includes(r.unparsed), ctx);
+    // A marked segment always shows in the parse result, so a caller that checks only that is safe.
+    if (r.segments.some((s) => s.unparsed !== null)) assert.notEqual(r.unparsed, null, ctx);
     r.segments.forEach((s, i) => {
+      assert.ok(s.unparsed === null || s.unparsed === 'env -S', ctx);
       assert.equal(s.position, i, ctx);
       assert.ok(kinds.includes(s.via), ctx);
       assert.ok(Number.isInteger(s.depth) && s.depth >= 0 && s.depth <= 3, ctx);
@@ -635,11 +695,20 @@ test('commandOf', () => {
     ['do', 'do', []],
     ['!', '!', []],
     ['{', '{', []],
-    // env -S hands its string to the shell: env stays the command, and parse() does the rest.
+    // env -S is not read: env stays the command, with every word after it as an argument, and
+    // parse() marks the segment unparsed. The long form may be abbreviated, as GNU getopt allows.
     ['env -S cat', 'env', ['-S', 'cat']],
     ['env -S cat extra', 'env', ['-S', 'cat', 'extra']],
     ['env -i -S cat FOO=1', 'env', ['-i', '-S', 'cat', 'FOO=1']],
+    ['env -iScat x', 'env', ['-iScat', 'x']],
     ['sudo env --split-string=cat', 'env', ['--split-string=cat']],
+    ['env --split=cat x', 'env', ['--split=cat', 'x']],
+    ['env --split cat x', 'env', ['--split', 'cat', 'x']],
+    ['env --s cat x', 'env', ['--s', 'cat', 'x']],
+    // Not -S: a value of -u or -C, or a word after the command.
+    ['env -u S cat x', 'cat', ['x']],
+    ['env -C S cat x', 'cat', ['x']],
+    ['env cat -S x', 'cat', ['-S', 'x']],
     // Words that only look like prefixes, or are not stripped.
     ['echo sudo rm', 'echo', ['sudo', 'rm']],
     ['xargs rm x', 'xargs', ['rm', 'x']],
