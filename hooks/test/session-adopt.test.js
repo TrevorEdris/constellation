@@ -260,6 +260,24 @@ test('does not adopt a dir stamped with another UUID', () => {
   assert.equal(fs.readFileSync(path.join(dir, 'SESSION.md'), 'utf8'), original, 'another session\'s id was overwritten');
 });
 
+test('does not adopt a dot-prefixed dir under the root', () => {
+  // `.archive` has no SESSION.md, so it reads as unstamped; it is fresh, and a
+  // tool input names it. Only the "direct, non-dot child" rule keeps it out.
+  const env = hookEnv();
+  const root = env.SESSION_ROOT;
+  const hidden = makeSessionDir(root, '.archive');
+  const before = tree(hidden);
+
+  const res = stop(env, SESSION, writeTranscript({ tools: [writeTool(hidden)] }));
+
+  assert.equal(res.status, 0, res.stderr);
+  assert.deepEqual(res.json, {});
+  const scaffolded = assertScaffolded(env, 'dot-prefixed');
+  assert.notEqual(scaffolded, hidden);
+  assert.notEqual(pointerOf(root, SESSION), fs.realpathSync(hidden) + '\n', 'the pointer names the dot dir');
+  assert.deepEqual(tree(hidden), before, 'the dot dir was modified');
+});
+
 test('first prompt naming a PLAN binds to its session dir', () => {
   const seed = base => {
     const old = makeSessionDir(base, '2026-10-01_Old', '---\nschema: v1\nsession_id: other-id\n---\n\n# Old\n');
@@ -363,6 +381,27 @@ test('PLAN outside the root is ignored', () => {
     assert.deepEqual(tree(repo), repoBefore, `${label}: the repo changed`);
     assert.deepEqual(tree(old), oldBefore, `${label}: the Old dir changed`);
   }
+});
+
+test('a named PLAN wins over a hand-made dir in the same turn', () => {
+  // G11 binds the PLAN's dir (step 3) before it looks for a hand-made one (step 4).
+  // Swapped, the fresh dir would take the pointer and the record would split.
+  const env = hookEnv();
+  const root = env.SESSION_ROOT;
+  const old = makeSessionDir(root, '2026-10-01_Old', '---\nschema: v1\nsession_id: other-id\n---\n\n# Old\n');
+  fs.writeFileSync(path.join(old, 'PLAN.md'), '# Plan\n');
+  const mine = makeSessionDir(root, '2026-10-07_Mine', '---\nschema: v1\n---\n\n# Mine\n');
+  const oldBefore = tree(old);
+  const mineBefore = tree(mine);
+
+  const res = stop(env, SESSION, writeTranscript({ prompt: `Implement ${old}/PLAN.md`, tools: [writeTool(mine)] }));
+
+  assert.equal(res.status, 0, res.stderr);
+  assert.deepEqual(res.json, {});
+  assert.deepEqual(visible(root), ['2026-10-01_Old', '2026-10-07_Mine'], 'a dir was scaffolded');
+  assert.equal(pointerOf(root, SESSION), fs.realpathSync(old) + '\n', 'the pointer is not the PLAN-bound dir');
+  assert.deepEqual(tree(old), oldBefore, 'the PLAN-bound dir was modified');
+  assert.deepEqual(tree(mine), mineBefore, 'the hand-made dir was stamped');
 });
 
 test('a session that already resolves is neither re-bound to a named PLAN nor adopted again', () => {
