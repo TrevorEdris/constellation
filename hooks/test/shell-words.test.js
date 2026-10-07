@@ -147,6 +147,20 @@ test('redirects', () => {
   assert.deepEqual(s.words, ['cmd']);
   assert.deepEqual(s.redirects, [{ op: '>', target: 'log' }]);
 
+  // A descriptor followed by a space before its target is the common real shape: the target is
+  // still the redirect's, never a word of the command.
+  s = scan('cmd 2> /dev/null').segments[0];
+  assert.deepEqual(s.words, ['cmd']);
+  assert.deepEqual(s.redirects, [{ op: '>', target: '/dev/null' }]);
+
+  s = scan('c 2>> log').segments[0];
+  assert.deepEqual(s.words, ['c']);
+  assert.deepEqual(s.redirects, [{ op: '>>', target: 'log' }]);
+
+  s = scan('cat sec 2> err').segments[0];
+  assert.deepEqual(s.words, ['cat', 'sec']);
+  assert.deepEqual(s.redirects, [{ op: '>', target: 'err' }]);
+
   // `&>` needs no space before it: `cmd` is still a word and the target is `log`.
   s = scan('cmd&>log').segments[0];
   assert.deepEqual(s.words, ['cmd']);
@@ -238,6 +252,14 @@ test('heredoc delimiter rules', () => {
   assert.deepEqual(r.segments.map((s) => s.pipeline), [0, 0, 1]);
   // Several heredocs on one line read their bodies in order.
   assert.deepEqual(words('cat <<A <<B\na\nA\nb\nB\nls'), [['cat'], ['ls']]);
+  // A body ends at the FIRST line equal to its delimiter. The same text later on is an ordinary
+  // word again: reading on to a later copy would hide every command in between.
+  assert.deepEqual(words('cat <<E\nx\nE\nls\nE\nrm y'), [['cat'], ['ls'], ['E'], ['rm', 'y']]);
+  assert.deepEqual(words('cat <<E\nx\nE\nrm y\nE'), [['cat'], ['rm', 'y'], ['E']]);
+  assert.deepEqual(
+    words('cat <<A <<B\na\nA\nb\nB\nls\nA\nB\nrm z'),
+    [['cat'], ['ls'], ['A'], ['B'], ['rm', 'z']],
+  );
   // A here-string word is dropped but its substitutions are live.
   const h = scan('cat <<< "$(cat x)"').segments[0];
   assert.deepEqual(h.words, ['cat']);
@@ -302,6 +324,9 @@ test('a heredoc inside a substitution may end on DELIM) as bash allows', () => {
   r = scan('echo "$(cat <<E\nhi\nE)" ; m2 q');
   assert.deepEqual(r.segments.map((s) => s.words), [['echo', ''], ['m2', 'q']]);
   assert.deepEqual(r.segments[0].substs, ['cat <<E\nhi\nE']);
+  // A body that ended on `DELIM)` ends there too: a later line equal to the delimiter is an
+  // ordinary word, and the commands before it are not swallowed.
+  assert.deepEqual(words('echo $(cat <<E\nhi\nE) ; m2\nE\n)'), [['echo', ''], ['m2'], ['E']]);
   // Process substitution takes the same form, and so does a subshell inside a substitution.
   assert.deepEqual(words('cat <(cat <<E\nhi\nE) ; m2 q'), [['cat', ''], ['m2', 'q']]);
   assert.deepEqual(words('echo $( (cat <<E\nhi\nE) ) ; m2 q'), [['echo', ''], ['m2', 'q']]);
