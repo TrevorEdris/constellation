@@ -466,8 +466,9 @@ def classify_reply(reply: str, question_count: int, plan_path: Optional[str] = N
        "<number> <answer>" is a numbered answer, and every other chunk is cut again at sentence
        ends into text (so "1. option 3" stays one answer);
     5. a hedge word in the text is a change;
-    6. an answer is ambiguous when it is longer than MAX_ANSWER_WORDS, holds an uncertainty word or a
-       hedge word (the bare answer "no" is clean), or holds a character the card cannot carry (see
+    6. a question numbered twice is ambiguous (the later answer would hide the earlier one); an answer
+       is ambiguous when it is longer than MAX_ANSWER_WORDS, holds an uncertainty word or a hedge word
+       (the bare answer "no" is clean), or holds a character the card cannot carry (see
        ANSWER_UNSAFE_CHARS and _answer_problem);
     7. text left after approval phrases and filler are taken out is ambiguous;
     8. no approval phrase and no answer is ambiguous;
@@ -478,13 +479,13 @@ def classify_reply(reply: str, question_count: int, plan_path: Optional[str] = N
     if "?" in reply:
         return Classification(CHANGE, {}, "the reply asks a question")
 
-    answers: dict[int, str] = {}
+    numbered: list[tuple[int, str]] = []  # every numbered answer, in the order given: none is dropped
     text: list[list[str]] = []  # the tokens of each stretch of text
     for chunk in _CHUNK_SPLIT_RE.split(_without_plan_path(reply, plan_path)):
         chunk = chunk.strip()
         match = _ANSWER_RE.match(chunk)
         if match and 1 <= int(match.group(1)) <= question_count:
-            answers[int(match.group(1))] = match.group(2)  # as typed: the case is kept
+            numbered.append((int(match.group(1)), match.group(2)))  # as typed: the case is kept
         else:
             text.extend(_tokens(sentence) for sentence in _SENTENCE_END_RE.split(chunk))
 
@@ -492,6 +493,14 @@ def classify_reply(reply: str, question_count: int, plan_path: Optional[str] = N
         hedge = _first_hedge(tokens)
         if hedge:
             return Classification(CHANGE, {}, f'the reply says "{hedge}"')
+
+    # Kept in a list, not a dict, so a repeated number cannot overwrite an answer before it is checked
+    seen: set[int] = set()
+    for number, _ in numbered:
+        if number in seen:
+            return Classification(AMBIGUOUS, {}, f"answer {number} given twice")
+        seen.add(number)
+    answers = dict(numbered)
 
     for number, answer in answers.items():
         problem = _answer_problem(answer)

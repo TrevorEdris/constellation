@@ -690,6 +690,12 @@ def _approve(answers=None):
         pytest.param("2 PostgreSQL with pooled connections and read replicas, go", 3, "ambiguous", {}, id="answer-of-7-words"),
         pytest.param("go 3 inline", 3, "ambiguous", {}, id="answer-after-go-is-text"),
         pytest.param("4 yes, go", 3, "ambiguous", {}, id="answer-above-count"),
+        # A question numbered twice is unclear whichever answer comes last: the earlier one may hold the hedge
+        pytest.param("2 stop, 2 yes, go", 3, "ambiguous", {}, id="repeated-number-hides-a-hedge"),
+        pytest.param("2 yes, 2 stop, go", 3, "ambiguous", {}, id="repeated-number-hedge-last"),
+        pytest.param("2 no, 2 yes", 3, "ambiguous", {}, id="repeated-number-conflicting-answers"),
+        pytest.param("2 no, 2 no, go", 3, "ambiguous", {}, id="repeated-number-same-answer"),
+        pytest.param("2 yes, 2 no, go, wait", 3, "change", {}, id="repeated-number-then-hedge-is-a-change"),
         pytest.param("0 yes, go", 3, "ambiguous", {}, id="answer-below-one"),
         pytest.param("2 no but only admins, go", 3, "ambiguous", {}, id="answer-with-but"),
         pytest.param("2 maybe, go", 3, "ambiguous", {}, id="answer-maybe"),
@@ -772,8 +778,13 @@ def test_a_name_inside_a_longer_word_is_not_stripped(reply, plan_path):
 
 def test_answers_are_returned_only_for_an_approval():
     assert card.classify_reply("2 no, go", 3).answers == {2: "no"}
-    for reply in ("2 no, go, wait", "2 maybe, go", "2 no, but go", "2 no, go 3 inline"):
+    for reply in ("2 no, go, wait", "2 maybe, go", "2 no, but go", "2 no, go 3 inline", "2 stop, 2 yes, go"):
         assert card.classify_reply(reply, 3).answers == {}, reply
+
+
+def test_a_repeated_question_number_says_which_answer_was_given_twice():
+    result = card.classify_reply("1 yes, 2 stop, 2 yes, go", 3)
+    assert (result.kind, result.answers, result.reason) == ("ambiguous", {}, "answer 2 given twice")
 
 
 # ---------------------------------------------------------------------------
@@ -1335,6 +1346,20 @@ def test_bad_run_answer_is_ambiguous(tmp_path, reply):
     assert f"Reply needing confirmation on card 37e114a ({plan})\n  > {reply}\n" in _masked(session.read_text(encoding="utf-8"), days)
 
 
+@pytest.mark.parametrize("reply", ["2 stop, 2 no, go", "2 no, 2 yes"])
+def test_a_repeated_question_number_never_approves(tmp_path, reply):
+    # The earlier answer ("stop") must not be overwritten by the later one before it is checked
+    plan = _awaiting(tmp_path)
+    session = _session(tmp_path)
+    before = plan.read_bytes()
+
+    (out, code), days = _decide(plan, reply, session)
+
+    assert (out, code) == (CONFIRM, 3)
+    assert plan.read_bytes() == before and b"status: awaiting-approval\n" in before
+    assert f"Reply needing confirmation on card 37e114a ({plan})\n  > {reply}\n" in _masked(session.read_text(encoding="utf-8"), days)
+
+
 def test_a_reply_naming_the_plan_approves(tmp_path):
     # The plan's own path is taken out of the reply first: this directory's name holds the hedge word "Remove"
     plan = _awaiting(tmp_path / PLAN_DIR)
@@ -1556,3 +1581,14 @@ def test_cli_exit_codes(tmp_path):
         result = _run_cli("approve", plan, "--reply", reply, "--session-md", _session(tmp_path / name))
         codes[name] = (result.returncode, result.stderr)
     assert codes == {"approve": (0, ""), "change": (2, ""), "ambiguous": (3, "")}
+
+
+def test_cli_repeated_question_number_exits_3_and_leaves_the_plan_awaiting(tmp_path):
+    plan = _awaiting(tmp_path)
+    before = plan.read_bytes()
+
+    result = _run_cli("approve", plan, "--reply", "2 stop, 2 no, go", "--session-md", _session(tmp_path))
+
+    assert (result.returncode, result.stderr) == (3, "")
+    assert result.stdout == CONFIRM
+    assert plan.read_bytes() == before and b"status: awaiting-approval\n" in before
