@@ -406,26 +406,25 @@ def test_render_shows_only_human_warnings(tmp_path):
     assert card.card_word_stats(out) == (118, 58), "the Warnings line is outside the word cap"
 
 
-def test_render_warnings_line_stops_at_15_words(tmp_path):
+def test_render_joins_every_human_warning(tmp_path):
     plan = v3_plan(tmp_path, **{_COMMITS_LINE: "", _PR_TITLE_LINE: ""})
     messages = [issue.message for issue in vp.validate_plan(plan).warnings if issue.category == "git"]
     assert messages == [COMMIT_WARNING, PR_WARNING], "the plan must raise two git warnings"
 
-    out, _, _ = card.render(plan, write=False)
+    out, err, code = card.render(plan, write=False)
 
+    assert (err, code) == ("", 0)
     warnings = [line for line in out.splitlines() if line.startswith("**Warnings for you:**")]
-    assert warnings == [f"**Warnings for you:** {COMMIT_WARNING}"], "the second warning would pass 15 words"
+    assert warnings == [f"**Warnings for you:** {COMMIT_WARNING} · {PR_WARNING}"], "no human warning may be dropped"
+    assert card.card_word_stats(out) == (118, 58), "the Warnings line is outside the word cap however long it is"
 
 
 def test_warnings_line_rules():
     assert card.warnings_line([]) == ""
     assert card.warnings_line(["Two words."]) == "**Warnings for you:** Two words."
-    # Whole warnings, in order, while they fit in 15 words; joined by " · "
-    assert card.warnings_line(["a b c d e", "f g h i j", "k l m n o", "p"]) == "**Warnings for you:** a b c d e · f g h i j · k l m n o"
-    assert card.warnings_line(["a b c d e f g h i j", "k l m n o p"]) == "**Warnings for you:** a b c d e f g h i j"
-    # The first one is always shown; a first one over 15 words is cut there
+    # Every warning, in order, joined by " · ", however many words that makes
     long_first = " ".join(f"w{n}" for n in range(1, 21))
-    assert card.warnings_line([long_first, "later"]) == "**Warnings for you:** " + " ".join(f"w{n}" for n in range(1, 16)) + "…"
+    assert card.warnings_line([long_first, "second one", "third"]) == f"**Warnings for you:** {long_first} · second one · third"
 
 
 # ---------------------------------------------------------------------------

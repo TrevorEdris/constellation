@@ -55,7 +55,6 @@ EXIT_REFUSED = 1
 EXIT_USAGE = 64
 
 WARNINGS_LABEL = "**Warnings for you:**"
-WARNINGS_MAX_WORDS = 15
 FOOTER_PREFIX = "Plan: "
 SET_STATUS = "awaiting-approval"
 
@@ -78,30 +77,13 @@ def brief_sha7(brief_text: str) -> str:
 def warnings_line(messages: list[str]) -> str:
     """The card's Warnings line for the human warnings, or "" when there are none.
 
-    It holds at most WARNINGS_MAX_WORDS words of warning text: whole warnings, in
-    order, joined by " · ", for as long as the next one fits. The first is always
-    shown; if it alone is longer, it is cut at the limit and ends with an ellipsis.
+    Every warning is shown, in order, joined by " · ". The line is outside the
+    120-word budget and is never cut: a warning the user cannot see is one they
+    cannot act on, and the agent only posts this card.
     """
-    shown: list[str] = []
-    used = 0
-    for message in messages:
-        count = _words(message)
-        if shown and used + count > WARNINGS_MAX_WORDS:
-            break
-        shown.append(message)
-        used += count
-    if not shown:
+    if not messages:
         return ""
-    text = " · ".join(shown)
-    if used > WARNINGS_MAX_WORDS:  # only the first warning can be over, and it is the only one shown
-        kept, count = [], 0
-        for token in text.split():
-            count += _words(token)
-            if count > WARNINGS_MAX_WORDS:
-                break
-            kept.append(token)
-        text = " ".join(kept) + "…"
-    return f"{WARNINGS_LABEL} {text}"
+    return f"{WARNINGS_LABEL} {' · '.join(messages)}"
 
 
 def card_word_stats(card_text: str) -> tuple[int, int]:
