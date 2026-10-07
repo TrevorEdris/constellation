@@ -32,7 +32,7 @@ NO PLAN PRESENTED FOR APPROVAL WITHOUT A FRESH plan-validator PASS (>= 70)
 The plan's frontmatter `schema` picks the gate.
 
 - **`schema: plan/v3`** (exact match; the format constellation:writing-plans writes, a v3 head over the PLAN v2 body). Every error blocks: frontmatter, card, delivery, placeholder and v2-step findings. The approval card is the gate: `card.py render` prints it only for a plan the validator passes, and its footer carries the score. No score is recorded in the plan.
-- **Any other schema, or none** is a legacy plan. Its gates are under "Legacy plans (v2)". The v3 checks report on it as warnings that never change its score, plus one `legacy` warning.
+- **Any other schema, or none** is a legacy plan. Its gates are under "Legacy plans (v2)". The card and delivery checks do not run on it; the v2 Brief check does, and still deducts points. Placeholder, v2-step and Traceability-row findings report as warnings that deduct nothing, plus one `legacy` warning.
 
 ## Process
 
@@ -137,7 +137,13 @@ Five groups. Run with `--json` for machine-readable output. Score starts at 100;
 - **card** (v3) — the Brief against the card grammar: the six labels in order, the questions and the Run line, the word budgets, and the D-lines in Global Constraints.
 - **delivery** (v3) — the `delivery` block list, the card's Ships-as and Size lines against it, local-only wording, and a live git probe of each repo's remote and recent commits.
 
-The card, delivery, placeholder and v2-step groups never touch the score. On a v3 plan their findings are errors, which block; on a legacy plan they are warnings.
+The card, delivery, placeholder and v2-step groups never touch the score. Which of them run depends on the schema:
+
+- **card and delivery** run on v3 plans only, and their findings are errors, which block. A legacy plan skips both.
+- **placeholders and v2 steps** (and the Traceability-row finding) run on every plan: errors on v3, warnings on legacy, and on legacy they deduct nothing.
+- **the v2 Brief check** (the Brief missing, not first, over its word budget, short of labels, or not plain language) runs on legacy plans only, in place of card, and it still deducts points as before, like the v2 structure group.
+
+A legacy plan also gets one `legacy` warning.
 
 Every finding prints as `[category] (audience)`, and `--json` carries the same `audience` on each issue. `human` findings (categories git, brief, card and delivery) are for the person approving, and `card.py render` prints them on the card as `Warnings for you`. Every other category is for the agent that wrote the plan: fix those first.
 
