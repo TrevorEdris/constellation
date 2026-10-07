@@ -17,6 +17,9 @@
  *     substs:    string[]                          raw bodies of $(...), `...`, <(...), >(...)
  *   }
  *
+ * parse(), commandOf() and gitCmd() are layered on top of scan; they are described before their
+ * code near the end of this file, and they are what the guard rules call.
+ *
  * A segment is one simple command: the text between unquoted `; && || | |& &`, newline, `(`
  * and `)`. `{`, `}` and `!` stay ordinary words (a later layer strips them in command
  * position), so `{}`, `{a,b}` and `${X}` pass through untouched. Segments that carry no words,
@@ -25,7 +28,7 @@
  *
  * Substitution bodies are not parsed here. Each one is found by scanning to its matching `)`
  * (honoring quotes, heredocs, nested parens and `case` patterns), stored raw in `substs`, and
- * replaced by an empty string in its word; a later layer re-parses the bodies.
+ * replaced by an empty string in its word; parse(), below, re-parses the bodies.
  *
  * Arithmetic. `$((...))` and a command-leading `((...))` are skipped, though a `$(...)` nested
  * inside one is still reported. Bash calls `((` arithmetic only when the `)` that closes the
@@ -58,6 +61,8 @@
  *     pattern until the next `;;`, `;&`, `;;&` or `esac`). It does not follow extglob patterns
  *     (`@(a|b)`), a `)` inside a bracket expression (`[)]`), or `in` on a line of its own.
  */
+
+const path = require('node:path').posix;
 
 const MAX_NEST = 16;
 // Reserved words after which a command can still start, so `then case x in` is a case command
@@ -566,4 +571,282 @@ function skipTo(src, j, q) {
   return j + 1;
 }
 
-module.exports = { scan };
+// ---------------------------------------------------------------------------------------------
+// Parser layer. scan() reads one piece of shell text; the code below finds the commands that hide
+// inside a command (substitutions, `sh -c`, `eval`, `env -S`, `xargs`, `find -exec`) and reads
+// the command word behind prefixes such as `sudo` and `env`.
+//
+//   parse(cmd)     -> { segments: Segment[], unparsed: null | 'size' | 'depth' }
+//   commandOf(ws)  -> { cmd, args }
+//   gitCmd(args)   -> { sub, args, dir }
+//
+//   Segment = Raw + {
+//     position: number         index in the depth-first, source-order walk; children follow their parent
+//     via:      'top' | 'subst' | 'shell-c' | 'xargs' | 'find-exec'
+//     parent:   number | null  `position` of the segment this one came from (null at top level)
+//     depth:    number         0 at top level, 1 more for each body re-parsed
+//   }
+//
+// `pipeline` ids come from one counter per parse. An xargs or find-exec child takes its parent's
+// id (it runs inside that pipeline); a substitution or `-c` body gets fresh ids of its own.
+//
+// Limits. Only the first 64 KiB (UTF-16 code units) of the text is scanned; longer input sets
+// `unparsed: 'size'`. A body that would sit past depth 3 is skipped and sets `unparsed: 'depth'`.
+// So does a scan that reports `overflow` (see the header of this file for its three causes), but
+// in that case every segment the scan did return is kept, and its bodies are still re-parsed within
+// the depth cap: a deny-tier command in the parsed part must stay visible. The first reason set
+// wins. A caller that sees `unparsed` should add its own "could not fully read this" ask.
+// ---------------------------------------------------------------------------------------------
+
+const MAX_INPUT = 64 * 1024;
+const MAX_DEPTH = 3;
+
+function parse(cmd) {
+  let src = typeof cmd === 'string' ? cmd : '';
+  const ctx = { segments: [], unparsed: null, pipelines: 0 };
+  if (src.length > MAX_INPUT) {
+    src = src.slice(0, MAX_INPUT);
+    ctx.unparsed = 'size';
+  }
+  addBody(src, 'top', null, 0, ctx);
+  return { segments: ctx.segments, unparsed: ctx.unparsed };
+}
+
+/** Note that part of the command was not parsed. The first reason set stays. */
+function skip(ctx, why) {
+  if (ctx.unparsed === null) ctx.unparsed = why;
+}
+
+/** Scan `src` as shell text at `depth` and add its segments (and, below them, their children). */
+function addBody(src, via, parent, depth, ctx) {
+  if (depth > MAX_DEPTH) {
+    skip(ctx, 'depth');
+    return;
+  }
+  const r = scan(src);
+  if (r.overflow) skip(ctx, 'depth');
+  // Each scan numbers its own pipelines from 0; give this body's pipelines ids from the shared counter.
+  const ids = new Map();
+  for (const raw of r.segments) if (!ids.has(raw.pipeline)) ids.set(raw.pipeline, ctx.pipelines++);
+  for (const raw of r.segments) addSegment(raw, ids.get(raw.pipeline), via, parent, depth, ctx);
+}
+
+function addSegment(raw, pipeline, via, parent, depth, ctx) {
+  const seg = Object.assign({}, raw, { pipeline, position: ctx.segments.length, via, parent, depth });
+  ctx.segments.push(seg);
+  // A substitution runs while the words are expanded, so its commands come before the segment's own.
+  for (const body of raw.substs) addBody(body, 'subst', seg.position, depth + 1, ctx);
+  for (const e of hiddenCommands(raw.words)) {
+    if (e.src !== undefined) {
+      addBody(e.src, e.via, seg.position, depth + 1, ctx);
+    } else if (depth + 1 > MAX_DEPTH) {
+      skip(ctx, 'depth');
+    } else {
+      // The words are already split and unquoted, so the child is built from them directly.
+      const child = { words: e.words, redirects: [], pipeline: seg.pipeline, substs: [] };
+      addSegment(child, seg.pipeline, e.via, seg.position, depth + 1, ctx);
+    }
+  }
+}
+
+const SHELLS = new Set(['bash', 'sh', 'zsh', 'dash', 'ksh']);
+const FIND_EXEC = new Set(['-exec', '-execdir', '-ok', '-okdir']);
+
+/**
+ * The commands a segment runs through its arguments: {via, src} for text to scan (`-c` strings,
+ * eval, env -S) or {via, words} for a command already split into words (xargs, find -exec).
+ */
+function hiddenCommands(words) {
+  const { cmd, args } = commandOf(words);
+  if (SHELLS.has(cmd)) {
+    const body = shellBody(args);
+    return body === null ? [] : [{ via: 'shell-c', src: body }];
+  }
+  // eval joins its arguments with spaces and runs the result, so `eval cat x` and `eval "cat x"` agree.
+  if (cmd === 'eval') return args.length ? [{ via: 'shell-c', src: args.join(' ') }] : [];
+  if (cmd === 'env') {
+    const split = readOptions(args, 0, PREFIXES.get('env')).values.S;
+    return split === undefined ? [] : [{ via: 'shell-c', src: split }];
+  }
+  if (cmd === 'xargs') {
+    const rest = args.slice(readOptions(args, 0, XARGS).next);
+    return [{ via: 'xargs', words: rest.length ? rest : ['echo'] }];
+  }
+  if (cmd === 'find') return findClauses(args).map((w) => ({ via: 'find-exec', words: w }));
+  return [];
+}
+
+/**
+ * The command string of `sh [options] -c STRING`, or null when there is none. Options end at the
+ * first word that is not one (or at `--`); `-c` may sit in a cluster (`-lc`, `-ec`); `-o` and `-O`
+ * take the next word; the rest after the string are positional parameters. Without `-c` the first
+ * word is a script file, which is not parsed.
+ */
+function shellBody(args) {
+  let hasC = false;
+  let i = 0;
+  while (i < args.length) {
+    const w = args[i];
+    if (w === '--') { i++; break; }
+    if (w.length < 2 || (w[0] !== '-' && w[0] !== '+')) break;
+    i++;
+    if (w[1] === '-') {
+      if (w === '--rcfile' || w === '--init-file') i++;
+      continue;
+    }
+    for (let k = 1; k < w.length; k++) {
+      if (w[k] === 'c' && w[0] === '-') hasC = true;
+      else if (w[k] === 'o' || w[k] === 'O') i++;
+    }
+  }
+  return hasC && i < args.length ? args[i] : null;
+}
+
+/**
+ * Each `-exec|-execdir|-ok|-okdir cmd ... ;|+` clause of a find command's arguments, as word lists.
+ * `+` ends a clause only right after `{}` (elsewhere it is an argument). A clause with no
+ * terminator runs to the end: find would refuse it, but reporting its command costs nothing.
+ */
+function findClauses(args) {
+  const out = [];
+  for (let i = 0; i < args.length; i++) {
+    if (!FIND_EXEC.has(args[i])) continue;
+    const clause = [];
+    let j = i + 1;
+    for (; j < args.length; j++) {
+      if (args[j] === ';' || (args[j] === '+' && args[j - 1] === '{}')) break;
+      clause.push(args[j]);
+    }
+    if (clause.length) out.push(clause);
+    i = j;
+  }
+  return out;
+}
+
+// -- Command words ------------------------------------------------------------------------------
+
+const ASSIGN = /^[A-Za-z_][A-Za-z0-9_]*\+?=/;
+// Words that can come before a command in command position. Matched as written, not by basename.
+const RESERVED = new Set(['if', 'then', 'else', 'elif', 'do', 'while', 'until', '!', '{', '}']);
+
+// An option table. `short`: letters whose value is the rest of the cluster or else the next word.
+// `long`: long option name -> the letter it stands for, for long options that take a value (as
+// `--name=value` or as the next word). Any other `-x` or `--name` is a flag with no value.
+function opts(short, long) {
+  return { short, long: long || {}, operands: 0 };
+}
+
+// Prefixes commandOf strips: commands that run another command given as their trailing words.
+// Matched by basename, so `/usr/bin/env` counts. `operands` is how many plain words follow the
+// options before the command (timeout's duration).
+const PREFIXES = new Map([
+  ['sudo', opts('ughpCDrtUT', { user: 'u', group: 'g', host: 'h', prompt: 'p', 'close-from': 'C', chdir: 'D', role: 'r', type: 't', 'other-user': 'U', 'command-timeout': 'T' })],
+  // -S takes a string for the shell (see hiddenCommands); commandOf stops there.
+  ['env', opts('uCS', { unset: 'u', chdir: 'C', 'split-string': 'S' })],
+  ['command', opts('')],
+  ['builtin', opts('')],
+  ['nohup', opts('')],
+  ['exec', opts('a')],
+  ['nice', opts('n', { adjustment: 'n' })],
+  ['timeout', Object.assign(opts('sk', { signal: 's', 'kill-after': 'k' }), { operands: 1 })],
+  ['stdbuf', opts('ioe', { input: 'i', output: 'o', error: 'e' })],
+  // Reserved in bash (`time -p cmd`) and also an external program (`/usr/bin/time -o f cmd`).
+  ['time', opts('of', { output: 'o', format: 'f' })],
+]);
+
+// xargs. GNU's long forms of -I, -L and -E take an optional value (`--replace=R`, never a
+// separate word), so only the others consume the next word.
+const XARGS = opts('ILnPdEsa', { 'arg-file': 'a', delimiter: 'd', 'max-args': 'n', 'max-procs': 'P', 'max-chars': 's' });
+
+const basename = (w) => w.slice(w.lastIndexOf('/') + 1);
+
+/**
+ * Read the options that start at words[i]. Returns the index of the first word that is not an
+ * option (after an optional `--`) and the values taken, keyed by the option's letter. Short
+ * options may be clustered (`-Eu root`); a valued one takes the rest of its cluster (`-uroot`) or
+ * else the next word.
+ */
+function readOptions(words, i, spec) {
+  const values = {};
+  while (i < words.length) {
+    const w = words[i];
+    if (w === '--') { i++; break; }
+    if (w.length < 2 || w[0] !== '-') break;
+    i++;
+    if (w[1] === '-') {
+      const eq = w.indexOf('=');
+      const name = eq === -1 ? w.slice(2) : w.slice(2, eq);
+      if (Object.hasOwn(spec.long, name)) {
+        if (eq !== -1) values[spec.long[name]] = w.slice(eq + 1);
+        else if (i < words.length) values[spec.long[name]] = words[i++];
+      }
+      continue;
+    }
+    for (let k = 1; k < w.length; k++) {
+      if (!spec.short.includes(w[k])) continue;
+      if (k + 1 < w.length) values[w[k]] = w.slice(k + 1);
+      else if (i < words.length) values[w[k]] = words[i++];
+      break;
+    }
+  }
+  return { next: i, values };
+}
+
+/**
+ * The command a segment runs and its arguments, found by stripping from the front, repeatedly:
+ * `NAME=value` words, the reserved words `if then else elif do while until ! { }`, and the
+ * prefix commands in PREFIXES with their options. `cmd` is the basename. When nothing is left
+ * after a prefix, the prefix is the command (bare `env`, `sudo`, `time`), with the words after it
+ * as `args`; with no words at all (or only assignments) `cmd` is ''. `env -S STRING` is also left
+ * as `env`: its string is a command line that parse() reads.
+ */
+function commandOf(words) {
+  const w = Array.isArray(words) ? words : [];
+  let i = 0;
+  let last = -1; // index of the last reserved word or prefix stripped
+  while (i < w.length) {
+    const word = w[i];
+    if (ASSIGN.test(word)) { i++; continue; }
+    if (RESERVED.has(word)) { last = i++; continue; }
+    const name = basename(word);
+    const spec = PREFIXES.get(name);
+    if (!spec) break;
+    last = i;
+    const o = readOptions(w, i + 1, spec);
+    if (name === 'env' && o.values.S !== undefined) return { cmd: 'env', args: w.slice(i + 1) };
+    i = o.next + spec.operands;
+  }
+  if (i < w.length) return { cmd: basename(w[i]), args: w.slice(i + 1) };
+  if (last === -1) return { cmd: '', args: [] };
+  return { cmd: basename(w[last]), args: w.slice(last + 1) };
+}
+
+/**
+ * Split git's arguments (the words after `git`) into subcommand, its arguments and the directory
+ * named by `-C`. Global options before the subcommand are skipped: `-c k=v`, `--git-dir`,
+ * `--work-tree` and `--namespace` (with a value, attached by `=` or as the next word), and any
+ * other option such as `--no-pager`, `-P`, `--paginate`, `--bare`, `--literal-pathspecs` or
+ * `--no-optional-locks`. Several `-C` compose left to right, as git does: a relative path extends
+ * the previous one, an absolute path replaces it. `dir` is '' when no `-C` was given; `sub` is ''
+ * when there is no subcommand.
+ */
+function gitCmd(args) {
+  const a = Array.isArray(args) ? args : [];
+  let dir = '';
+  let i = 0;
+  while (i < a.length && a[i].length > 1 && a[i][0] === '-') {
+    const w = a[i++];
+    if (w === '-C') {
+      if (i < a.length) dir = joinDir(dir, a[i++]);
+    } else if (w === '-c' || w === '--git-dir' || w === '--work-tree' || w === '--namespace') {
+      i++;
+    }
+  }
+  return { sub: i < a.length ? a[i] : '', args: a.slice(i + 1), dir };
+}
+
+function joinDir(dir, next) {
+  return dir === '' || path.isAbsolute(next) ? next : path.join(dir, next);
+}
+
+module.exports = { scan, parse, commandOf, gitCmd };
