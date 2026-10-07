@@ -2224,6 +2224,23 @@ AGENTIC_WORKERS = (
     "> **For agentic workers:** REQUIRED SUB-SKILL: constellation:subagent-driven-development "
     "(inline: its references/executing-plans). Run is answered on the card."
 )
+# The v2 sections whose first line is guidance for the plan's author. The template turns each
+# into a `> Template:` line, which the placeholder check rejects if a filled plan keeps it.
+GUIDED_SECTIONS = (
+    "Brief",
+    "Global Constraints",
+    "Target repo & files",
+    "Estimated PR size",
+    "Architecture decision",
+    "Ordered steps",
+    "Verification (aggregate)",
+    "Out of scope",
+    "Git strategy",
+)
+TEMPLATE_GUIDANCE = "> Template:"
+# What a body line may be besides guidance: a heading, a table row, a bold label, a numbered step,
+# a D-line or the `Assumptions:` stub. Anything else is scaffold prose the author could ship by accident.
+BODY_SCAFFOLD_LINE = re.compile(r"^(#|\||\*\*|\d+\. |- D\d+ \[|Assumptions:|> Template:)")
 
 
 def _template_lines() -> list[str]:
@@ -2295,3 +2312,74 @@ def test_template_head_has_the_card_brief_and_global_constraints():
     rule = lines.index("---", vp.parse_frontmatter("\n".join(lines)).end_line)
     assert lines[rule + 1] == AGENTIC_WORKERS
     assert lines.index("## Global Constraints") > rule + 1
+
+
+def _next_nonblank(lines: list[str], index: int) -> str:
+    """The first non-blank line after lines[index]."""
+    return next(line for line in lines[index + 1:] if line.strip())
+
+
+def test_template_guidance_lines_carry_the_template_prefix():
+    lines = _template_lines()
+    # the line under the title ...
+    title = next(i for i, line in enumerate(lines) if re.match(r"^#\s+PLAN\s*:", line))
+    assert _next_nonblank(lines, title).startswith(TEMPLATE_GUIDANCE)
+    # ... and the first line under each section that opens with guidance
+    unprefixed = [s for s in GUIDED_SECTIONS if not _next_nonblank(lines, lines.index(f"## {s}")).startswith(TEMPLATE_GUIDANCE)]
+    assert unprefixed == []
+    # no body line is raw scaffold prose: a guidance line that lost its prefix would ship in a filled plan
+    body = lines[lines.index("## Global Constraints"):]
+    stray = [line for line in body if line.strip() and not BODY_SCAFFOLD_LINE.match(line)]
+    assert stray == []
+
+
+def _fill_template(tmp_path: Path) -> Path:
+    """Write a filled copy of the real template to tmp_path/PLAN.md and return its path.
+
+    Fills every `<slot>` in the head with a valid value, so the template's field formats
+    (Ships-as, Size, Delivers, Flags, the D-lines, the delivery item) are what is tested. An
+    unknown slot fails loudly. The `> Template:` lines are dropped, as an author drops them.
+    The body keeps its slots: only the card, delivery and schema checks are asked about here.
+    """
+    repo = make_repo(tmp_path / "repo")
+    text = TEMPLATE.read_text(encoding="utf-8")
+    text = text.replace("{{DATE}}", "2026-10-07").replace("{{SLUG}}", "Fill-Check")
+    head, body_marker, body = text.partition("## Target repo & files")
+    head = "\n".join(line for line in head.splitlines() if not line.startswith(TEMPLATE_GUIDANCE)) + "\n"
+    counts = iter(["120", "4", "3"])  # lines, files, tasks in the Size line
+    fill = {
+        "absolute path to the repo": str(repo),
+        "title": "Fill check",
+        "branch": "feat/fill-check",
+        "remote": "origin",
+        "base": "main",
+        "question": "Share links expire",
+        "default": "after 30 days",
+        "why": "limits leaked links",
+        "cost": "one config value",
+        "decision": "Viewer reuses the list component",
+        "user": "signed-in user",
+        "action": "share a list by link",
+    }
+
+    def slot(match: "re.Match[str]") -> str:
+        name = match.group(1)
+        if name == "N":
+            return next(counts)
+        assert name in fill, f"template slot <{name}> has no fill value in this test"
+        return fill[name]
+
+    plan = tmp_path / "PLAN.md"
+    plan.write_text(re.sub(r"<([^<>]+)>", slot, head) + body_marker + body, encoding="utf-8")
+    return plan
+
+
+def test_filled_template_has_no_card_delivery_or_schema_findings(tmp_path):
+    plan = _fill_template(tmp_path)
+    lines = plan.read_text(encoding="utf-8").splitlines()
+    # the fill is a v3 plan with a real card, so the checks below ran in error mode on something
+    assert vp.is_v3(vp.parse_frontmatter("\n".join(lines)))
+    assert [q.is_run for q in vp.parse_card(lines).questions] == [False, True]
+    report = vp.validate_plan(plan)
+    findings = [(i.severity, i.category, i.rule, i.message) for i in report.issues if i.category in ("card", "delivery", "schema")]
+    assert findings == []
