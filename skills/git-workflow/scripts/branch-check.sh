@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # branch-check.sh — Validate a branch name against naming conventions
 #
+# Names are lowercase "<type>/<description>". The one uppercase exception is a
+# ticket ID right after the type (feature/PROJ-42-add-login); suggestions keep it.
+#
 # Usage: branch-check.sh <branch-name>
 #
 # Output:
@@ -15,6 +18,17 @@
 #   2  - Usage error (no argument provided)
 set -euo pipefail
 
+# ── Constants ─────────────────────────────────────────────────────────────────
+
+# Single source of truth for the type list: every printed list derives from it.
+VALID_TYPES="feature|feat|fix|hotfix|chore|docs|refactor|test|release|experiment|ci|perf"
+MAX_TOTAL_LEN=100
+MAX_DESC_LEN=50
+
+# A ticket ID (PROJ-42) directly after "<type>/" may be uppercase; nothing else
+# may. It needs digits after the hyphen and ends at '-' or the end of the name.
+TICKET_RE='^[A-Z][A-Z0-9]*-[0-9]+(-|$)'
+
 # ── Usage ─────────────────────────────────────────────────────────────────────
 
 if [ $# -eq 0 ]; then
@@ -25,17 +39,11 @@ if [ $# -eq 0 ]; then
   echo "  branch-check.sh 'Feature/AddOAuthLogin'              # FAIL"
   echo "  branch-check.sh 'fix/null-pointer-on-logout'         # PASS"
   echo ""
-  echo "Valid types: feature, fix, hotfix, chore, docs, refactor, test, release, experiment"
+  echo "Valid types: ${VALID_TYPES//|/, }"
   exit 2
 fi
 
 BRANCH="$1"
-
-# ── Constants ─────────────────────────────────────────────────────────────────
-
-VALID_TYPES="feature|fix|hotfix|chore|docs|refactor|test|release|experiment"
-MAX_TOTAL_LEN=100
-MAX_DESC_LEN=50
 
 # ── Collect validation failures ───────────────────────────────────────────────
 
@@ -65,18 +73,41 @@ if [ -n "$TYPE" ]; then
       FAILURES+=("Type '$TYPE' must be lowercase (found uppercase)")
       SUGGESTIONS+=("$LOWER_TYPE/$REST")
     else
-      FAILURES+=("Unknown type '$TYPE'. Valid types: feature, fix, hotfix, chore, docs, refactor, test, release, experiment")
+      FAILURES+=("Unknown type '$TYPE'. Valid types: ${VALID_TYPES//|/, }")
       SUGGESTIONS+=("feature/$REST")
     fi
   fi
 fi
 
-# ── Check: No uppercase letters ───────────────────────────────────────────────
+# ── Split off a leading ticket ID ─────────────────────────────────────────────
+#
+# TICKET keeps its case and trailing hyphen (e.g. "PROJ-42-"). Only a name that
+# has a type prefix can carry one. DESC_WITHOUT_TICKET is what the uppercase and
+# description-length checks look at.
 
-if echo "$BRANCH" | grep -q '[A-Z]'; then
-  LOWER=$(echo "$BRANCH" | tr '[:upper:]' '[:lower:]')
+TICKET=""
+DESC_WITHOUT_TICKET="$REST"
+if [ -n "$TYPE" ] && [[ "$REST" =~ $TICKET_RE ]]; then
+  TICKET="${BASH_REMATCH[0]}"
+  DESC_WITHOUT_TICKET="${REST#"$TICKET"}"
+fi
+
+lowercase() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+
+# The name in lowercase, with the ticket ID left as typed.
+if [ -n "$TICKET" ]; then
+  LOWERED="$(lowercase "$TYPE")/$TICKET$(lowercase "$DESC_WITHOUT_TICKET")"
+  UPPERCASE_SUBJECT="$TYPE/$DESC_WITHOUT_TICKET"
+else
+  LOWERED="$(lowercase "$BRANCH")"
+  UPPERCASE_SUBJECT="$BRANCH"
+fi
+
+# ── Check: No uppercase letters (a leading ticket ID excepted) ────────────────
+
+if echo "$UPPERCASE_SUBJECT" | grep -q '[A-Z]'; then
   FAILURES+=("Contains uppercase letters")
-  SUGGESTIONS+=("$LOWER")
+  SUGGESTIONS+=("$LOWERED")
 fi
 
 # ── Check: No underscores ─────────────────────────────────────────────────────
@@ -127,14 +158,12 @@ fi
 # ── Check: Description length ─────────────────────────────────────────────────
 
 if [ -n "$REST" ]; then
-  # Strip ticket ID prefix if present (e.g., PROJ-123-)
-  DESC_WITHOUT_TICKET=$(echo "$REST" | sed 's/^[A-Z][A-Z0-9]*-[0-9]*-//')
+  # The ticket ID (e.g. PROJ-123-) does not count toward the description.
   DESC_LEN=${#DESC_WITHOUT_TICKET}
   if [ "$DESC_LEN" -gt "$MAX_DESC_LEN" ]; then
     FAILURES+=("Description segment is ${DESC_LEN} chars (max ${MAX_DESC_LEN}): '$DESC_WITHOUT_TICKET'")
     TRUNCATED=$(echo "$DESC_WITHOUT_TICKET" | cut -c1-"$MAX_DESC_LEN" | sed 's/-[^-]*$//')
-    TICKET_PREFIX=$(echo "$REST" | grep -oE '^[A-Z][A-Z0-9]*-[0-9]*-' || true)
-    SUGGESTIONS+=("$TYPE/$TICKET_PREFIX$TRUNCATED")
+    SUGGESTIONS+=("$TYPE/$TICKET$TRUNCATED")
   fi
 fi
 
@@ -160,11 +189,12 @@ else
   # Show the first suggestion (most relevant fix)
   if [ "${#SUGGESTIONS[@]}" -gt 0 ]; then
     # Apply all suggestions sequentially to produce one final corrected name
-    CORRECTED="$BRANCH"
-    CORRECTED=$(echo "$CORRECTED" | tr '[:upper:]' '[:lower:]')
+    # LOWERED already keeps a leading ticket ID's case, so the character
+    # class admits A-Z: only that ticket can still be uppercase here.
+    CORRECTED="$LOWERED"
     CORRECTED=$(echo "$CORRECTED" | tr '_' '-')
     CORRECTED=$(echo "$CORRECTED" | tr ' ' '-')
-    CORRECTED=$(echo "$CORRECTED" | sed 's/[^a-z0-9\/\-\.]/-/g')
+    CORRECTED=$(echo "$CORRECTED" | sed 's|[^A-Za-z0-9/._-]|-|g')
     CORRECTED=$(echo "$CORRECTED" | sed 's/[-\/]*$//')
     echo "  Suggestion: $CORRECTED"
   fi

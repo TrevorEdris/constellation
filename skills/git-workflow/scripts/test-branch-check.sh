@@ -4,7 +4,8 @@
 # Why this exists: branch-check.sh shipped a bracket expression that silently
 # excluded the literal hyphen, so it rejected nearly every real branch name
 # while its own error text claimed hyphens were allowed. These tests pin the
-# accept/reject boundary so that class of bug cannot return unnoticed.
+# accept/reject boundary so that class of bug cannot return unnoticed. They also
+# pin the full type list and the uppercase-ticket exception.
 #
 # Usage: test-branch-check.sh
 #
@@ -48,7 +49,7 @@ expect_valid() {
   if [ "$status" -eq 0 ] && [ "${out%%$'\n'*}" = "PASS: $branch" ]; then
     report ok "valid: $branch"
   else
-    report "not ok" "valid: $branch" "expected PASS/exit 0, got exit $status: ${out%%$'\n'*}"
+    report "not ok" "valid: $branch" "expected PASS/exit 0, got exit $status: $(printf '%s' "$out" | sed -n 's/^ *Reason: //p' | paste -sd ';' -)"
   fi
 }
 
@@ -77,6 +78,52 @@ expect_suggestion_differs() {
   fi
 }
 
+# The suggestion must be exactly the expected corrected name. This is stricter
+# than expect_suggestion_differs: it catches a fix that rewrites the ticket ID.
+expect_suggestion() {
+  local branch="$1" expected="$2" out suggestion
+  out="$(bash "$TARGET" "$branch" 2>&1)"
+  suggestion="$(printf '%s' "$out" | sed -n 's/^ *Suggestion: //p' | head -1)"
+  if [ "$suggestion" = "$expected" ]; then
+    report ok "suggestion: $branch -> $expected"
+  else
+    report "not ok" "suggestion: $branch" "expected '$expected', got '${suggestion:-<none>}'"
+  fi
+}
+
+# Both printed type lists (usage text, Unknown-type reason) must name every type
+# as a whole word. Only the list line is searched, so an example such as
+# 'fix/null-pointer' elsewhere in the output cannot satisfy 'fix'. A whole-word
+# match also stops 'feature' from satisfying 'feat'.
+ALL_TYPES="feature feat fix hotfix chore docs refactor test release experiment ci perf"
+
+expect_types_listed() {
+  local out line type missing
+  out="$(bash "$TARGET" 2>&1)"
+  line="$(printf '%s\n' "$out" | grep '^Valid types:')"
+  missing=""
+  for type in $ALL_TYPES; do
+    printf '%s' "$line" | grep -qw -- "$type" || missing="$missing $type"
+  done
+  if [ -z "$missing" ]; then
+    report ok "usage lists every type"
+  else
+    report "not ok" "usage lists every type" "missing:$missing"
+  fi
+
+  out="$(bash "$TARGET" "banana/x" 2>&1)"
+  line="$(printf '%s\n' "$out" | grep "Unknown type")"
+  missing=""
+  for type in $ALL_TYPES; do
+    printf '%s' "$line" | grep -qw -- "$type" || missing="$missing $type"
+  done
+  if [ -z "$missing" ]; then
+    report ok "Unknown-type reason lists every type"
+  else
+    report "not ok" "Unknown-type reason lists every type" "missing:$missing"
+  fi
+}
+
 expect_usage_error() {
   local out status
   out="$(bash "$TARGET" 2>&1)"
@@ -100,6 +147,19 @@ expect_valid "feature/git-workflow-stack-mode"
 expect_valid "chore/bump-deps-v2.1.0"
 expect_valid "hotfix/payment-gateway-timeout"
 
+# Every type in the convention, including the ones the repo's own branches use
+# (feat/, ci/) and SKILL.md teaches (ci, perf). A dropped type fails here.
+expect_valid "feat/add-login"
+expect_valid "ci/version-check"
+expect_valid "perf/cache-warmup"
+expect_valid "release/v2.3.0"
+
+# A ticket ID right after the type may be uppercase. Checking uppercase on the
+# whole name instead of the part after the ticket fails all three.
+expect_valid "feature/PROJ-42-add-oauth"
+expect_valid "feature/PROJ-42-add-oauth-login"
+expect_valid "fix/ENG-456-null-pointer"
+
 # ── Cases: names that must still be rejected ──────────────────────────────────
 # Widening the character class must not swallow these.
 
@@ -109,10 +169,27 @@ expect_invalid "feature/has!bang"       "invalid special characters"
 expect_invalid "feature/has@at"         "invalid special characters"
 expect_invalid "banana/some-thing"      "Unknown type"
 
+# Uppercase is allowed only in the ticket. Everything else stays lowercase.
+expect_invalid "feature/AddOAuthLogin"      "uppercase"
+expect_invalid "feature/PROJ-42-AddLogin"   "uppercase"
+expect_invalid "Feat/add-login"             "must be lowercase"
+# The ticket exception sits right after the type, and needs digits after the
+# hyphen. 'PROJ--' only passed while the pattern read [0-9]* instead of [0-9]+.
+expect_invalid "feature/add-PROJ-42-login"  "uppercase"
+expect_invalid "feature/PROJ--add-login"    "uppercase"
+
 # ── Cases: rejection output must be actionable ────────────────────────────────
 
 expect_suggestion_differs "feature/has_underscore"
 expect_suggestion_differs "feature/has!bang"
+
+# The suggestion must keep the ticket ID's case. Lowercasing the whole name
+# would turn PROJ-42 into proj-42.
+expect_suggestion "feature/PROJ-42-Add-Login" "feature/PROJ-42-add-login"
+
+# ── Cases: printed type lists come from VALID_TYPES ───────────────────────────
+
+expect_types_listed
 
 # ── Cases: argument handling ──────────────────────────────────────────────────
 
