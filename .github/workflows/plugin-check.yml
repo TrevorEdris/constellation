@@ -1,0 +1,36 @@
+name: plugin-check
+
+# Runs scripts/check.sh: node syntax and tests, pytest, the generator checks,
+# the version files, and the skills' bash tests. The job id and name are both
+# `plugin-check` so branch protection can require it by that name.
+# No `branches` filter on pull_request: a PR in a stack targets another
+# feature branch, and it must be checked too.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  plugin-check:
+    name: plugin-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pytest
+        run: python -m pip install 'pytest>=8,<10'
+
+      - name: Run plugin checks
+        run: bash scripts/check.sh
