@@ -154,6 +154,34 @@ test('not denied: look-alikes of the deny tier return null', () => {
   for (const cmd of rows) assert.equal(run(cmd), null, cmd);
 });
 
+test('deny rules: every system directory and every disk device prefix is covered', () => {
+  const systemDirs = ['/bin', '/boot', '/dev', '/etc', '/lib', '/opt', '/private', '/proc', '/sbin', '/sys', '/usr', '/var', '/System',
+    '/Library', '/Applications', '/Users', '/home', '/root'];
+  for (const dir of systemDirs) {
+    for (const cmd of [`rm -rf ${dir}`, `rm -rf ${dir}/`, `rm -rf ${dir}/*`, `sudo rm -r ${dir}`]) {
+      const d = run(cmd);
+      assert.equal(d?.decision, 'deny', cmd);
+      assert.equal(d.id, 'rm-system-dir', cmd);
+    }
+    // Only the directory itself (or everything directly under it) is denied, never a lookalike name.
+    for (const cmd of [`rm -rf ${dir}x`, `rm -rf ${dir}-old`, `rm -rf ${dir}/a/b`]) assert.equal(run(cmd), null, cmd);
+  }
+
+  // dd and a redirect, for every device family the rule names. Pseudo devices are not disks.
+  const disks = ['/dev/disk2', '/dev/rdisk3', '/dev/sda', '/dev/sda1', '/dev/hda', '/dev/hdb2', '/dev/vda', '/dev/vdb1', '/dev/xvda', '/dev/xvdf1',
+    '/dev/nvme0n1', '/dev/nvme0n1p1', '/dev/mmcblk0', '/dev/mmcblk0p1'];
+  for (const dev of disks) {
+    for (const cmd of [`dd if=img of=${dev}`, `echo x > ${dev}`, `echo x >> ${dev}`]) {
+      const d = run(cmd);
+      assert.equal(d?.decision, 'deny', cmd);
+      assert.equal(d.id, 'disk-write', cmd);
+    }
+  }
+  for (const dev of ['/dev/null', '/dev/zero', '/dev/tty', '/dev/stdout', '/dev/stderr', '/dev/random', '/dev/fd/3', '/dev/shm/x', '/dev/pts/0']) {
+    for (const cmd of [`dd if=img of=${dev}`, `echo x > ${dev}`]) assert.equal(run(cmd), null, cmd);
+  }
+});
+
 test('read-secret asks (never denies) for ask-tier paths', () => {
   const rows = [
     // [command, pathId]
@@ -215,6 +243,9 @@ test('read-secret: which words of a reader are paths', () => {
     ['sort .env', 'env-file'],
     ['cut -d= -f2 .env', 'env-file'],
     ['yq .a .env', 'env-file'],
+    // yq is a reader but not a pattern reader (the brief lists jq only): its filter is checked as a
+    // path too, which is a prompt at worst. jq's filter `.env` above is not.
+    ['yq .env config.yml', 'env-file'],
     ['cat secrets.json', 'secrets-file'],
     ['cat .aws', 'secret-dir'],
     ['grep -r token ~/.ssh', 'secret-dir'],
@@ -252,6 +283,150 @@ test('read-secret: which words of a reader are paths', () => {
   const d = run('sort < ~/.ssh/id_rsa');
   assert.equal(d.decision, 'deny');
   assert.equal(d.pathId, 'ssh-private-key');
+});
+
+test('read-secret: the value of an option is neither the pattern nor a file', () => {
+  // A valued option in front of the pattern (-A 2, -t md, -v k=1, --arg k v) used to shift the words
+  // by one: its value passed for the pattern and the real pattern was read as a file, so a search
+  // FOR the name `id_rsa` was denied, and a deny cannot be approved. So was the value of -e.
+  const searches = [
+    'rg -t md id_rsa docs',
+    'rg --type md id_rsa docs',
+    'rg --type=md id_rsa docs',
+    "rg -g '*.md' id_rsa",
+    'rg -A 2 -B 2 id_rsa docs',
+    'rg -r X id_rsa docs',
+    'rg -it md id_rsa docs',
+    'rg -e id_rsa docs',
+    'ag -m 1 id_rsa docs',
+    'grep -A 2 id_rsa README.md',
+    'grep -A2 id_rsa README.md',
+    'grep -C 3 id_rsa README.md',
+    'grep -B 2 id_rsa README.md',
+    'grep -m 1 id_rsa README.md',
+    'grep -d skip -r id_rsa .',
+    'grep -nA 2 id_rsa README.md',
+    'grep -e id_rsa README.md',
+    'grep -ie id_rsa README.md',
+    'grep -ne id_rsa README.md',
+    'fgrep -A 2 id_rsa README.md',
+    'grep -rn -e id_rsa -e id_ed25519 docs',
+    'grep --regexp id_rsa README.md',
+    'grep --regexp=id_rsa README.md',
+    'grep --include "*.md" -rn id_rsa .',
+    'grep --exclude-dir node_modules -rn id_rsa .',
+    'egrep -A 1 id_rsa README.md',
+    'awk -v k=1 "/id_rsa/" README.md',
+    'gawk -v k=1 "/id_rsa/" README.md',
+    "awk -F: '/id_rsa/ {print $1}' notes.txt",
+    "awk -F : -v k=1 '/id_rsa/' notes.txt",
+    'sed -e id_rsa README.md',
+    'sed --expression=id_rsa README.md',
+    "sed -n -e '/id_rsa/p' notes.txt",
+    "jq --arg k id_rsa '.[$k]' README.json",
+    "jq -n --argjson n 1 --arg k id_rsa '$k'",
+    "jq --arg k v '.id_rsa' README.json",
+    'jq --argjson n 1 id_rsa README.json',
+    'jq --indent 2 id_rsa README.json',
+    // Not pattern suppliers there: ag's -f follows symlinks, jq's -e sets the exit status.
+    'ag -f id_rsa docs',
+    'jq -e id_rsa README.json',
+    // The same shapes with an ask-tier name.
+    'grep -A 2 .env README.md',
+    'grep -e .env README.md',
+    'rg -t md .env docs',
+    'jq -e .ssh config.json',
+  ];
+  for (const cmd of searches) assert.equal(run(cmd), null, cmd);
+
+  // A read after the same options is still a read: only the words that are not files are skipped.
+  const reads = [
+    'grep -n KEY ~/.ssh/id_rsa',
+    'grep -rn -A 2 KEY ~/.ssh/id_rsa',
+    'grep -e KEY -e TOKEN ~/.aws/credentials',
+    'grep --regexp=KEY ~/.aws/credentials',
+    'grep --include "*.md" -rn KEY ~/.aws/credentials',
+    'grep -f ~/.ssh/id_rsa notes.txt',
+    'grep --file ~/.ssh/id_rsa notes.txt',
+    'grep --file=/h/.ssh/id_rsa notes.txt',
+    'grep -f/h/.ssh/id_rsa notes.txt',
+    'sed -f/h/.ssh/id_rsa notes.txt',
+    'grep --exclude-from ~/.ssh/id_rsa -r KEY .',
+    'rg --ignore-file ~/.ssh/id_rsa KEY .',
+    "gawk -i ~/.ssh/id_rsa '{print}' notes.txt",
+    'rg -n KEY ~/.ssh/id_rsa',
+    'rg -t md KEY ~/.ssh/id_rsa',
+    "rg -g '*.md' -e KEY ~/.ssh/id_rsa",
+    "sed -n '1,5p' ~/.ssh/id_rsa",
+    'sed -n p ~/.ssh/id_rsa',
+    'sed -e p ~/.ssh/id_rsa',
+    "sed -i '' s/a/b/ ~/.ssh/id_rsa",
+    "awk '{print}' ~/.aws/credentials",
+    "awk -F: '{print $1}' ~/.ssh/id_rsa",
+    "awk -v k=1 '{print}' ~/.ssh/id_rsa",
+    'awk -f prog.awk ~/.ssh/id_rsa',
+    'jq . ~/.ssh/id_rsa',
+    'jq -e . ~/.ssh/id_rsa',
+    'jq -n . ~/.ssh/id_rsa',
+    'jq -r .a ~/.aws/credentials',
+    'jq --arg k v . ~/.ssh/id_rsa',
+    "jq -n --slurpfile k ~/.ssh/id_rsa '$k'",
+    'jq -f prog.jq ~/.ssh/id_rsa',
+    'jq --from-file prog.jq ~/.ssh/id_rsa',
+  ];
+  for (const cmd of reads) {
+    const d = run(cmd);
+    assert.equal(d?.decision, 'deny', cmd);
+    assert.equal(d.id, 'read-secret', cmd);
+  }
+  // `--args` ends the files of jq: what follows are values for $ARGS.
+  assert.equal(run("jq -n '$ARGS' --args id_rsa x"), null);
+  assert.equal(run("jq -n '$ARGS' --jsonargs 1 id_rsa"), null);
+  assert.equal(run('jq . ~/.ssh/id_rsa --args x').decision, 'deny');
+
+  // The common flags are known not to take a value, so they never turn a read into an ask.
+  const flagged = ['grep -r', 'grep -rn', 'grep -rnI', 'grep -i', 'grep -v', 'grep -l', 'grep -c', 'grep -w', 'grep -o', 'grep -E', 'grep -F',
+    'grep -H', 'grep -h', 'grep -s', 'grep -q', 'grep --color=never', 'grep --recursive', 'grep --ignore-case', 'grep --line-number',
+    'egrep -n', 'fgrep -n', 'rg -n', 'rg -i', 'rg -l', 'rg -S', 'rg -s', 'rg -uu', 'rg -N', 'rg -F', 'rg -w', 'rg -H', 'rg --hidden',
+    'rg --no-ignore', 'rg --files-with-matches', 'rg --line-number', 'ag -f', 'ag -i', 'ag -l', 'ag -Q', 'ag --hidden', 'sed -n', 'sed -E',
+    'sed -r', 'sed -s', 'sed --quiet', 'sed --regexp-extended', 'awk -b', 'gawk --traditional', 'jq -r', 'jq -c', 'jq -e', 'jq -s', 'jq -S',
+    'jq -n', 'jq -nr', 'jq --raw-output', 'jq --compact-output', 'grep -r --'];
+  for (const prefix of flagged) {
+    const d = run(`${prefix} KEY ~/.ssh/id_rsa`);
+    assert.equal(d?.decision, 'deny', prefix);
+  }
+});
+
+test('read-secret: a word that may be an option value or the pattern can ask but never deny', () => {
+  // An option the tables do not list might take a value, so which word is the pattern is not
+  // known. A deny-tier name in a place that is a file on only some readings asks instead.
+  const asks = [
+    ['grep --nope KEY ~/.ssh/id_rsa', 'ssh-private-key'],
+    ['rg --nope KEY ~/.aws/credentials', 'aws-credentials'],
+    ['grep -J KEY ~/.ssh/id_rsa', 'ssh-private-key'],
+    ['sed -i s/a/b/ ~/.ssh/id_rsa', 'ssh-private-key'],
+    ['awk -d KEY ~/.ssh/id_rsa', 'ssh-private-key'], // BSD grep -J and gawk -d are deliberately not in the tables
+    ['grep --nope=~/.ssh/id_rsa KEY notes.txt', 'ssh-private-key'],
+    // ag's context options take an optional value: `2` is their value or the pattern, so id_rsa is a path or the pattern.
+    ['ag -A 2 id_rsa docs', 'ssh-private-key'],
+  ];
+  for (const [cmd, pathId] of asks) {
+    const d = run(cmd);
+    assert.equal(d?.decision, 'ask', cmd);
+    assert.equal(d.id, 'read-secret', cmd);
+    assert.equal(d.pathId, pathId, cmd);
+    assert.ok(d.reason.endsWith(ASK_TAIL), d.reason);
+  }
+  // Nothing is lost for the ask tier, and a word that is a file on every reading still denies.
+  assert.equal(run('grep --nope KEY .env').decision, 'ask');
+  // (ag's context options take an optional value, so `-A 2 KEY` reads KEY as the pattern or as a file; the key is a file either way.)
+  for (const cmd of ['grep --nope KEY a ~/.ssh/id_rsa', 'grep --nope=x KEY ~/.ssh/id_rsa', 'grep -n --nope KEY a ~/.aws/credentials',
+    'ag -A 2 KEY ~/.ssh/id_rsa']) {
+    assert.equal(run(cmd)?.decision, 'deny', cmd);
+  }
+  // And the pattern itself is still not a file, whatever the options before it.
+  assert.equal(run('grep --nope id_rsa README.md'), null);
+  assert.equal(run('grep --nope id_rsa'), null);
 });
 
 test('precedence: deny beats ask, then the lowest position wins, then table order', () => {
@@ -356,6 +531,12 @@ test('classifier units: globTargetsSecret', () => {
   for (const g of ['*.ts', '**/*.ts', '*', '**', 'src/**', '*.{ts,tsx}', '.env.example', '.environment*', '', undefined, null]) {
     assert.equal(globTargetsSecret(g, HOME), null, String(g));
   }
+  // Only the last `/` segment of a glob is judged. The directory part is classifyPath's job, which
+  // readSecret runs on the whole word first: `cat ~/.ssh/id_*` and `cat ~/.ssh/*` are caught there.
+  assert.equal(globTargetsSecret('~/.ssh/id_*', HOME), null);
+  assert.equal(globTargetsSecret('/h/.ssh/*', HOME), null);
+  assert.deepEqual(globTargetsSecret('/h/.ssh/{id_rsa,x}', HOME), { pathId: 'ssh-private-key', tier: 'deny' });
+  assert.deepEqual(globTargetsSecret('a/b/c/*.pem', HOME), { pathId: 'private-key-file', tier: 'ask' });
 });
 
 test('unparsed: input the parser could not read asks, and hits in the read part still count', () => {
@@ -467,6 +648,33 @@ test('reasons never contain the plugin namespace prefix that the skill lint flag
       assert.ok(d.reason.startsWith('constellation-guard ['), cmd);
       assert.ok(!d.reason.includes('constellation' + ':'), cmd);
     }
+  }
+});
+
+test('reasons quote a word safely: control characters become spaces and long words are cut', () => {
+  // The word comes from the command, so it is shortened (80 characters at most) before it is shown.
+  const at = (len) => 'd'.repeat(len - 5) + '/.env';
+  const ok = at(80);
+  assert.equal(ok.length, 80);
+  assert.ok(run('cat ' + ok).reason.includes(`reading ${ok} (env-file)`), 'a word of 80 characters is shown whole');
+  const cut = at(81);
+  assert.equal(cut.length, 81);
+  assert.ok(run('cat ' + cut).reason.includes(`reading ${cut.slice(0, 77)}... (env-file)`), 'a word of 81 characters is cut to 77 plus ...');
+  const huge = at(2000);
+  const reason = run('cat ' + huge).reason;
+  assert.ok(!reason.includes(huge) && reason.length < 400, 'a long word does not flood the reason');
+  // The same for the words that deny rules quote.
+  const longRoot = '/' + 'a/'.repeat(50) + '../'.repeat(50);
+  const rm = run('rm -rf ' + longRoot);
+  assert.equal(rm.id, 'rm-root-home');
+  assert.ok(rm.reason.includes(`removing ${longRoot.slice(0, 77)}... would delete`), rm.reason);
+
+  // Newline, tab and other control characters inside a quoted word cannot reshape the message.
+  for (const [cmd, shownWord] of [['cat "a\nb/.env"', 'a b/.env'], ['cat "a\tb/.env"', 'a b/.env'], ['cat "a\x01b/.env"', 'a b/.env']]) {
+    const d = run(cmd);
+    assert.equal(d?.id, 'read-secret', JSON.stringify(cmd));
+    assert.ok(d.reason.includes(`reading ${shownWord} (env-file)`), d.reason);
+    assert.doesNotMatch(d.reason, /[\x00-\x1f]/);
   }
 });
 
@@ -738,6 +946,20 @@ test('e2e: a benign command prints {} and writes no log line', () => {
   assert.deepEqual(JSON.parse(r.stdout), {});
   assert.deepEqual(r.logs, []);
   assert.equal(r.claudeDir, false);
+});
+
+test('e2e: a search for the name of a key is not a read of the key', () => {
+  // These were denied when the value of an option passed for the pattern; nothing here reads a secret.
+  for (const cmd of ['rg -t md id_rsa docs', 'grep -A 2 id_rsa README.md', 'grep -e id_rsa README.md', "awk -v k=1 '/id_rsa/' README.md"]) {
+    const r = spawnGuard(bashPayload(cmd));
+    assert.equal(r.status, 0, r.stderr);
+    assert.deepEqual(JSON.parse(r.stdout), {}, cmd);
+    assert.deepEqual(r.logs, [], cmd);
+  }
+  // The same options in front of a real read still deny, and the log says which path.
+  const read = spawnGuard(bashPayload('grep -A 2 KEY ~/.ssh/id_rsa'));
+  assert.equal(JSON.parse(read.stdout).hookSpecificOutput.permissionDecision, 'deny');
+  assert.equal(read.lines[0].pathId, 'ssh-private-key');
 });
 
 test('e2e: input that is not a decision prints {} and exits 0, failing open', () => {

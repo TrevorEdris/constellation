@@ -302,27 +302,197 @@ function forkBomb(seg, ctx) {
 
 const READERS = new Set(['cat', 'tac', 'less', 'more', 'head', 'tail', 'bat', 'batcat', 'view', 'nl', 'strings', 'xxd', 'hexdump', 'od',
   'base64', 'grep', 'egrep', 'fgrep', 'rg', 'ag', 'awk', 'gawk', 'sed', 'cut', 'sort', 'uniq', 'diff', 'cmp', 'jq', 'yq']);
-// These take a pattern, script or filter as their first positional, unless an option supplies it.
-const PATTERN_READERS = new Set(['grep', 'egrep', 'fgrep', 'rg', 'ag', 'sed', 'awk', 'gawk', 'jq']);
+
+// The readers that take a pattern, script or filter as their first positional (unless an option
+// supplies it), each with what its options do to the words around them. The tables are needed
+// because a valued option in front of the pattern (`grep -A 2 id_rsa f`, `rg -t md id_rsa`,
+// `awk -v k=1 /id_rsa/ f`) shifts the words by one: its value passes for the pattern, the real
+// pattern is read as a file, and a search FOR a key's name looks like a read of the key.
+//
+// Kinds of option: `flag` takes no value. `val` takes one, either the rest of its cluster (`-A2`,
+// `--glob=x`) or else the next word. `val2` takes two (jq `--arg name value`). `valfile` takes a
+// name and then a file that is read (jq `--slurpfile`). `rfile` takes a file that is read.
+// `pat` supplies the pattern (`-e PATTERN`), so no positional is the pattern. `file` supplies it
+// from a file that is itself read (`-f FILE`). An option a table does not list is `maybe`: it may or
+// may not take a value, and it is never guessed to be a flag or to take one, so a gap in a table
+// costs a prompt at worst. Some are left there on purpose because they differ between the GNU and
+// BSD versions of a command (sed `-i`, grep `--context`) or take an optional value (ag `-A`).
+function optionTable(spec) {
+  const table = { short: new Map(), long: new Map(), stop: new Set(spec.stop || []) };
+  for (const [kind, letters] of Object.entries(spec.short)) for (const c of letters) table.short.set(c, kind);
+  for (const [kind, names] of Object.entries(spec.long)) for (const n of names.split(' ')) table.long.set(n, kind);
+  return table;
+}
+
+const GREP = optionTable({
+  short: { flag: 'abcEFGHhIiLlnOoPpqRrSsTUuVvwxyZz0123456789', val: 'ABCDdm', pat: 'e', file: 'f' },
+  long: {
+    flag: 'recursive dereference-recursive count files-with-matches files-without-match ignore-case no-ignore-case invert-match line-number '
+      + 'no-filename with-filename word-regexp line-regexp only-matching quiet silent no-messages text null null-data perl-regexp '
+      + 'extended-regexp fixed-strings basic-regexp initial-tab byte-offset line-buffered binary color colour help version no-group-separator',
+    val: 'after-context before-context max-count binary-files devices directories include exclude exclude-dir include-dir group-separator',
+    rfile: 'exclude-from', // (BSD grep takes the value of --context and --label only with `=`: left to the default)
+    pat: 'regexp',
+    file: 'file',
+  },
+});
+const RG = optionTable({
+  short: { flag: '.0FHILNPSUVabchilnopqsuvwxz', val: 'ABCEMTdgjmrt', pat: 'e', file: 'f' },
+  long: {
+    flag: 'hidden no-ignore no-ignore-dot no-ignore-exclude no-ignore-files no-ignore-global no-ignore-parent no-ignore-vcs no-require-git '
+      + 'no-config one-file-system follow unrestricted binary text search-zip case-sensitive ignore-case smart-case fixed-strings invert-match '
+      + 'line-regexp word-regexp multiline multiline-dotall null-data pcre2 no-unicode crlf byte-offset column heading no-heading help '
+      + 'line-buffered line-number no-line-number null only-matching passthru pretty quiet trim vimgrep with-filename no-filename count '
+      + 'count-matches files-with-matches files-without-match json debug no-messages stats trace files type-list version',
+    val: 'pre pre-glob dfa-size-limit encoding engine max-count regex-size-limit threads glob iglob max-depth max-filesize type type-not type-add '
+      + 'type-clear after-context before-context color colors context context-separator field-context-separator field-match-separator '
+      + 'hostname-bin hyperlink-format max-columns path-separator replace sort sortr generate',
+    rfile: 'ignore-file',
+    pat: 'regexp',
+    file: 'file',
+  },
+});
+const AG = optionTable({
+  short: { flag: 'acfFhHilLnNorsSQtuUvwz0', val: 'Ggm' }, // (-A, -B and -C take an optional value: left to the default)
+  long: {
+    flag: 'ignore-case case-sensitive smart-case literal word-regexp invert-match count files-with-matches files-without-matches column '
+      + 'nocolor nogroup noheading numbers nonumbers follow hidden unrestricted all-types search-zip null print0 stats vimgrep recurse '
+      + 'norecurse fixed-strings only-matching',
+    val: 'depth ignore ignore-dir max-count file-search-regex path-to-ignore workers pager width',
+  },
+});
+const SED = optionTable({
+  short: { flag: 'aEnrsuz', pat: 'e', file: 'f' }, // (-i takes a suffix on BSD sed only and -l a length on GNU sed only: left to the default)
+  long: {
+    flag: 'quiet silent regexp-extended null-data separate unbuffered debug posix sandbox follow-symlinks binary help version in-place',
+    val: 'line-length',
+    pat: 'expression',
+    file: 'file',
+  },
+});
+const AWK = optionTable({
+  short: { flag: 'bcCghMnNOPrsStV', val: 'Fvl', pat: 'e', file: 'fE', rfile: 'i' },
+  long: {
+    flag: 'characters-as-bytes traditional copyright gen-pot help bignum non-decimal-data use-lc-numeric optimize posix re-interval '
+      + 'no-optimize sandbox lint-old version csv lint',
+    val: 'field-separator assign load',
+    rfile: 'include',
+    pat: 'source',
+    file: 'file exec',
+  },
+});
+const JQ = optionTable({
+  short: { flag: 'nRscrjaSCMeVhb0', val: 'L', file: 'f' }, // jq -e is --exit-status, not a script
+  long: {
+    flag: 'null-input raw-input slurp compact-output raw-output raw-output0 join-output ascii-output sort-keys color-output monochrome-output '
+      + 'tab unbuffered stream stream-errors seq exit-status version help build-configuration binary',
+    val: 'indent library-path',
+    val2: 'arg argjson',
+    valfile: 'slurpfile rawfile',
+    file: 'from-file',
+  },
+  stop: ['--args', '--jsonargs'], // what follows are values for $ARGS, not files
+});
+const PATTERN_READERS = new Map([['grep', GREP], ['egrep', GREP], ['fgrep', GREP], ['rg', RG], ['ag', AG], ['sed', SED], ['awk', AWK],
+  ['gawk', AWK], ['jq', JQ]]);
+
+// The words an option may take after it, by kind ('v' a plain value, 'f' a file, '' none).
+const OWED = { flag: [''], val: ['v'], val2: ['vv'], valfile: ['vf'], rfile: ['f'], pat: ['v'], file: ['f'], maybe: ['', 'v'] };
+const FILE_VALUE = new Set(['rfile', 'file']);
+
+/**
+ * What one option word (`-rn`, `-A2`, `--glob=x`) does. `owed` lists the ways it may take the words
+ * after it, `supplies` says it provides the pattern, and `file` is a file named inside the word
+ * (`--file=x`, `-fx`) and whether that is certain. A cluster of short options is read up to the
+ * first letter that is not a flag; the rest of the cluster is that letter's value.
+ */
+function readOption(table, w) {
+  if (w[1] === '-') {
+    const eq = w.indexOf('=');
+    const known = table.long.get(eq === -1 ? w.slice(2) : w.slice(2, eq));
+    const kind = known || 'maybe';
+    const supplies = kind === 'pat' || kind === 'file';
+    if (eq === -1) return { owed: OWED[kind], supplies, file: null };
+    const value = w.slice(eq + 1);
+    // The value of an option the table does not list might be a file.
+    if (known === undefined) return { owed: [''], supplies, file: { word: value, certain: false } };
+    return { owed: [''], supplies, file: FILE_VALUE.has(kind) ? { word: value, certain: true } : null };
+  }
+  const letters = w.slice(1);
+  let i = 0;
+  while (i < letters.length && table.short.get(letters[i]) === 'flag') i++;
+  if (i === letters.length) return { owed: [''], supplies: false, file: null };
+  const kind = table.short.get(letters[i]) || 'maybe';
+  const supplies = kind === 'pat' || kind === 'file';
+  const rest = letters.slice(i + 1);
+  if (rest === '') return { owed: OWED[kind], supplies, file: null };
+  return { owed: [''], supplies, file: FILE_VALUE.has(kind) ? { word: rest, certain: true } : null };
+}
 
 /** Does an option (`-e`, `-f`, a cluster holding one, `--regexp`, `--file`) supply the pattern? */
-function patternOption(args) {
-  for (const w of args) {
+function suppliesPattern(table, words) {
+  for (const w of words) {
     if (w === '--') return false;
-    if (/^--(regexp|file|expression)(=|$)/.test(w) || /^-[A-Za-z]*[ef]/.test(w)) return true;
+    if (w.length > 1 && w[0] === '-' && readOption(table, w).supplies) return true;
   }
   return false;
 }
 
 /**
- * The words of a reader's arguments that may be files: every non-option word, except the
- * first one for a pattern reader without `-e`/`-f`, plus the value of `--name=value` options.
- * Without a table of each command's options, a value-taking short option (`-A 3`) makes the
- * word after it look like the pattern; the real pattern is then checked as a path, which can
- * only add a false ask.
+ * The words of a pattern reader's arguments that may be files, as `{word, certain}`. Which word is
+ * the pattern depends on which options take a value, and an option the table does not list might
+ * or might not, so every way of reading the arguments is followed at once. A reading is a string:
+ * `1` or `0` for whether the pattern has been found, then the words still owed to an option. A word
+ * is a file on every reading (`certain`), on only some (it might be an option's value or the
+ * pattern), or on none (not returned).
+ */
+function patternReaderWords(table, args) {
+  const stop = args.findIndex((w) => table.stop.has(w));
+  const words = stop === -1 ? args : args.slice(0, stop);
+  const end = words.indexOf('--'); // from here on every word is a positional
+  let readings = new Set([suppliesPattern(table, words) ? '1' : '0']);
+  const out = [];
+  words.forEach((w, i) => {
+    const roles = new Set();
+    const next = new Set();
+    let inline = null;
+    for (const r of readings) {
+      const found = r[0];
+      const owed = r.slice(1);
+      if (owed !== '') {
+        roles.add(owed[0] === 'f' ? 'file' : 'value');
+        next.add(found + owed.slice(1));
+      } else if ((end === -1 || i < end) && w.length > 1 && w[0] === '-') {
+        roles.add('option');
+        const opt = readOption(table, w);
+        inline = opt.file;
+        for (const more of opt.owed) next.add(found + more);
+      } else if (i === end) {
+        roles.add('option');
+        next.add(r);
+      } else if (found === '0') {
+        roles.add('pattern');
+        next.add('1');
+      } else {
+        roles.add('file');
+        next.add(r);
+      }
+    }
+    if (roles.has('file')) out.push({ word: w, certain: roles.size === 1 });
+    if (inline !== null) out.push({ word: inline.word, certain: inline.certain && roles.size === 1 && roles.has('option') });
+    readings = next;
+  });
+  return out;
+}
+
+/**
+ * The words of a reader's arguments that may be files, as `{word, certain}`. For the readers that
+ * take a pattern see patternReaderWords. For the others it is every non-option word, plus the value
+ * of `--name=value` options.
  */
 function readerWords(cmd, args) {
-  let skip = PATTERN_READERS.has(cmd) && !patternOption(args);
+  const table = PATTERN_READERS.get(cmd);
+  if (table !== undefined) return patternReaderWords(table, args);
   const out = [];
   let ended = false;
   for (const w of args) {
@@ -330,11 +500,9 @@ function readerWords(cmd, args) {
       ended = true;
     } else if (!ended && w.length > 1 && w[0] === '-') {
       const eq = w[1] === '-' ? w.indexOf('=') : -1;
-      if (eq !== -1) out.push(w.slice(eq + 1));
-    } else if (skip) {
-      skip = false;
+      if (eq !== -1) out.push({ word: w.slice(eq + 1), certain: true });
     } else {
-      out.push(w);
+      out.push({ word: w, certain: true });
     }
   }
   return out;
@@ -343,15 +511,19 @@ function readerWords(cmd, args) {
 /**
  * A reader with a secret argument, or any command with a secret `<` target. An argument with a
  * glob character is also read as a glob, so `cat .env*` is caught the way `cat .env.local` is.
+ * A word that is a file on only some readings of the options (it might be the pattern or an
+ * option's value) can ask but never deny, because a deny cannot be approved.
  */
 function readSecret(seg, ctx) {
   const { cmd, args } = cmdOf(seg);
   const words = READERS.has(cmd) ? readerWords(cmd, args) : [];
-  for (const r of seg.redirects) if (r.op === '<') words.push(r.target);
+  for (const r of seg.redirects) if (r.op === '<') words.push({ word: r.target, certain: true });
   let best = null;
-  for (const w of words) {
-    const c = classifyPath(w, ctx.home) || (/[*?[]/.test(w) ? globTargetsSecret(w, ctx.home) : null);
-    if (c !== null && (best === null || (c.tier === 'deny' && best.tier !== 'deny'))) best = { word: w, pathId: c.pathId, tier: c.tier };
+  for (const { word, certain } of words) {
+    const c = classifyPath(word, ctx.home) || (/[*?[]/.test(word) ? globTargetsSecret(word, ctx.home) : null);
+    if (c === null) continue;
+    const tier = c.tier === 'deny' && !certain ? 'ask' : c.tier;
+    if (best === null || (tier === 'deny' && best.tier !== 'deny')) best = { word, pathId: c.pathId, tier };
   }
   if (best === null) return null;
   return { pathId: best.pathId, tier: best.tier, reason: `reading ${shown(best.word)} (${best.pathId}) can expose secrets` };
