@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.1 — 2026-10-07
+
+- feat(hooks): parse substitutions, -c, xargs and find -exec into command segments
+
 ## 0.4.0 — 2026-10-07
 
 - feat(hooks): add quote-aware shell tokenizer for guard rules
