@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.6 — 2026-10-07
+
+- feat(hooks): ask before merging or pushing into the default branch
+
 ## 0.4.5 — 2026-10-07
 
 - fix(hooks): guard secrets across Grep, MultiEdit and NotebookEdit
