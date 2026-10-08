@@ -1,6 +1,7 @@
 """Tests for validate_plan.py: PR-size and Brief checks, frontmatter parsing,
 schema dispatch (v3 vs legacy), issue audience tags, placeholder rejection,
-PLAN v2 step parsing, Traceability rows and the v3 approval-card checks.
+PLAN v2 step parsing, Traceability rows, the v3 approval-card checks and the v3
+delivery checks (frontmatter list, Ships-as cross-check, live remote probe).
 
 Run from the repo root:
     PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q -p no:cacheprovider skills/plan-validator/scripts
@@ -8,6 +9,9 @@ Run from the repo root:
 
 import inspect
 import json
+import os
+import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -16,7 +20,7 @@ from pathlib import Path
 import pytest
 
 import validate_plan as vp
-from conftest import v3_plan
+from conftest import git_env, make_repo, v3_plan
 
 SCRIPT = Path(vp.__file__).resolve()
 
@@ -968,11 +972,11 @@ def _v3(tmp_path, **replace) -> "vp.ValidationReport":
     return vp.validate_plan(v3_plan(tmp_path, **replace))
 
 
-def _fires_only(report: "vp.ValidationReport", rule: str) -> list["vp.Issue"]:
-    """Assert `rule` is the one error id in the report, as a human-audience card error that costs no score."""
+def _fires_only(report: "vp.ValidationReport", rule: str, category: str = "card") -> list["vp.Issue"]:
+    """Assert `rule` is the one error id in the report, as a human-audience error that costs no score."""
     got = [(i.rule, i.category, i.message) for i in report.errors]
     assert {r for r, _, _ in got} == {rule}, got
-    assert all(i.category == "card" and i.audience == "human" for i in report.errors), got
+    assert all(i.category == category and i.audience == "human" for i in report.errors), got
     assert not report.passed
     assert report.score == 100, "v3 errors block through severity alone"
     return report.errors
@@ -1564,3 +1568,641 @@ def test_legacy_plan_gets_no_card_checks_and_keeps_check_brief(tmp_path):
 
 def test_v3_plan_does_not_run_check_brief(tmp_path):
     assert not [i for i in _v3(tmp_path).issues if i.category == "brief"]
+
+
+# ---------------------------------------------------------------------------
+# v3 delivery: probe_remote and check_delivery
+#
+# The v3_plan factory builds real git repos (a remote, commit subjects, a second
+# repo, a plain directory) and validate_plan probes them with the real git, so a
+# test fails when the probe is skipped or its answer is misread. Like the card
+# tests, each rule test edits the fixture with str.replace and asserts that
+# exactly that rule fires.
+# ---------------------------------------------------------------------------
+
+DELIVERY_BLOCK = (
+    "delivery:\n"
+    "  - repo: {repo}\n"
+    "    mode: pr\n"
+    "    branch: feat/share-link\n"
+    "    base: main\n"
+    "    remote: origin\n"
+    "    prs: 1\n"
+)
+OUT_OF_SCOPE = "Link analytics and per-viewer permissions will not be built here."
+
+# The fixture's one delivery turned into a local-only one: no remote, no PR.
+LOCAL_SHIPS = "**Ships as:** local only, no PR, feat/share-link"
+LOCAL_ONLY = {
+    "mode: pr": "mode: local-only",
+    "remote: origin": "remote: none",
+    "prs: 1": "prs: 0",
+    SHIPS: LOCAL_SHIPS,
+    SIZE: SIZE.replace("1 PR", "0 PRs"),
+}
+# A card question that asks about the local-only choice, with its [ask] line. It takes the place
+# of question 2 so the card stays inside its word budgets.
+LOCAL_ASK = {
+    Q2: "2. Keep local only, no PR? → **yes** (repo has a remote; if wrong: one PR)",
+    D2: "- D2 [ask] Keep local only, no PR? Default: yes. Why: the repo has a remote. If wrong: one PR.",
+}
+STACK_2 = {
+    "mode: pr": "mode: stack",
+    "prs: 1": "prs: 2",
+    SHIPS: SHIPS.replace("1 PR,", "2-PR stack,"),
+    SIZE: SIZE.replace("1 PR", "2 PRs"),
+}
+# Stack of 2 in the first repo plus 1 PR in the second: Size must say 3. The longer Ships-as
+# line pays for itself with the shorter Size line, so the card stays at 118 words.
+SHIPS_SECOND_PR = " · 1 PR, feat/second → origin/main"
+SUM_THREE = {**STACK_2, SHIPS: STACK_2[SHIPS] + SHIPS_SECOND_PR, SIZE: SIZE_SHORT.replace("1 PR", "3 PRs")}
+TWO_PRS = {SHIPS: SHIPS + SHIPS_SECOND_PR, SIZE: SIZE_SHORT.replace("1 PR", "2 PRs")}
+SECOND_LOCAL = {"mode": "local-only", "remote": "none", "prs": "0", "branch": "notes"}
+PR_AND_LOCAL = {SHIPS: SHIPS + " · local only, no PR, notes", SIZE: SIZE_SHORT}
+
+DELIVERY_RULES = {
+    "delivery_missing": "test_delivery_missing_error",
+    "delivery_flow_style": "test_delivery_flow_style_error",
+    "delivery_unknown_key": "test_delivery_unknown_key_error",
+    "delivery_missing_key": "test_delivery_missing_key_error",
+    "delivery_bad_mode": "test_delivery_bad_mode_error",
+    "delivery_repo_path": "test_delivery_repo_path_error",
+    "delivery_prs": "test_delivery_prs_error",
+    "delivery_remote_absent": "test_delivery_remote_absent_error",
+    "delivery_repo_not_git": "test_delivery_repo_not_git_error",
+    "ships_as_mismatch": "test_ships_as_must_name_branch_and_remote_base",
+    "size_pr_count_mismatch": "test_size_pr_count_mismatch_error",
+    "local_only_phrase": "test_local_only_phrase_forces_mode",
+    "local_only_without_question": "test_local_only_with_remote_requires_question",
+}
+
+
+def _add_remote(repo: Path, name: str, url: str = "https://example.invalid/other.git") -> None:
+    subprocess.run(["git", "-C", str(repo), "remote", "add", name, url], check=True, capture_output=True, env=git_env())
+
+
+def _assert_no_delivery_findings(report: "vp.ValidationReport") -> None:
+    assert [(i.rule, i.message) for i in report.issues if i.category == "delivery"] == []
+    assert report.errors == []
+    assert report.passed
+    assert report.score == 100
+
+
+def _delivery_report(tmp_path, probe: bool = True, **replace) -> "vp.ValidationReport":
+    return vp.validate_plan(v3_plan(tmp_path, **replace), probe=probe)
+
+
+# probe_remote
+
+
+def test_probe_remote_reads_remotes_and_pr_subjects(tmp_path):
+    repo = make_repo(tmp_path / "r", subjects=["chore: start", "feat: add share link (#12)", "fix: typo"])
+    _add_remote(repo, "upstream")
+    state = vp.probe_remote(str(repo))
+    assert state == vp.RemoteState(["origin", "upstream"], ["feat: add share link (#12)"], None)
+    assert vp.probe_remote(repo) == state  # a Path works too
+
+
+def test_probe_remote_empty_repo_no_error(tmp_path):
+    # No commits: `git log` exits 128, which is an empty history and not a failure.
+    repo = make_repo(tmp_path / "empty")
+    assert vp.probe_remote(str(repo)) == vp.RemoteState(["origin"], [], None)
+    no_remote = make_repo(tmp_path / "bare-bones", remote=None)
+    assert vp.probe_remote(str(no_remote)) == vp.RemoteState([], [], None)
+
+
+def test_probe_remote_reads_the_last_five_subjects_only(tmp_path):
+    five = make_repo(tmp_path / "five", subjects=["old (#1)", "b", "c", "d", "e"])
+    six = make_repo(tmp_path / "six", subjects=["old (#1)", "b", "c", "d", "e", "f"])
+    assert vp.probe_remote(str(five)).pr_subjects == ["old (#1)"]
+    assert vp.probe_remote(str(six)).pr_subjects == []
+
+
+@pytest.mark.parametrize(
+    "subject,is_pr",
+    [("feat: x (#12)", True), ("(#7) leading", True), ("Merge pull request #12 from a/b", False), ("fix (#) none", False), ("fix #12", False)],
+)
+def test_probe_remote_pr_subject_is_a_parenthesised_number(tmp_path, subject, is_pr):
+    repo = make_repo(tmp_path / "r", subjects=[subject])
+    assert vp.probe_remote(str(repo)).pr_subjects == ([subject] if is_pr else [])
+
+
+def test_probe_remote_not_a_repo_is_an_error(tmp_path):
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    for path in (plain, tmp_path / "missing"):
+        state = vp.probe_remote(str(path))
+        assert state.error and state.remotes == [] and state.pr_subjects == []
+
+
+def test_probe_remote_ignores_the_callers_git_environment(tmp_path, monkeypatch):
+    # GIT_DIR and GIT_WORK_TREE from the caller (a git hook, say) must not redirect the probe
+    repo = make_repo(tmp_path / "repo")
+    other = make_repo(tmp_path / "other", remote="elsewhere")
+    monkeypatch.setenv("GIT_DIR", str(other / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(other))
+    monkeypatch.setenv("GIT_INDEX_FILE", str(other / ".git" / "index"))
+    assert vp.probe_remote(str(repo)).remotes == ["origin"]
+
+
+def test_probe_remote_without_git_is_an_error_not_a_crash(tmp_path, monkeypatch):
+    repo = make_repo(tmp_path / "repo")
+    monkeypatch.setenv("PATH", str(tmp_path / "no-such-dir"))
+    state = vp.probe_remote(str(repo))
+    assert state.error and "git" in state.error
+
+
+def _stub_git(tmp_path: Path, before: str) -> Path:
+    """A directory with a `git` that runs the /bin/sh fragment `before` (over "$@") and then the real git.
+
+    It makes failures happen that a healthy git never produces: a failing `log`, a slow `remote`.
+    """
+    stub = tmp_path / "bin" / "git"
+    stub.parent.mkdir()
+    stub.write_text(f'#!/bin/sh\n{before}\nexec {shutil.which("git")} "$@"\n')
+    stub.chmod(0o755)
+    return stub.parent
+
+
+def test_probe_remote_log_failure_is_an_error_not_an_empty_history(tmp_path, monkeypatch):
+    # `git log` exiting 128 is a repo with no commits; any other failure must not read as "no PR commits"
+    repo = make_repo(tmp_path / "repo", subjects=["feat: x (#1)"])
+    monkeypatch.setenv("PATH", str(_stub_git(tmp_path, 'for arg in "$@"; do [ "$arg" = log ] && { echo boom >&2; exit 7; }; done')))
+    state = vp.probe_remote(str(repo))
+    assert state.remotes == ["origin"] and state.pr_subjects == []
+    assert state.error == "git log failed: boom"
+
+
+def test_probe_remote_gives_up_on_a_git_that_hangs(tmp_path, monkeypatch):
+    repo = make_repo(tmp_path / "repo")
+    assert vp.PROBE_TIMEOUT_SECONDS == 5  # the contract; the test below shortens it so it need not wait
+    monkeypatch.setattr(vp, "PROBE_TIMEOUT_SECONDS", 0.3)
+    monkeypatch.setenv("PATH", str(_stub_git(tmp_path, 'for arg in "$@"; do [ "$arg" = remote ] && /bin/sleep 3; done')))
+    state = vp.probe_remote(str(repo))
+    assert state.error and "could not run git" in state.error and "timed out" in state.error
+    assert state.remotes == [] and state.pr_subjects == []
+
+
+def test_probe_false_never_runs_git(tmp_path, monkeypatch):
+    plan = v3_plan(tmp_path)
+    monkeypatch.setenv("PATH", str(tmp_path / "no-such-dir"))
+    _assert_no_delivery_findings(vp.validate_plan(plan, probe=False))
+    probed = vp.validate_plan(plan, probe=True)
+    assert [i.rule for i in probed.errors] == ["delivery_repo_not_git"]
+    assert "git" in probed.errors[0].message
+
+
+# valid deliveries
+
+
+def test_valid_v3_has_no_delivery_findings(tmp_path):
+    _assert_no_delivery_findings(_delivery_report(tmp_path))
+
+
+def test_stack_delivery_valid_and_pr_count_summed(tmp_path):
+    _assert_no_delivery_findings(_delivery_report(tmp_path / "stack", **STACK_2))
+    # 2 PRs in the stack plus 1 in the second repo: Size must say 3, so 2 or 1 is wrong
+    _assert_no_delivery_findings(_delivery_report(tmp_path / "sum", second_repo=True, **SUM_THREE))
+    for wrong in ("2 PRs", "1 PR", "4 PRs"):
+        edits = {**SUM_THREE, SIZE: SIZE_SHORT.replace("1 PR", wrong)}
+        report = _delivery_report(tmp_path / wrong.replace(" ", "-"), second_repo=True, **edits)
+        errors = _fires_only(report, "size_pr_count_mismatch", "delivery")
+        assert f"says {wrong}" in errors[0].message and "add up to 3" in errors[0].message
+
+
+def test_two_repo_delivery_valid(tmp_path):
+    _assert_no_delivery_findings(_delivery_report(tmp_path / "pr-pr", second_repo=True, **TWO_PRS))
+    # a local-only second repo adds no PRs and needs its own Ships-as phrase
+    both = _delivery_report(tmp_path / "pr-local", second_repo=SECOND_LOCAL, **PR_AND_LOCAL)
+    _assert_no_delivery_findings(both)
+
+
+def test_ships_as_names_every_delivery(tmp_path):
+    only_first = {**TWO_PRS, SHIPS: SHIPS}
+    errors = _fires_only(_delivery_report(tmp_path, second_repo=True, **only_first), "ships_as_mismatch", "delivery")
+    assert "1 PR, feat/second → origin/main" in errors[0].message
+    assert str(tmp_path / "repo2") in errors[0].message
+
+
+def test_local_only_clean_repo_ok(tmp_path):
+    # No remote and no PR-style commits: nothing to ask
+    _assert_no_delivery_findings(_delivery_report(tmp_path / "empty", remote=None, **LOCAL_ONLY))
+    _assert_no_delivery_findings(_delivery_report(tmp_path / "commits", remote=None, subjects=["feat: x", "fix: y"], **LOCAL_ONLY))
+
+
+def test_local_only_non_git_dir_ok(tmp_path):
+    # GC3: a plain directory is allowed for local-only with remote: none; branch may be n/a
+    plain = {**LOCAL_ONLY, "branch: feat/share-link": "branch: n/a", SHIPS: "**Ships as:** local only, no PR, n/a"}
+    report = _delivery_report(tmp_path, git=False, **plain)
+    _assert_no_delivery_findings(report)
+    assert not (tmp_path / "repo" / ".git").exists()
+
+
+def test_local_only_phrase_in_code_ignored(tmp_path):
+    prose = (
+        OUT_OF_SCOPE + "\n"
+        "Never write `no PR` or `local only` in a plan for a repo with a remote.\n\n"
+        "```\nno PR, local-only, merged it locally, no remote.\n```\n\n"
+        "A span that wraps a line break, `see the\nlocal only flag`, is code too."
+    )
+    _assert_no_delivery_findings(_delivery_report(tmp_path, **{OUT_OF_SCOPE: prose}))
+
+
+@pytest.mark.parametrize(
+    "sentence",
+    [
+        "The repo has no PR template, so the PR description is free text.",
+        "There is no PR title convention here.",
+        "A change with no PR body is fine.",
+        "Commits carry no PR description either.",
+        "Branches have no PR number until opened.",
+        "Reviewers leave no PR comment on drafts.",
+        "There is no remote branch to track yet.",
+    ],
+)
+def test_no_pr_template_not_flagged(tmp_path, sentence):
+    _assert_no_delivery_findings(_delivery_report(tmp_path, **{OUT_OF_SCOPE: OUT_OF_SCOPE + "\n" + sentence}))
+
+
+# delivery list shape
+
+
+@pytest.mark.parametrize("block", ["", "delivery:\n", "delivery: []\n"], ids=["absent", "empty", "empty-flow-list"])
+def test_delivery_missing_error(tmp_path, block):
+    plan = v3_plan(tmp_path, **{DELIVERY_BLOCK: block})
+    errors = _fires_only(vp.validate_plan(plan), "delivery_missing", "delivery")
+    assert "delivery" in errors[0].message
+
+
+@pytest.mark.parametrize(
+    "block",
+    [
+        "delivery: [{repo: x, mode: pr}]\n",
+        "delivery: {repo: x, mode: pr}\n",
+        "delivery: [one, two]\n",
+        "delivery: somewhere\n",
+        "delivery:\n  - just-a-path\n",
+    ],
+    ids=["flow-of-maps", "flow-map", "flow-list", "scalar", "block-of-scalars"],
+)
+def test_delivery_flow_style_error(tmp_path, block):
+    plan = v3_plan(tmp_path, **{DELIVERY_BLOCK: block})
+    errors = _fires_only(vp.validate_plan(plan), "delivery_flow_style", "delivery")
+    assert "block" in errors[0].message
+    assert errors[0].line == _line_of(plan.read_text(encoding="utf-8"), "delivery:")
+
+
+@pytest.mark.parametrize("mode", ["merge", "PR", "local_only", "Local-only"])
+def test_delivery_bad_mode_error(tmp_path, mode):
+    plan = v3_plan(tmp_path, **{"mode: pr": f"mode: {mode}"})
+    errors = _fires_only(vp.validate_plan(plan), "delivery_bad_mode", "delivery")
+    assert mode.strip() in errors[0].message and "local-only" in errors[0].message
+    assert errors[0].line == _line_of(plan.read_text(encoding="utf-8"), "- repo:")
+
+
+@pytest.mark.parametrize("key", ["color: red", "status: ready", "schema: plan/v3", "session_id: abc"])
+def test_delivery_unknown_key_error(tmp_path, key):
+    plan = v3_plan(tmp_path, **{"    prs: 1\n": f"    prs: 1\n    {key}\n"})
+    errors = _fires_only(vp.validate_plan(plan), "delivery_unknown_key", "delivery")
+    name = key.split(":")[0]
+    assert name in errors[0].message
+    # the three names the flat session parser would mix up say why
+    assert ("parser" in errors[0].message) == (name in ("status", "schema", "session_id"))
+
+
+@pytest.mark.parametrize(
+    "edit,key",
+    [
+        ({"    base: main\n": ""}, "base"),
+        ({"    branch: feat/share-link\n": "    branch:\n"}, "branch"),
+        ({"    remote: origin\n": ""}, "remote"),
+        ({"    mode: pr\n": ""}, "mode"),
+        ({"  - repo: {repo}\n    mode: pr\n": "  - mode: pr\n"}, "repo"),
+    ],
+    ids=["base-absent", "branch-empty", "remote-absent", "mode-absent", "repo-absent"],
+)
+def test_delivery_missing_key_error(tmp_path, edit, key):
+    errors = _fires_only(vp.validate_plan(v3_plan(tmp_path, **edit)), "delivery_missing_key", "delivery")
+    assert f"'{key}'" in errors[0].message
+
+
+@pytest.mark.parametrize(
+    "repo_value,reason",
+    [("relative/dir", "absolute"), ("{repo}/missing", "does not exist"), ("{repo}/.git/HEAD", "not a directory")],
+    ids=["relative", "missing", "a-file"],
+)
+@pytest.mark.parametrize("probe", [True, False], ids=["probe", "no-probe"])
+def test_delivery_repo_path_error(tmp_path, repo_value, reason, probe):
+    # The directory check is the file system's, so it does not wait for the git probe
+    report = _delivery_report(tmp_path, probe=probe, **{"repo: {repo}": f"repo: {repo_value}"})
+    errors = _fires_only(report, "delivery_repo_path", "delivery")
+    assert reason in errors[0].message
+
+
+@pytest.mark.parametrize("probe", [True, False], ids=["probe", "no-probe"])
+def test_delivery_repo_unreadable_is_a_finding_not_a_crash(tmp_path, probe):
+    # Path.exists() only swallows "no such file" errors; a directory the user cannot search raises
+    locked = tmp_path / "locked"
+    (locked / "repo").mkdir(parents=True)
+    locked.chmod(0o000)
+    try:
+        if os.access(locked, os.X_OK):
+            pytest.skip("a directory cannot be made unsearchable for this user (running as root?)")
+        report = _delivery_report(tmp_path, probe=probe, **{"repo: {repo}": f"repo: {locked}/repo"})
+        errors = _fires_only(report, "delivery_repo_path", "delivery")
+        assert "cannot be read" in errors[0].message and f"{locked}/repo" in errors[0].message
+        assert "Permission denied" in errors[0].message  # why, from the operating system
+    finally:
+        locked.chmod(0o755)
+
+
+@pytest.mark.parametrize("probe", [True, False], ids=["probe", "no-probe"])
+def test_delivery_repo_name_too_long_is_a_finding_not_a_crash(tmp_path, probe):
+    report = _delivery_report(tmp_path, probe=probe, **{"repo: {repo}": "repo: {repo}/" + "x" * 5000})
+    errors = _fires_only(report, "delivery_repo_path", "delivery")
+    assert "cannot be read" in errors[0].message and "too long" in errors[0].message
+
+
+@pytest.mark.parametrize("prs", ["9" * 5000, "10000"], ids=["5000-digits", "five-digits"])
+@pytest.mark.parametrize("probe", [True, False], ids=["probe", "no-probe"])
+def test_delivery_prs_too_large_is_a_finding_not_a_crash(tmp_path, prs, probe):
+    # int() refuses a string of more than 4300 digits, so the size has to be bounded before it is converted
+    errors = _fires_only(_delivery_report(tmp_path, probe=probe, **{"prs: 1": f"prs: {prs}"}), "delivery_prs", "delivery")
+    assert "9999" in errors[0].message
+    assert len(errors[0].message) < 200  # does not echo 5000 digits back
+
+
+@pytest.mark.parametrize(
+    "edit",
+    [
+        {"mode: pr": "mode: stack"},
+        {"mode: pr": "mode: stack", "    prs: 1\n": ""},
+        {"prs: 1": "prs: two"},
+        {"prs: 1": "prs: -1"},
+        {"prs: 1": "prs: 1.5"},
+        {"prs: 1": "prs: [1]"},
+    ],
+    ids=["stack-of-one", "stack-without-prs", "word", "negative", "fraction", "list"],
+)
+def test_delivery_prs_error(tmp_path, edit):
+    errors = _fires_only(vp.validate_plan(v3_plan(tmp_path, **edit)), "delivery_prs", "delivery")
+    assert "prs" in errors[0].message
+
+
+def test_one_bad_item_holds_back_the_card_cross_checks(tmp_path):
+    # The second delivery is unreadable (no base), so what the card should say about it is unknown:
+    # the card here is right for both deliveries, and only the bad item is reported
+    report = _delivery_report(tmp_path, second_repo={"base": ""}, **TWO_PRS)
+    errors = _fires_only(report, "delivery_missing_key", "delivery")
+    assert "Delivery item 2" in errors[0].message and "'base'" in errors[0].message
+    assert errors[0].line == _line_of(Path(tmp_path / "PLAN.md").read_text(encoding="utf-8"), f"- repo: {tmp_path / 'repo2'}")
+
+
+def test_delivery_prs_defaults_by_mode(tmp_path):
+    # pr defaults to 1 and local-only to 0, so Size is checked against those
+    no_prs = {"    prs: 1\n": ""}
+    local_no_prs = {**{k: v for k, v in LOCAL_ONLY.items() if k != "prs: 1"}, **no_prs}
+    _assert_no_delivery_findings(_delivery_report(tmp_path / "pr", **no_prs))
+    _assert_no_delivery_findings(_delivery_report(tmp_path / "local", remote=None, **local_no_prs))
+    # Size still says 1 PR, but a local-only delivery without `prs` is 0
+    wrong = {**local_no_prs, SIZE: SIZE}
+    _fires_only(_delivery_report(tmp_path / "wrong", remote=None, **wrong), "size_pr_count_mismatch", "delivery")
+
+
+# live probe
+
+
+@pytest.mark.parametrize("edit", [{}, STACK_2], ids=["pr", "stack"])
+@pytest.mark.parametrize("remote", ["upstream", None], ids=["other-remote", "no-remote"])
+def test_delivery_remote_absent_error(tmp_path, remote, edit):
+    errors = _fires_only(_delivery_report(tmp_path / "on", remote=remote, **edit), "delivery_remote_absent", "delivery")
+    message = errors[0].message
+    assert "origin" in message and str(tmp_path / "on" / "repo") in message
+    assert (remote or "no remote") in message  # what the repo has instead
+    # only the probe can know what the repo's remotes are
+    _assert_no_delivery_findings(_delivery_report(tmp_path / "off", probe=False, remote=remote, **edit))
+
+
+@pytest.mark.parametrize("edit", [{}, STACK_2], ids=["pr", "stack"])
+def test_delivery_remote_must_be_among_several(tmp_path, edit):
+    plan = v3_plan(tmp_path, remote="upstream", **edit)
+    _add_remote(tmp_path / "repo", "origin")
+    _assert_no_delivery_findings(vp.validate_plan(plan))
+
+
+@pytest.mark.parametrize("probe", [True, False], ids=["probe", "no-probe"])
+@pytest.mark.parametrize("edit", [{"remote: origin": "remote: none"}, STACK_2 | {"remote: origin": "remote: none"}], ids=["pr", "stack"])
+def test_delivery_remote_none_is_absent_for_pr_and_stack(tmp_path, edit, probe):
+    errors = _fires_only(_delivery_report(tmp_path, probe=probe, **edit), "delivery_remote_absent", "delivery")
+    assert "none" in errors[0].message
+
+
+@pytest.mark.parametrize("edit", [{}, STACK_2], ids=["pr", "stack"])
+def test_delivery_repo_not_git_error(tmp_path, edit):
+    report = _delivery_report(tmp_path, git=False, **edit)
+    errors = _fires_only(report, "delivery_repo_not_git", "delivery")
+    assert str(tmp_path / "repo") in errors[0].message and "local-only" in errors[0].message
+    _assert_no_delivery_findings(_delivery_report(tmp_path / "off", probe=False, git=False, **edit))
+
+
+def test_local_only_remote_none_is_not_waved_through_when_git_cannot_run(tmp_path, monkeypatch):
+    # Only a git that ran and refused the directory makes it a plain directory; no git means no answer
+    plan = v3_plan(tmp_path, remote=None, **LOCAL_ONLY)
+    _assert_no_delivery_findings(vp.validate_plan(plan))
+    monkeypatch.setenv("PATH", str(tmp_path / "no-such-dir"))
+    errors = _fires_only(vp.validate_plan(plan), "delivery_repo_not_git", "delivery")
+    assert "could not run git" in errors[0].message
+
+
+def test_local_only_plain_dir_needs_remote_none(tmp_path):
+    # The plain-directory exception is for `remote: none` only
+    named = {**LOCAL_ONLY, "remote: none": "remote: origin"}
+    _fires_only(_delivery_report(tmp_path, git=False, **named), "delivery_repo_not_git", "delivery")
+
+
+# Ships-as and Size
+
+
+@pytest.mark.parametrize(
+    "ships",
+    [
+        "**Ships as:** 1 PR, feat/other → origin/main",
+        "**Ships as:** 1 PR, feat/share-link → upstream/main",
+        "**Ships as:** 1 PR, feat/share-link → origin/develop",
+        "**Ships as:** 1 PR, feat/share-link → main",
+        "**Ships as:** 2 PRs, feat/share-link → origin/main",
+        "**Ships as:** soon, by someday, for now, ok",
+    ],
+    ids=["branch", "remote", "base", "no-remote", "count", "none"],
+)
+def test_ships_as_must_name_branch_and_remote_base(tmp_path, ships):
+    plan = v3_plan(tmp_path, **{SHIPS: ships})
+    errors = _fires_only(vp.validate_plan(plan), "ships_as_mismatch", "delivery")
+    assert "1 PR, feat/share-link → origin/main" in errors[0].message
+    assert errors[0].line == _line_of(plan.read_text(encoding="utf-8"), "**Ships as:**")
+
+
+def test_ships_as_local_only_wording_on_a_pr_delivery_is_also_a_phrase_error(tmp_path):
+    # Ships-as says local only, the delivery says pr: the line is wrong, and it reads as local-only wording
+    report = _delivery_report(tmp_path, **{SHIPS: LOCAL_SHIPS})
+    assert {i.rule for i in report.errors} == {"ships_as_mismatch", "local_only_phrase"}
+
+
+def test_ships_as_phrase_per_mode(tmp_path):
+    stack = _fires_only(_delivery_report(tmp_path / "s", **{**STACK_2, SHIPS: SHIPS}), "ships_as_mismatch", "delivery")
+    assert "2-PR stack, feat/share-link → origin/main" in stack[0].message
+    local = _fires_only(_delivery_report(tmp_path / "l", remote=None, **{**LOCAL_ONLY, SHIPS: SHIPS}), "ships_as_mismatch", "delivery")
+    assert "local only, no PR, feat/share-link" in local[0].message
+
+
+@pytest.mark.parametrize(
+    "ships",
+    [
+        "**Ships as:** 1 PR, feat/share-link-2 \u2192 origin/main",  # a longer branch is not the branch
+        "**Ships as:** 1 PR, feat/share-link \u2192 origin/main-v2",  # nor a longer base
+        "**Ships as:** 11 PR, feat/share-link \u2192 origin/main",  # nor a larger count
+    ],
+)
+def test_ships_as_phrase_is_not_found_inside_a_longer_name(tmp_path, ships):
+    _fires_only(_delivery_report(tmp_path, **{SHIPS: ships}), "ships_as_mismatch", "delivery")
+
+
+def test_local_only_ships_as_branch_is_not_a_prefix_of_a_longer_one(tmp_path):
+    # the local-only phrase ends with the branch, so "feat/share-link-2" must not pass for "feat/share-link"
+    longer = {**LOCAL_ONLY, SHIPS: LOCAL_SHIPS + "-2"}
+    _fires_only(_delivery_report(tmp_path, remote=None, **longer), "ships_as_mismatch", "delivery")
+
+
+def test_ships_as_accepts_the_ascii_arrow(tmp_path):
+    _assert_no_delivery_findings(_delivery_report(tmp_path, **{SHIPS: "**Ships as:** 1 PR, feat/share-link -> origin/main"}))
+
+
+def test_size_pr_count_mismatch_error(tmp_path):
+    plan = v3_plan(tmp_path, **{SIZE: SIZE.replace("1 PR", "2 PRs")})
+    errors = _fires_only(vp.validate_plan(plan), "size_pr_count_mismatch", "delivery")
+    assert "2 PRs" in errors[0].message and "1" in errors[0].message
+    assert errors[0].line == _line_of(plan.read_text(encoding="utf-8"), "**Size:**")
+
+
+def test_ships_as_and_size_are_left_to_the_card_check_when_the_label_is_missing(tmp_path):
+    # check_card reports a missing label; the delivery check adds nothing to it
+    for n, removed in enumerate((SHIPS + "\n", SIZE + "\n")):
+        _fires_only(_v3(tmp_path / str(n), **{removed: ""}), "missing_label")
+
+
+# local-only rule (G1-03)
+
+
+@pytest.mark.parametrize(
+    "sentence",
+    [
+        "No PR is opened for this work.",
+        "We open no PRs at all.",
+        "This is a local-only change.",
+        "Treat it as LOCAL ONLY work.",
+        "The repo has no remote.",
+        "There is no remote, so nothing is pushed.",
+        "We merged it locally.",
+        "We merge the feature branch locally.",
+    ],
+)
+def test_local_only_phrase_forces_mode(tmp_path, sentence):
+    plan = v3_plan(tmp_path, **{OUT_OF_SCOPE: OUT_OF_SCOPE + "\n" + sentence})
+    errors = _fires_only(vp.validate_plan(plan), "local_only_phrase", "delivery")
+    assert [e.line for e in errors] == [_line_of(plan.read_text(encoding="utf-8"), sentence)]
+    assert "local-only" in errors[0].message
+
+
+def test_local_only_phrase_names_every_line(tmp_path):
+    prose = OUT_OF_SCOPE + "\nNo PR here.\nNothing else.\nLocal only there."
+    plan = v3_plan(tmp_path, **{OUT_OF_SCOPE: prose})
+    text = plan.read_text(encoding="utf-8")
+    errors = _fires_only(vp.validate_plan(plan), "local_only_phrase", "delivery")
+    assert [e.line for e in errors] == [_line_of(text, "No PR here."), _line_of(text, "Local only there.")]
+
+
+def test_local_only_phrase_is_fine_when_a_delivery_is_local_only(tmp_path):
+    # The same sentence that fails above is the plan's own Ships-as once a delivery says local-only
+    with_phrase = {OUT_OF_SCOPE: OUT_OF_SCOPE + "\nNo PR is opened for this work."}
+    _assert_no_delivery_findings(_delivery_report(tmp_path / "one", remote=None, **LOCAL_ONLY, **with_phrase))
+    # one local-only delivery among several is enough
+    both = _delivery_report(tmp_path / "two", second_repo=SECOND_LOCAL, **PR_AND_LOCAL, **with_phrase)
+    _assert_no_delivery_findings(both)
+
+
+def test_local_only_phrase_scan_skips_the_frontmatter(tmp_path):
+    # the slug is data, not prose
+    report = _delivery_report(tmp_path, **{"slug: Wishlist-Share-Link": "slug: local-only-no PR"})
+    assert [i for i in report.issues if i.rule == "local_only_phrase"] == []
+
+
+def test_local_only_with_remote_requires_question(tmp_path):
+    # AC3: a repo with a remote, a plan that ships local only
+    plan = v3_plan(tmp_path, **LOCAL_ONLY)
+    errors = _fires_only(vp.validate_plan(plan), "local_only_without_question", "delivery")
+    message = errors[0].message
+    assert str(tmp_path / "repo") in message and "origin" in message
+    assert "ask it as a numbered question" in message
+    # only the probe knows about the remote
+    _assert_no_delivery_findings(_delivery_report(tmp_path / "off", probe=False, **LOCAL_ONLY))
+    # a question that does not say "local", a Run line and a reason that say it do not count
+    not_asked = {
+        **LOCAL_ONLY,
+        Q1: Q1.replace("limits leaked links", "limits local leaks"),
+        Q3: Q3.replace("5 independent tasks", "5 local tasks"),
+    }
+    _fires_only(_delivery_report(tmp_path / "wrong", **not_asked), "local_only_without_question", "delivery")
+    # "local" is a word of its own: localhost and locally are other words
+    for n, word in enumerate(("localhost", "locally", "localized")):
+        other = {Q2: f"2. Serve from {word}? \u2192 **yes** (repo has a remote; if wrong: one PR)", D2: LOCAL_ASK[D2].replace("Keep local only, no PR", f"Serve from {word}")}
+        _fires_only(_delivery_report(tmp_path / f"word{n}", **LOCAL_ONLY, **other), "local_only_without_question", "delivery")
+    # the question and its [ask] clear it
+    _assert_no_delivery_findings(_delivery_report(tmp_path / "asked", **LOCAL_ONLY, **LOCAL_ASK))
+
+
+def test_local_only_with_remote_requires_question_in_any_case(tmp_path):
+    asked = {**LOCAL_ASK, Q2: LOCAL_ASK[Q2].replace("Keep local only", "Local only"), D2: LOCAL_ASK[D2].replace("Keep local only", "Local only")}
+    _assert_no_delivery_findings(_delivery_report(tmp_path, **LOCAL_ONLY, **asked))
+
+
+def test_local_only_with_pr_subjects_requires_question(tmp_path):
+    # No remote, but the history looks like PRs were merged through one
+    subjects = ["feat: add thing (#7)", "fix: typo"]
+    plan = v3_plan(tmp_path, remote=None, subjects=subjects, **LOCAL_ONLY)
+    errors = _fires_only(vp.validate_plan(plan), "local_only_without_question", "delivery")
+    assert str(tmp_path / "repo") in errors[0].message and "(#7)" in errors[0].message
+    assert "ask it as a numbered question" in errors[0].message
+    _assert_no_delivery_findings(_delivery_report(tmp_path / "asked", remote=None, subjects=subjects, **LOCAL_ONLY, **LOCAL_ASK))
+
+
+def test_local_only_question_is_required_per_repo(tmp_path):
+    # the first repo is clean; the second has a remote, so the plan has to ask
+    second = {"mode": "local-only", "remote": "origin", "prs": "0", "branch": "notes"}
+    report = _delivery_report(tmp_path, second_repo=second, **PR_AND_LOCAL)
+    errors = _fires_only(report, "local_only_without_question", "delivery")
+    assert str(tmp_path / "repo2") in errors[0].message
+    assert not re.search(re.escape(str(tmp_path / "repo")) + "(?!2)", errors[0].message)  # the clean first repo is not named
+
+
+def test_delivery_errors_reach_the_cli(tmp_path):
+    plan = v3_plan(tmp_path, remote="upstream")
+    proc = _run_cli(plan)
+    assert proc.returncode == 1
+    assert "[ERROR] [delivery] (human)" in proc.stdout and "origin" in proc.stdout
+    assert json.loads(_run_cli(plan, "--json").stdout)["issues"][0]["category"] == "delivery"
+    assert _run_cli(v3_plan(tmp_path / "ok")).returncode == 0
+
+
+def test_legacy_plan_gets_no_delivery_checks(tmp_path):
+    legacy = {
+        "schema: plan/v3": "schema: plan/v2",
+        DELIVERY_BLOCK: "delivery: nonsense\n",
+        OUT_OF_SCOPE: OUT_OF_SCOPE + "\nNo PR is opened for this work.",
+        "**Flags:** none": "**Flags:** none",
+    }
+    report = _delivery_report(tmp_path, git=False, **legacy)
+    assert [i for i in report.issues if i.category == "delivery"] == []
+
+
+def test_every_delivery_rule_has_a_test():
+    assert [rule for rule, name in DELIVERY_RULES.items() if name not in globals()] == []

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.2 — 2026-10-07
+
+- feat(plan-validator): check plan/v3 delivery against the live remote
+
 ## 0.2.1 — 2026-10-07
 
 - feat(plan-validator): check the plan/v3 card Brief
