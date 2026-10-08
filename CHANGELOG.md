@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.7 — 2026-10-07
+
+- docs(git-workflow): port v6.4.2 worktree isolation and point SKILL.md at its references
+
 ## 0.3.6 — 2026-10-07
 
 - fix(git-workflow): finish branches PR-first and worktree-safe, without Discard

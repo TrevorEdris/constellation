@@ -46,7 +46,7 @@ Auto-detect: staged files + no conflicts → commit; conflict markers → confli
 6. Draft `<type>(<scope>): <description>` — imperative, present tense, first line under 72 chars; explain *why* in the body, not *what*.
 7. Present for approval, then commit with the `Co-Authored-By` trailer.
 
-`scripts/commit-msg.sh` suggests type, scope, and a description hint from the staged diff:
+`bash scripts/commit-msg.sh` suggests type, scope, and a description hint from the staged diff:
 ```bash
 bash scripts/commit-msg.sh
 ```
@@ -65,7 +65,7 @@ Good/bad messages:
 6. Create the PR: `GITHUB_TOKEN= gh pr create --title "<title>" --body "<body>"`. If `gh` is missing, print the body + remote URL and suggest `brew install gh`.
 7. Report the PR URL.
 
-`scripts/pr-body.sh [base-branch]` generates a formatted body from commit history.
+`bash scripts/pr-body.sh [base-branch]` generates a formatted body from commit history.
 
 ## Sub-Workflow: branch
 
@@ -96,12 +96,7 @@ Note: during `git rebase`, "ours" and "theirs" are swapped (HEAD is the upstream
 
 ## Sub-Workflow: worktree
 
-**Bundled reference:** follow `references/using-git-worktrees/` (its SKILL.md). Do not hand-roll worktree creation here. That reference owns directory selection and the safety gates below.
-
-Non-negotiable safety carried from that skill — apply even if you set up a worktree inline:
-- **Verify the worktree directory is gitignored before creating it.** For project-local dirs run `git check-ignore -q .worktrees || git check-ignore -q worktrees`. If NOT ignored: add the line to `.gitignore` and commit it (auto-fix immediately), then proceed. Skipping this lets worktree contents get tracked and committed.
-- **Verify a clean test baseline after setup.** Run the project's test suite in the new worktree. If tests fail, report failures and ask whether to proceed or investigate — never start work on an unknown-broken baseline.
-- Auto-detect setup (`package.json`→install, `go.mod`→`go mod download`, `Cargo.toml`→`cargo build`, `requirements.txt`/`pyproject.toml`→install); never hardcode.
+**Bundled reference:** follow `references/using-git-worktrees/` (isolation check, consent, directory choice and ignore check, clean test baseline). Do not hand-roll worktree creation here.
 
 ## Sub-Workflow: finish
 
@@ -111,7 +106,7 @@ Non-negotiable safety carried from that skill — apply even if you set up a wor
 
 - `references/using-git-worktrees/` — bundled reference for the worktree mode.
 - `references/finishing-a-development-branch/` — bundled reference for the finish mode.
-- `constellation:code-review` / `code-review` — review a PR this skill opened (no direct coupling; pin reviewers to `gh pr diff --name-only` scope).
+- `constellation:code-review` — review a PR this skill opened (no direct coupling; pin reviewers to `gh pr diff --name-only` scope).
 - `constellation:verification-before-completion` — run before claiming a commit/PR is done; verify by running, not by reasoning.
 
 ## References
@@ -122,9 +117,12 @@ Non-negotiable safety carried from that skill — apply even if you set up a wor
 
 ## Scripts
 
-- `scripts/commit-msg.sh` — suggest type + scope + description from the staged diff.
-- `scripts/pr-body.sh [base]` — generate a PR body from commit history and diff stat.
-- `scripts/branch-check.sh <name>` — validate a branch name, return PASS/FAIL + suggestion.
+Script paths are relative to the git-workflow skill base directory (shown when the skill loads); run them by that absolute path from the repo.
+
+- `bash scripts/commit-msg.sh` — suggest type + scope + description from the staged diff.
+- `bash scripts/pr-body.sh [base]` — generate a PR body from commit history and diff stat.
+- `bash scripts/branch-check.sh <name>` — validate a branch name, return PASS/FAIL + suggestion.
+- `bash scripts/workspace.sh detect|merge-local|cleanup` — report the workspace (isolation, base, remote, PR-based or local), merge locally and test the result, remove a finished worktree. The worktree and finish references give the arguments.
 
 ## Assets
 
