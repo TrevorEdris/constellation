@@ -2,13 +2,13 @@
 /**
  * Context Snapshot - PreCompact Hook (constellation)
  * Before compaction, writes CONTEXT_SNAPSHOT.md to the ACTIVE session dir
- * (resolved by session_id / .active pointer / mtime, not alphabetical).
+ * (resolved by the session_id pointer or SESSION.md scan; the legacy .active file is never read).
  *
  * @hook {"event":"PreCompact","matcher":"","description":"Saves context snapshot to the active session before compaction"}
  */
 const fs = require('fs');
 const path = require('path');
-const { DEFAULT_SESSION_ROOT, resolveSessionDir, inferPhase, readSafe, sessionIdFromStdin } = require('./lib/session');
+const { sessionRoot, resolveSessionDir, inferPhase, readSafe, sessionIdFromStdin } = require('./lib/session');
 
 const SESSION_FILES = ['SESSION.md', 'DISCOVERY.md'];
 
@@ -16,8 +16,8 @@ function extractHeadings(content) {
   return content.split('\n').map(l => (l.match(/^##\s+(.+)/) || [])[1]).filter(Boolean).map(s => s.trim());
 }
 
-function createSnapshot(sessionRoot, sessionId) {
-  const sessionDir = resolveSessionDir(sessionRoot, { sessionId });
+function createSnapshot(root, sessionId) {
+  const sessionDir = resolveSessionDir(root, { sessionId });
   if (!sessionDir) return null;
   const phase = inferPhase(sessionDir);
   if (!phase) return null;
@@ -43,7 +43,7 @@ function createSnapshot(sessionRoot, sessionId) {
 async function main() {
   let input = '';
   for await (const chunk of process.stdin) input += chunk;
-  try { createSnapshot(DEFAULT_SESSION_ROOT, sessionIdFromStdin(input)); } catch { /* PreCompact cannot block */ }
+  try { createSnapshot(sessionRoot(), sessionIdFromStdin(input)); } catch { /* PreCompact cannot block */ }
   console.log('{}');
 }
 

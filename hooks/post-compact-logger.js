@@ -2,14 +2,14 @@
 /**
  * Post-Compact Logger - SessionStart(compact) Hook (constellation)
  * After compaction, appends the compact summary to the ACTIVE session's SESSION.md
- * (resolved by session_id / .active pointer / mtime). Preserves decisions across
+ * (resolved by the session_id pointer or SESSION.md scan). Preserves decisions across
  * compaction boundaries.
  *
  * @hook {"event":"SessionStart","matcher":"compact","description":"Appends compact summary to the active SESSION.md"}
  */
 const fs = require('fs');
 const path = require('path');
-const { DEFAULT_SESSION_ROOT, resolveSessionDir, sessionIdFromStdin } = require('./lib/session');
+const { sessionRoot, resolveSessionDir, sessionIdFromStdin } = require('./lib/session');
 
 function appendCompactSummary(sessionDir, summary) {
   const sessionMd = path.join(sessionDir, 'SESSION.md');
@@ -26,7 +26,7 @@ async function main() {
     // SessionStart(compact) exposes the summary as `compact_summary` (or nested under source).
     const summary = payload.compact_summary || (payload.hookSpecificOutput && payload.hookSpecificOutput.compact_summary);
     if (summary) {
-      const sessionDir = resolveSessionDir(DEFAULT_SESSION_ROOT, { sessionId: sessionIdFromStdin(input) });
+      const sessionDir = resolveSessionDir(sessionRoot(), { sessionId: sessionIdFromStdin(input) });
       if (sessionDir) appendCompactSummary(sessionDir, summary);
     }
   } catch { /* cannot block */ }

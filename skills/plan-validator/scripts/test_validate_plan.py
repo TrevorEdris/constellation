@@ -2217,7 +2217,6 @@ def test_every_delivery_rule_has_a_test():
 # ---------------------------------------------------------------------------
 
 TEMPLATE = SCRIPT.parents[2] / "writing-plans" / "references" / "PLAN-TEMPLATE.md"
-NEW_SESSION = SCRIPT.parents[3] / "scripts" / "new-session.sh"
 # The one section the valid fixture lacks: a plan writes it only when a genuine fork exists.
 OPTIONAL_TEMPLATE_SECTIONS = ("Architecture decision",)
 AGENTIC_WORKERS = (
@@ -2252,11 +2251,18 @@ def _h2_titles(lines: list[str]) -> list[str]:
 
 
 def _scaffold(tmp_path: Path, slug: str) -> Path:
-    """Run the real new-session.sh into tmp_path and return the PLAN.md it fills from the template."""
-    env = {**os.environ, "SESSION_ROOT": str(tmp_path / "sessions"), "HOME": str(tmp_path / "home")}
-    proc = subprocess.run(["bash", str(NEW_SESSION), slug], capture_output=True, text=True, check=False, env=env)
-    assert proc.returncode == 0, proc.stderr
-    return Path(proc.stdout.strip().splitlines()[-1]) / "PLAN.md"
+    """Fill the template the way writing-plans does (DATE and SLUG only) and return the PLAN.md.
+
+    new-session.sh scaffolds only SESSION.md, so a plan is created from the template when
+    planning starts; this mirrors that step.
+    """
+    import datetime
+
+    text = TEMPLATE.read_text(encoding="utf-8")
+    text = text.replace("{{DATE}}", datetime.date.today().isoformat()).replace("{{SLUG}}", slug)
+    plan = tmp_path / "PLAN.md"
+    plan.write_text(text, encoding="utf-8")
+    return plan
 
 
 def test_unfilled_template_fails_with_placeholder_error():
@@ -2268,7 +2274,7 @@ def test_unfilled_template_fails_with_placeholder_error():
 def test_scaffolded_template_still_fails(tmp_path):
     plan = _scaffold(tmp_path, "Scaffold-Check")
     text = plan.read_text(encoding="utf-8")
-    # new-session.sh filled the fields it owns ...
+    # the scaffold step filled the fields it owns ...
     assert "{{" not in text
     assert re.search(r"^date: \d{4}-\d{2}-\d{2}$", text, re.M)
     assert "slug: Scaffold-Check" in text.splitlines()
@@ -2285,7 +2291,7 @@ def test_template_frontmatter_is_v3_without_comments():
     assert fm.problems == []
     assert not [line for line in text.splitlines()[: fm.end_line] if "#" in line]
     assert set(fm.data) == {"schema", "date", "slug", "status", "delivery", "tags"}
-    # new-session.sh fills these two with sed
+    # writing-plans fills these two when it creates the plan
     assert fm.data["date"] == "{{DATE}}"
     assert fm.data["slug"] == "{{SLUG}}"
     assert fm.data["status"] == "draft"

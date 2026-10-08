@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.1 — 2026-10-07
+
+- fix(session): journal each session in its own local-dated dir
+
 ## 0.3.0 — 2026-10-07
 
 - ci: run plugin checks on every pull request and add a version bump helper
