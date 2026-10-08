@@ -46,6 +46,7 @@ class Issue:
     category: str
     message: str
     line: int = 0
+    rule: str = ""  # stable id of the rule that fired, for card and delivery errors
 
     @property
     def audience(self) -> str:
@@ -1171,6 +1172,499 @@ def check_traceability_rows(lines: list[str], report: ValidationReport) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Approval card (plan/v3)
+#
+# A v3 plan opens with a Brief written as the approval card: six labelled
+# fields, questions first. `card.py` prints the Brief verbatim between an ask
+# line and a footer, so the Brief is what the user approves. parse_card reads
+# it, parse_dlines reads the plan's D-lines, and check_card enforces the
+# grammar and the word budgets. Every finding has a stable `rule` id.
+# ---------------------------------------------------------------------------
+
+CARD_LABELS = (
+    "**Needs your call:**",
+    "**Ships as:**",
+    "**Delivers:**",
+    "**Size:**",
+    "**Made for you:**",
+    "**Flags:**",
+)
+NEEDS_LABEL, SHIPS_LABEL, DELIVERS_LABEL, SIZE_LABEL, MADE_LABEL, FLAGS_LABEL = CARD_LABELS
+CARD_FLAGS = ("auth", "payments", "migration", "delete", "external-contract", "prod-infra")
+
+CARD_MAX_WORDS = 120
+CHECK_TIME_WORDS = 4  # " (remote checked MM-DD HH:MM)", which the renderer adds to the Ships-as line
+CARD_QUESTIONS_END_BY_WORD = 60
+CARD_MAX_QUESTIONS = 3  # not counting Run
+CARD_MAX_MADE = 3
+CARD_ITEM_MAX_WORDS = 20  # each question and each Made-for-you item
+CARD_DELIVERS_MAX_WORDS = 25
+# The word budgets limit what the renderer shows for approval. Once the plan is approved the Brief is
+# frozen, and `approve` has added `you: <answer>` to it, which can push it over; so they stop applying.
+CARD_PAST_APPROVAL_STATUSES = ("approved", "in-progress", "complete")
+_WORD_BUDGET_RULES = frozenset({"question_over_20_words", "made_over_20_words"})
+
+_QUESTION_RE = re.compile(r"^(\d+)\. (.+\?) → \*\*(.+?)\*\* \((.+); if wrong: (.+)\)$")
+_RUN_RE = re.compile(r"^(\d+)\. Run → \*\*(.+?)\*\* \((.+); or (subagent-driven|inline)\)$")
+_MADE_RE = re.compile(r"^- (D\d+) (.+) \(if wrong: (.+)\)$")
+_DELIVERS_RE = re.compile(r"^An? .+ can .+")
+_DELIVERS_FOUNDATION = "None user-visible: foundation for"
+_SIZE_PARTS = (
+    ("a line count such as '~430 lines'", re.compile(r"~?[\d,]+ lines\b")),
+    ("a file count such as '9 files'", re.compile(r"\d+ files?\b")),
+    ("a PR count such as '1 PR'", re.compile(r"\d+ PRs?\b")),
+)
+_NUMBERED_RE = re.compile(r"^\d+\. ")
+_DLINE_RE = re.compile(r"^- (D\d+) \[(ask|made|made, one-way|you: [^\]]+)\] (.+)$")
+_DLINE_START_RE = re.compile(r"^- D\d+\b")
+_ASK_BODY_RE = re.compile(r"^(.+?\?) Default: (.+?)\. Why: (.+?)\. If wrong: (.+)\.$")
+_TITLE_RE = re.compile(r"^#\s+PLAN\s*[:—-]\s*(.+)$")
+_GLOBAL_CONSTRAINTS_RE = re.compile(r"global\s+constraints\b", re.IGNORECASE)
+_ANSWER_PREFIX = "you: "
+
+
+class Question(NamedTuple):
+    """One numbered line under "Needs your call".
+
+    default: the bold text, or the user's answer once it reads `**you: <answer>**`.
+    For Run (text "Run"), `cost` holds the other option from "or <other>".
+    line: 1-indexed file line.
+    """
+
+    n: int
+    text: str
+    default: str
+    reason: str
+    cost: str
+    is_run: bool
+    answered: bool
+    line: int = 0
+
+
+class CardField(NamedTuple):
+    """A card label's line number (1-indexed) and the text after the label on that line."""
+
+    line: int
+    text: str
+
+
+class Card(NamedTuple):
+    """A plan's Brief read as an approval card.
+
+    made: (D-id, choice, cost) per Made-for-you item.
+    fields: label -> CardField, in the order the labels appear. Text is normalized
+        (`->` read as `→`); brief_text is verbatim.
+    brief_text: the Brief's lines, joined by newlines: non-blank, not starting `>`,
+        up to a `---` line or the next heading of level 1 or 2.
+    brief_start: 1-indexed line of the `## Brief` heading; 0 when there is none.
+    """
+
+    questions: list[Question]
+    made: list[tuple[str, str, str]]
+    fields: dict[str, CardField]
+    brief_text: str
+    brief_start: int
+
+
+class DLine(NamedTuple):
+    """A `- D<n> [<tag>] <body>` line in `## Global Constraints`.
+
+    tag: "ask", "made", "made, one-way" or "you: <answer>".
+    text: everything after the tag.
+    default: the `Default:` value of an [ask] or [you:] line, else "".
+    line: 1-indexed file line.
+    """
+
+    tag: str
+    text: str
+    default: str
+    line: int = 0
+
+
+class _CardProblem(NamedTuple):
+    line: int
+    rule: str
+    message: str
+
+
+def _words(text: str) -> int:
+    """A word is a whitespace token that contains a word character."""
+    return sum(1 for token in text.split() if re.search(r"\w", token))
+
+
+def plan_title(lines: list[str]) -> Optional[str]:
+    """The title from the first `# PLAN: <title>` line outside fenced code, or None."""
+    mask = _fence_mask(lines)
+    for idx in range(parse_frontmatter("\n".join(lines)).end_line, len(lines)):
+        match = None if mask[idx] else _TITLE_RE.match(lines[idx].rstrip())
+        if match:
+            return match.group(1).strip()
+    return None
+
+
+def ask_line(title: str) -> str:
+    """The first line of the rendered card; it counts against the word budget."""
+    return f'**Approve "{title}"?** Reply go to take every default, or answer by number.'
+
+
+def _brief_lines(lines: list[str]) -> tuple[int, list[tuple[int, str]], bool]:
+    """(1-indexed `## Brief` line, [(1-indexed line, text)], whether it is the first `##` section).
+
+    (0, [], False) when the plan has no Brief. Headings in fenced code and in
+    the frontmatter do not count. The entries are the Brief's card lines.
+    """
+    mask = _fence_mask(lines)
+    h2 = []
+    for idx in range(parse_frontmatter("\n".join(lines)).end_line, len(lines)):
+        heading = None if mask[idx] else _HEADING_RE.match(lines[idx])
+        if heading and len(heading.group(1)) == 2:
+            h2.append((idx, heading.group(2).strip().lower()))
+    brief = next((idx for idx, title in h2 if title == "brief"), None)
+    if brief is None:
+        return 0, [], False
+
+    entries = []
+    for idx in range(brief + 1, len(lines)):
+        stripped = lines[idx].strip()
+        heading = None if mask[idx] else _HEADING_RE.match(lines[idx])
+        if stripped == "---" or (heading and len(heading.group(1)) <= 2):
+            break
+        if stripped and not stripped.startswith(">"):
+            entries.append((idx + 1, lines[idx].rstrip()))
+    return brief + 1, entries, h2[0][0] == brief
+
+
+def _scan_card(lines: list[str]) -> tuple[Card, list[_CardProblem], list[tuple[int, str]], bool]:
+    """Read the Brief: (card, format and per-item budget findings, the Brief's lines, Brief is first)."""
+    brief_start, entries, is_first = _brief_lines(lines)
+    fields: dict[str, CardField] = {}
+    content: dict[str, list[tuple[int, str]]] = {NEEDS_LABEL: [], MADE_LABEL: []}
+    current = None
+    for line_no, raw in entries:
+        text = raw.replace("->", "→")
+        label = next((lab for lab in CARD_LABELS if text.startswith(lab)), None)
+        if label is None:
+            if current in content:
+                content[current].append((line_no, text))
+            continue
+        current = label
+        value = text[len(label) :].strip()
+        fields.setdefault(label, CardField(line_no, value))
+        if label in content and value:
+            content[label].append((line_no, value))
+
+    problems: list[_CardProblem] = []
+    questions: list[Question] = []
+    for line_no, text in content[NEEDS_LABEL]:
+        run = _RUN_RE.match(text)
+        match = run or _QUESTION_RE.match(text)
+        if match is None:
+            problems.append(
+                _CardProblem(
+                    line_no,
+                    "question_format",
+                    f"Cannot read this question: {text!r}. Write 'N. <question>? → **<default>** (<reason>; if wrong: <cost>)', "
+                    "and 'N. Run → **<subagent-driven|inline>** (<reason>; or <other>)' last.",
+                )
+            )
+            continue
+        bold = match.group(3 if not run else 2)
+        answered = bold.startswith(_ANSWER_PREFIX)
+        questions.append(
+            Question(
+                n=int(match.group(1)),
+                text="Run" if run else match.group(2),
+                default=bold[len(_ANSWER_PREFIX) :] if answered else bold,
+                reason=match.group(3) if run else match.group(4),
+                cost=match.group(4) if run else match.group(5),
+                is_run=bool(run),
+                answered=answered,
+                line=line_no,
+            )
+        )
+        if _words(text) > CARD_ITEM_MAX_WORDS:
+            problems.append(
+                _CardProblem(
+                    line_no,
+                    "question_over_20_words",
+                    f"Question {match.group(1)} is {_words(text)} words; each is at most {CARD_ITEM_MAX_WORDS}. Shorten it.",
+                )
+            )
+
+    made: list[tuple[str, str, str]] = []
+    for line_no, text in content[MADE_LABEL]:
+        match = _MADE_RE.match(text)
+        if match:
+            made.append(match.groups())
+            if _words(text) > CARD_ITEM_MAX_WORDS:
+                problems.append(
+                    _CardProblem(
+                        line_no,
+                        "made_over_20_words",
+                        f"Made-for-you item {match.group(1)} is {_words(text)} words; "
+                        f"each is at most {CARD_ITEM_MAX_WORDS}. Shorten it.",
+                    )
+                )
+        elif text != "None.":
+            problems.append(
+                _CardProblem(
+                    line_no,
+                    "made_for_you_format",
+                    f"Cannot read this Made-for-you item: {text!r}. Write '- D<n> <choice> (if wrong: <cost>)'.",
+                )
+            )
+    if MADE_LABEL in fields and not content[MADE_LABEL]:
+        problems.append(
+            _CardProblem(
+                fields[MADE_LABEL].line,
+                "made_for_you_format",
+                "Made for you is empty. List the items, or write the line 'None.'.",
+            )
+        )
+
+    card = Card(questions, made, fields, "\n".join(raw for _, raw in entries), brief_start)
+    return card, problems, entries, is_first
+
+
+def parse_card(lines: list[str]) -> Card:
+    """Read a plan's Brief as an approval card. This is the one card parser; card.py imports it."""
+    return _scan_card(lines)[0]
+
+
+def _scan_dlines(lines: list[str]) -> tuple[bool, dict[str, DLine], list[_CardProblem]]:
+    """(has `## Global Constraints`, its D-lines, D-lines that do not parse)."""
+    mask = _fence_mask(lines)
+    section = _find_section(lines, mask, _GLOBAL_CONSTRAINTS_RE, 2)
+    if section is None:
+        return False, {}, []
+    dlines: dict[str, DLine] = {}
+    problems: list[_CardProblem] = []
+    for idx in range(section[0] + 1, section[1]):
+        line = lines[idx].rstrip()
+        if mask[idx] or not _DLINE_START_RE.match(line):
+            continue
+        match = _DLINE_RE.match(line)
+        if match is None:
+            problems.append(
+                _CardProblem(
+                    idx + 1,
+                    "dline_format",
+                    f"Cannot read this D-line: {line!r}. Write '- D<n> [ask|made|made, one-way] <text>'.",
+                )
+            )
+            continue
+        did, tag, body = match.groups()
+        default = ""
+        if tag == "ask" or tag.startswith(_ANSWER_PREFIX):
+            ask = _ASK_BODY_RE.match(body)
+            if ask:
+                default = ask.group(2)
+            else:
+                problems.append(
+                    _CardProblem(idx + 1, "dline_format", f"{did} must read '<question>? Default: <d>. Why: <w>. If wrong: <c>.'")
+                )
+        dlines[did] = DLine(tag, body, default, idx + 1)
+    return True, dlines, problems
+
+
+def parse_dlines(lines: list[str]) -> dict[str, DLine]:
+    """The D-lines in `## Global Constraints`, by D-id."""
+    return _scan_dlines(lines)[1]
+
+
+def check_card(lines: list[str], report: ValidationReport) -> None:
+    """Check a `plan/v3` Brief against the card grammar, the word budgets and the D-lines.
+
+    Every finding is an error with category "card" and a stable rule id. None
+    touches the score: a v3 plan is blocked by the error severity alone.
+
+    The word budgets (the card total, the questions-by-word-60 limit and the per-item
+    caps) are render-time limits. They stop applying once the status is approved,
+    in-progress or complete, so a plan keeps validating however long the user's answers
+    made the frozen Brief (DESIGN 3.3, R1). Every other card rule still applies.
+    """
+
+    def error(rule: str, message: str, line: int = 0) -> None:
+        report.issues.append(Issue(severity="error", category="card", message=message, line=line, rule=rule))
+
+    budgets = parse_frontmatter("\n".join(lines)).data.get("status") not in CARD_PAST_APPROVAL_STATUSES
+    card, problems, entries, is_first = _scan_card(lines)
+    if not budgets:
+        problems = [problem for problem in problems if problem.rule not in _WORD_BUDGET_RULES]
+    has_constraints, dlines, dline_problems = _scan_dlines(lines)
+    if not has_constraints:
+        error(
+            "global_constraints_missing",
+            "No '## Global Constraints' section. Record each [ask] and [made] decision there as a D-line.",
+        )
+    for problem in dline_problems:
+        error(problem.rule, problem.message, problem.line)
+
+    if card.brief_start == 0:
+        error("brief_missing", "No '## Brief' section. A v3 plan opens with a Brief written as the approval card.")
+        return
+    if not is_first:
+        error("brief_not_first", "Brief must be the first section (first '##' heading) of the plan.", card.brief_start)
+
+    title = plan_title(lines)
+    if title is None:
+        error("title_missing", "No '# PLAN: <title>' line. The card's ask line is built from the title.")
+
+    # Grammar: every label, once, in order
+    for label in CARD_LABELS:
+        if label not in card.fields:
+            error("missing_label", f"Brief is missing the label {label}", card.brief_start)
+    present = [label for label in CARD_LABELS if label in card.fields]
+    written = sorted(card.fields, key=lambda label: card.fields[label].line)
+    if written != present:
+        error("label_order", f"Brief labels are out of order. Use: {', '.join(present)}", card.fields[written[0]].line)
+
+    for problem in problems:
+        error(problem.rule, problem.message, problem.line)
+
+    # Questions: at most 3 plus Run, and Run last
+    plain = [q for q in card.questions if not q.is_run]
+    if len(plain) > CARD_MAX_QUESTIONS:
+        error(
+            "four_questions",
+            f"{len(plain)} questions plus Run; the card takes at most {CARD_MAX_QUESTIONS}. "
+            "More means the design is unsettled: decide some, or go back to brainstorming.",
+            plain[CARD_MAX_QUESTIONS].line,
+        )
+    first_run = next((q.line for q in card.questions if q.is_run), 0)
+    if not first_run:
+        # An unreadable numbered line may be the Run itself; question_format already reports it
+        unreadable = any(problem.rule == "question_format" for problem in problems)
+        needs = card.fields.get(NEEDS_LABEL)
+        if not unreadable:
+            error(
+                "run_not_last",
+                "The card has no Run item. End the numbered list with "
+                "'N. Run → **<subagent-driven|inline>** (<reason>; or <other>)'; Run must be the last numbered item.",
+                card.questions[-1].line if card.questions else needs.line if needs else card.brief_start,
+            )
+    elif card.questions[-1].line != first_run:
+        error("run_not_last", "Run must be the last numbered item, and appear once.", first_run)
+
+    # Fields
+    if len(card.made) > CARD_MAX_MADE:
+        error(
+            "four_made",
+            f"{len(card.made)} Made-for-you items; the card takes at most {CARD_MAX_MADE}. Keep the costliest.",
+            card.fields[MADE_LABEL].line,
+        )
+
+    delivers = card.fields.get(DELIVERS_LABEL)
+    if delivers:
+        if not (_DELIVERS_RE.match(delivers.text) or delivers.text.startswith(_DELIVERS_FOUNDATION)):
+            error(
+                "delivers_not_user_action",
+                f"Delivers must say what a user can do ('A <user> can <action>.'), or start '{_DELIVERS_FOUNDATION} <X>'.",
+                delivers.line,
+            )
+        if budgets and _words(delivers.text) > CARD_DELIVERS_MAX_WORDS:
+            error(
+                "delivers_over_25_words",
+                f"Delivers is {_words(delivers.text)} words; the limit is {CARD_DELIVERS_MAX_WORDS}.",
+                delivers.line,
+            )
+
+    size = card.fields.get(SIZE_LABEL)
+    if size:
+        missing = [what for what, pattern in _SIZE_PARTS if not pattern.search(size.text)]
+        if missing:
+            error("size_without_counts", f"Size must give counts, not adjectives. Missing {'; '.join(missing)}.", size.line)
+
+    flags = card.fields.get(FLAGS_LABEL)
+    if flags and flags.text != "none":
+        unknown = [flag for flag in (item.strip() for item in flags.text.split(",")) if flag not in CARD_FLAGS]
+        if unknown:
+            error(
+                "unknown_flag",
+                f"Unknown flag {', '.join(repr(flag) for flag in unknown)}. Use 'none' or a comma list of: {', '.join(CARD_FLAGS)}.",
+                flags.line,
+            )
+
+    # The Brief is read as plain language, and the renderer adds the check time itself
+    if "`" in card.brief_text:
+        error("backticks_in_brief", "Brief must be plain language: no code or backticks.", card.brief_start)
+    if BRIEF_STEP_REF.search(card.brief_text):
+        error("step_ref_in_brief", "Brief must be plain language: no step numbers.", card.brief_start)
+    if "remote checked" in card.brief_text.lower():
+        ships = card.fields.get(SHIPS_LABEL)
+        error(
+            "remote_checked_in_brief",
+            "Brief must not contain 'remote checked'; the renderer adds the check time to the Ships-as line.",
+            ships.line if ships else card.brief_start,
+        )
+
+    # Budgets: ask line + Brief + the check time the renderer adds
+    ask_words = _words(ask_line(title or ""))
+    total = ask_words + sum(_words(text) for _, text in entries) + CHECK_TIME_WORDS
+    if budgets and total > CARD_MAX_WORDS:
+        error(
+            "card_over_120_words",
+            f"Card is {total} words; the budget is {CARD_MAX_WORDS} "
+            f"(ask line, Brief and the {CHECK_TIME_WORDS}-word check time added at render). Cut it.",
+            card.brief_start,
+        )
+    position, last_question_end, last_question_line = ask_words, 0, 0
+    for line_no, text in entries:
+        position += _words(text)
+        if _NUMBERED_RE.match(text):
+            last_question_end, last_question_line = position, line_no
+    if budgets and last_question_end > CARD_QUESTIONS_END_BY_WORD:
+        error(
+            "questions_after_word_60",
+            f"The questions end at word {last_question_end}; they must end by word {CARD_QUESTIONS_END_BY_WORD}. "
+            "Shorten them, or move words to Size.",
+            last_question_line,
+        )
+
+    # D-lines
+    ask_dlines = {}
+    for did, dline in dlines.items():
+        if dline.tag == "ask" or dline.tag.startswith(_ANSWER_PREFIX):
+            ask = _ASK_BODY_RE.match(dline.text)
+            if ask:
+                ask_dlines.setdefault(ask.group(1), (did, dline))
+    question_texts = {q.text for q in plain}
+    for question, (did, dline) in ask_dlines.items():
+        if dline.tag == "ask" and question not in question_texts:
+            error("ask_without_question", f"{did} is an [ask] but the card has no question {question!r}.", dline.line)
+    for q in plain:
+        found = ask_dlines.get(q.text)
+        if found is None:
+            error("question_without_ask", f"Question {q.n} ({q.text!r}) has no [ask] D-line in Global Constraints.", q.line)
+            continue
+        did, dline = found
+        answered = q.answered or dline.tag.startswith(_ANSWER_PREFIX)
+        if not answered and dline.default != q.default:
+            error(
+                "dline_default_mismatch",
+                f"{did} says Default: {dline.default}, but the card's default is {q.default}.",
+                dline.line,
+            )
+
+    for did, dline in dlines.items():
+        if dline.tag == "made, one-way":
+            error("one_way_made", f"{did} is one-way, so the user decides it: make it an [ask].", dline.line)
+        if dline.tag.startswith("made") and "Conflicts:" in dline.text:
+            error(
+                "conflicts_made",
+                f"{did} conflicts with a standing rule, so the user decides it: make it an [ask].",
+                dline.line,
+            )
+    for did, _, _ in card.made:
+        if did not in dlines or not dlines[did].tag.startswith("made"):
+            error(
+                "made_for_you_unknown_did",
+                f"Made for you lists {did}, but Global Constraints has no [made] D-line {did}.",
+                card.fields[MADE_LABEL].line,
+            )
+
+
+# ---------------------------------------------------------------------------
 # Report rendering
 # ---------------------------------------------------------------------------
 
@@ -1269,7 +1763,8 @@ def validate_plan(path: Path, probe: bool = True) -> ValidationReport:
 
     lines = content.splitlines()
 
-    check_schema(parse_frontmatter(content), report)
+    fm = parse_frontmatter(content)
+    check_schema(fm, report)
 
     check_target_repos(lines, report)
     check_files_to_modify(lines, report)
@@ -1288,7 +1783,10 @@ def validate_plan(path: Path, probe: bool = True) -> ValidationReport:
     check_pr_size_estimate(lines, report)
     check_git_branch(lines, report)
     check_git_commit_plan(lines, report)
-    check_brief(lines, report)
+    if is_v3(fm):
+        check_card(lines, report)
+    else:
+        check_brief(lines, report)
     check_placeholders(lines, report)
     check_v2_steps(lines, report)
     check_traceability_rows(lines, report)
