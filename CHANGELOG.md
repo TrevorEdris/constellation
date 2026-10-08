@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.5 — 2026-10-07
+
+- feat(git-workflow): add workspace.sh to detect, merge and clean up worktrees safely
+
 ## 0.3.4 — 2026-10-07
 
 - fix(git-workflow): accept hyphens, feat/ and ticket IDs in branch-check
