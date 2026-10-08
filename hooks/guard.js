@@ -444,13 +444,14 @@ function suppliesPattern(table, words) {
  * or might not, so every way of reading the arguments is followed at once. A reading is a string:
  * `1` or `0` for whether the pattern has been found, then the words still owed to an option. A word
  * is a file on every reading (`certain`), on only some (it might be an option's value or the
- * pattern), or on none (not returned).
+ * pattern), or on none (not returned). A command with no pattern passes `hasPattern = false`
+ * (see operandWords): the pattern counts as found from the start.
  */
-function patternReaderWords(table, args) {
+function patternReaderWords(table, args, hasPattern = true) {
   const stop = args.findIndex((w) => table.stop.has(w));
   const words = stop === -1 ? args : args.slice(0, stop);
   const end = words.indexOf('--'); // from here on every word is a positional
-  let readings = new Set([suppliesPattern(table, words) ? '1' : '0']);
+  let readings = new Set([!hasPattern || suppliesPattern(table, words) ? '1' : '0']);
   const out = [];
   words.forEach((w, i) => {
     const roles = new Set();
@@ -508,29 +509,337 @@ function readerWords(cmd, args) {
   return out;
 }
 
+/** One word as a path or, if it has a glob character (`*`, `?`, `[`, or a `{a,b}` group), as a glob. */
+function secretWord(word, home) {
+  return classifyPath(word, home) || (/[*?[{]/.test(word) ? globTargetsSecret(word, home) : null);
+}
+
 /**
- * A reader with a secret argument, or any command with a secret `<` target. An argument with a
- * glob character (`*`, `?`, `[`, or a `{a,b}` group) is also read as a glob, so a wildcard or brace
- * word is caught the way `.env.local` is.
- * A word that is a file on only some readings of the options (it might be the pattern or an
- * option's value) can ask but never deny, because a deny cannot be approved.
+ * The secret among candidate words (`{word, certain}`) that matters most, as `{word, pathId, tier}`,
+ * or null. `classify` maps a word to `{pathId, tier}` or null. A word that is a file on only some
+ * readings of the options (it might be the pattern or an option's value) can ask but never deny,
+ * because a deny cannot be approved.
  */
-function readSecret(seg, ctx) {
-  const { cmd, args } = cmdOf(seg);
-  const words = READERS.has(cmd) ? readerWords(cmd, args) : [];
-  for (const r of seg.redirects) if (r.op === '<') words.push({ word: r.target, certain: true });
+function worstSecret(candidates, classify) {
   let best = null;
-  for (const { word, certain } of words) {
-    const c = classifyPath(word, ctx.home) || (/[*?[{]/.test(word) ? globTargetsSecret(word, ctx.home) : null);
+  for (const { word, certain } of candidates) {
+    const c = classify(word);
     if (c === null) continue;
     const tier = c.tier === 'deny' && !certain ? 'ask' : c.tier;
     if (best === null || (tier === 'deny' && best.tier !== 'deny')) best = { word, pathId: c.pathId, tier };
   }
+  return best;
+}
+
+/** A reader with a secret argument, or any command with a secret `<` target (see worstSecret). */
+function readSecret(seg, ctx) {
+  const { cmd, args } = cmdOf(seg);
+  const words = READERS.has(cmd) ? readerWords(cmd, args) : [];
+  for (const r of seg.redirects) if (r.op === '<') words.push({ word: r.target, certain: true });
+  const best = worstSecret(words, (w) => secretWord(w, ctx.home));
+  return best === null ? null : { pathId: best.pathId, tier: best.tier, reason: `reading ${shown(best.word)} (${best.pathId}) can expose secrets` };
+}
+
+// -- What else a command can do with a secret ---------------------------------------------------
+//
+// Each rule here names one action (copy, send, feed through a pipe, write, delete, source) and
+// answers with the tier the path classifier gives: a deny-tier path denies and any other secret
+// asks. They sit above `read-secret` in the table, so a tie inside one segment goes to the rule
+// that names the action. A word that names a secret but fits none of them is safety net B's.
+
+// A word names a path in more ways than its own text: `of=/x` and `--file=/x` carry one after the
+// `=`, and curl and httpie mark a file to send with a leading `@` (`-d @x`, `-F f=@x`, `f@x`).
+const AT_FILE = /^[^\s=@/]*=?@/;
+
+/** The texts of a word that may be a path: itself, what follows its first `=`, and each without a leading `@` form. */
+function pathForms(word) {
+  const forms = [word];
+  const eq = word.indexOf('=');
+  if (eq !== -1) forms.push(word.slice(eq + 1));
+  for (const f of forms.slice()) {
+    const m = AT_FILE.exec(f);
+    if (m !== null) forms.push(f.slice(m[0].length));
+  }
+  return forms;
+}
+
+/** secretWord over every form of a word (see pathForms); a deny-tier match wins. */
+function wordSecret(word, home) {
+  let found = null;
+  for (const form of pathForms(word)) {
+    const c = secretWord(form, home);
+    if (c !== null && (found === null || (c.tier === 'deny' && found.tier !== 'deny'))) found = c;
+  }
+  return found;
+}
+
+/** The rule answer for the worst secret `worstSecret` found (or null): "<action> <word> (<pathId>) <why>". */
+function secretHit(best, action, why) {
   if (best === null) return null;
-  return { pathId: best.pathId, tier: best.tier, reason: `reading ${shown(best.word)} (${best.pathId}) can expose secrets` };
+  return { pathId: best.pathId, tier: best.tier, reason: `${action} ${shown(best.word)} (${best.pathId}) ${why}` };
+}
+
+// The options of the commands below, in the form of the reader tables above, so that the value of
+// an option is not taken for a file (`scp -i KEY`, `tar -C DIR`): the word after an option the
+// table does not list may or may not be its value, and then it can only ask. A table lists what
+// the common versions agree on; a letter left out costs a prompt at worst.
+const NO_OPTIONS = optionTable({ short: {}, long: {} });
+const CP = optionTable({
+  short: { flag: 'abcdfHiLlnPpRrsTuvxXZ', val: 'tS' },
+  long: {
+    flag: 'archive force recursive interactive no-clobber update link symbolic-link dereference no-dereference preserve parents verbose',
+    val: 'target-directory suffix',
+  },
+});
+const MV = optionTable({
+  short: { flag: 'bfhinuvxZ', val: 'tS' },
+  long: { flag: 'force interactive no-clobber update verbose backup', val: 'target-directory suffix' },
+});
+const LN = optionTable({
+  short: { flag: 'bdFfhiLnPrsTvw', val: 'tS' },
+  long: {
+    flag: 'symbolic force interactive logical physical relative verbose no-dereference backup directory',
+    val: 'target-directory suffix',
+  },
+});
+const INSTALL = optionTable({
+  short: { flag: 'bCcdDpsTUv', val: 'gmot' },
+  long: { flag: 'backup compare directory preserve-timestamps strip verbose', val: 'group mode owner target-directory' },
+});
+const SCP = optionTable({ short: { flag: '346ABCpqrTv', val: 'cDFiJloPSX' }, long: {} });
+const SFTP = optionTable({ short: { flag: '1246aCfpqrv', val: 'BbcDFiJlmoPRSsX' }, long: {} });
+const RSYNC = optionTable({
+  short: { flag: 'aAbcCdDEFgHhiIJklLmnoOpPqrRsStuUvWxXyz46', val: 'eBfMT' },
+  long: {
+    flag: 'archive recursive verbose compress delete dry-run progress partial update times perms links checksum human-readable stats '
+      + 'itemize-changes inplace relative copy-links',
+    val: 'rsh exclude include filter temp-dir port',
+    rfile: 'exclude-from include-from files-from',
+  },
+});
+const TAR = optionTable({
+  short: { flag: 'cxturdAvjJzZpPkhmOa', val: 'fCTX' },
+  long: {
+    flag: 'create extract list append update delete verbose gzip bzip2 xz auto-compress preserve-permissions dereference',
+    val: 'file directory files-from exclude-from exclude',
+  },
+});
+const ZIP = optionTable({ short: { flag: 'rjqvgdfFTmoSyDXklAeu0123456789', val: 'bntxiPOZs' }, long: {} });
+const RM = optionTable({
+  short: { flag: 'dfIiPRrvWx' },
+  long: { flag: 'force recursive dir verbose one-file-system no-preserve-root preserve-root interactive' },
+});
+const SHRED = optionTable({
+  short: { flag: 'fuvxz', val: 'ns' },
+  long: { flag: 'force remove verbose exact zero', val: 'iterations size random-source' },
+});
+const TRUNCATE = optionTable({ short: { flag: 'co', val: 'rs' }, long: { flag: 'no-create io-blocks', val: 'size reference' } });
+const TEE = optionTable({ short: { flag: 'aip' }, long: { flag: 'append ignore-interrupts output-error' } });
+
+const COPIERS = new Map([['cp', CP], ['mv', MV], ['ln', LN], ['install', INSTALL], ['rsync', RSYNC], ['scp', SCP], ['sftp', SFTP], ['tar', TAR],
+  ['zip', ZIP]]);
+const DELETERS = new Map([['rm', RM], ['shred', SHRED], ['truncate', TRUNCATE], ['unlink', NO_OPTIONS]]);
+const SOURCERS = new Map([['source', NO_OPTIONS], ['.', NO_OPTIONS]]);
+
+/** The words of a command's arguments that are operands rather than options or their values, as `{word, certain}`. */
+function operandWords(table, args) {
+  return patternReaderWords(table, args, false);
+}
+
+/** A rule for commands whose operands are all files: the worst secret among them, in the classifier's tier. */
+function operandRule(tables, action, why) {
+  return (seg, ctx) => {
+    const { cmd, args } = cmdOf(seg);
+    const table = tables.get(cmd);
+    if (table === undefined) return null;
+    return secretHit(worstSecret(operandWords(table, args), (w) => wordSecret(w, ctx.home)), action, why);
+  };
+}
+
+const copySecret = operandRule(COPIERS, 'copying', 'can expose a secret');
+const deleteSecret = operandRule(DELETERS, 'deleting', 'can destroy a secret');
+const sourceSecret = operandRule(SOURCERS, 'sourcing', 'loads its secrets into the shell');
+
+const UPLOADERS = new Set(['curl', 'wget', 'nc', 'ncat', 'netcat', 'socat', 'http', 'https']);
+// The options that name the file to send, as a word of their own or with the file attached by `=`.
+const SEND_FILE_OPTIONS = new Set(['-T', '--upload-file', '--post-file', '--body-file']);
+const SEND_FILE_ATTACHED = /^--(?:upload|post|body)-file=/;
+
+/**
+ * Every argument of a sender, as `{word, certain}`. It is certain to be a file that is sent when it
+ * is marked (`@x`, `name=@x`, `name@x`) or follows `-T` / `--upload-file` / `--post-file` /
+ * `--body-file`. Any other argument might only hand the command a key to sign with (`--key`) or a
+ * path to write (`-o`), so it can ask but never deny.
+ */
+function sentWords(args) {
+  return args.map((word, i) => {
+    const marked = pathForms(word).some((f) => AT_FILE.test(f));
+    return { word, certain: marked || SEND_FILE_OPTIONS.has(args[i - 1]) || SEND_FILE_ATTACHED.test(word) };
+  });
+}
+
+/** A network sender given a secret: as an argument (see sentWords) or as its `<` input. */
+function uploadSecret(seg, ctx) {
+  const { cmd, args } = cmdOf(seg);
+  if (!UPLOADERS.has(cmd)) return null;
+  const words = sentWords(args);
+  for (const r of seg.redirects) if (r.op === '<') words.push({ word: r.target, certain: true });
+  return secretHit(worstSecret(words, (w) => wordSecret(w, ctx.home)), `${shown(cmd)} with`, 'can send a secret over the network');
+}
+
+/** A `>` or `>>` target, or a `tee` operand, that is a secret. */
+function writeSecret(seg, ctx) {
+  const words = [];
+  for (const r of seg.redirects) if (r.op === '>' || r.op === '>>') words.push({ word: r.target, certain: true });
+  const { cmd, args } = cmdOf(seg);
+  if (cmd === 'tee') words.push(...operandWords(TEE, args));
+  return secretHit(worstSecret(words, (w) => wordSecret(w, ctx.home)), 'writing to', 'can overwrite or change a secret');
+}
+
+// -- Feeding a secret through a pipe --
+
+const FIND_NAME_OPTIONS = new Set(['-name', '-iname', '-path', '-wholename']);
+
+/** The secret a `find`'s name or path glob can match, as `{word, pathId}`, or null. */
+function findGlobSecret(find, home) {
+  if (find === undefined) return null;
+  const { args } = cmdOf(find);
+  for (let i = 0; i + 1 < args.length; i++) {
+    if (!FIND_NAME_OPTIONS.has(args[i])) continue;
+    const c = globTargetsSecret(args[i + 1], home);
+    if (c !== null) return { word: args[i + 1], pathId: c.pathId };
+  }
+  return null;
+}
+
+/** For each pipeline, its segments (in order) that mention a secret, as `{position, hit}`. Built once, when a sink needs it. */
+function feedsOf(ctx) {
+  if (ctx.feeds === null) {
+    ctx.feeds = new Map();
+    for (const s of ctx.segments) {
+      const hit = mentionOf(s, ctx.home);
+      if (hit === null) continue;
+      if (!ctx.feeds.has(s.pipeline)) ctx.feeds.set(s.pipeline, []);
+      ctx.feeds.get(s.pipeline).push({ position: s.position, hit });
+    }
+  }
+  return ctx.feeds;
+}
+
+/**
+ * The child of an `xargs` or a `find -exec` that reads, copies or sends what it is given, when what
+ * it is given may be a secret: a word naming one earlier in the same pipeline (`find . -name .env |
+ * xargs cat`), or, for a `find -exec` child, a name glob of its own find. The child's own words are
+ * read-secret's, so its parent (whose words contain them) is not a feed. What comes down a pipe is
+ * a guess, so this always asks.
+ */
+function pipeSecret(seg, ctx) {
+  if (seg.via !== 'xargs' && seg.via !== 'find-exec') return null;
+  const { cmd } = cmdOf(seg);
+  if (!READERS.has(cmd) && !COPIERS.has(cmd) && !UPLOADERS.has(cmd)) return null;
+  let fed = seg.via === 'find-exec' ? findGlobSecret(ctx.segments[seg.parent], ctx.home) : null;
+  if (fed === null) {
+    for (const f of feedsOf(ctx).get(seg.pipeline) || []) {
+      if (f.position >= seg.position) break;
+      if (f.position !== seg.parent) {
+        fed = f.hit;
+        break;
+      }
+    }
+  }
+  if (fed === null) return null;
+  const through = seg.via === 'xargs' ? 'xargs' : 'find -exec';
+  return { pathId: fed.pathId, tier: 'ask', reason: `${through} ${shown(cmd)} is fed ${shown(fed.word)} (${fed.pathId}), which can expose secrets` };
+}
+
+// -- Printing secrets without a file name --
+
+const nonOptions = (args) => args.filter((a) => !(a.length > 1 && a[0] === '-'));
+
+/**
+ * Print the whole environment: bare `env` (only flags), `printenv` with no name, `export` with no
+ * name, bare `set` (`set -e` sets an option and is not one), and `declare -p` or `-x` with no name.
+ * A command the parser could not place under `env` is net A's.
+ */
+function envDump(seg) {
+  const { cmd, args } = cmdOf(seg);
+  const dumps = (cmd === 'env' && seg.unparsed === null && args.every((a) => a.startsWith('-')))
+    || ((cmd === 'printenv' || cmd === 'export') && nonOptions(args).length === 0)
+    || (cmd === 'set' && args.length === 0)
+    || (cmd === 'declare' && nonOptions(args).length === 0 && args.some((a) => /^-[A-Za-z]*[px]/.test(a)));
+  return dumps ? { reason: `${shown(cmd)} prints every variable in the environment, which can expose secrets` } : null;
+}
+
+// The names of variables that hold a secret. `KEY` alone is not one: it is too common a word.
+const SECRET_VAR = /(^|_)(SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIALS?|AUTH)$|_KEY$|APIKEY$/i;
+// `$NAME` and `${NAME...`: groups are a `#` (the length), the braced name, what follows it, the plain name.
+const VAR_REF = /\$(?:\{(#?)([A-Za-z_][A-Za-z0-9_]*)([^}]*)|([A-Za-z_][A-Za-z0-9_]*))/g;
+
+/** The first secret variable whose value a word prints. `${N:+x}` and `${N+x}` only test it and `${#N}` is its length. */
+function secretVarIn(word) {
+  for (const m of word.matchAll(VAR_REF)) {
+    if (m[1] === '#' || (m[2] !== undefined && /^:?\+/.test(m[3]))) continue;
+    const name = m[2] !== undefined ? m[2] : m[4];
+    if (SECRET_VAR.test(name)) return name;
+  }
+  return null;
+}
+
+/** `echo`, `printf` or `print` of a secret variable, or `printenv` of one. */
+function printSecretVar(seg) {
+  const { cmd, args } = cmdOf(seg);
+  let name = null;
+  if (cmd === 'echo' || cmd === 'printf' || cmd === 'print') {
+    for (const a of args) {
+      name = secretVarIn(a);
+      if (name !== null) break;
+    }
+  } else if (cmd === 'printenv') {
+    name = nonOptions(args).find((a) => SECRET_VAR.test(a)) || null;
+  }
+  return name === null ? null : { reason: `printing ${shown(name)} can expose a secret` };
+}
+
+// A process's environment, one file per process.
+const PROC_ENVIRON = /\/proc\/[^/]+\/environ(?![\w.-])/;
+
+/** Any word, or a `<` input, that is the environment file of a process. */
+function procEnviron(seg) {
+  const words = seg.words.concat(seg.redirects.filter((r) => r.op === '<').map((r) => r.target));
+  const w = words.find((x) => PROC_ENVIRON.test(x));
+  return w === undefined ? null : { reason: `${shown(w)} holds the environment of a process, which can expose secrets` };
 }
 
 // -- Safety nets ---------------------------------------------------------------------------------
+
+const mentionCache = new WeakMap();
+
+/**
+ * The worst secret that any word or redirect target of a segment names, as `{word, pathId, tier}`,
+ * or null. The words of a pattern reader (grep, rg, ag, sed, awk, jq) are left to read-secret, which
+ * tells its pattern from its files: a search FOR a key's name is not a mention of the key.
+ */
+function mentionOf(seg, home) {
+  let m = mentionCache.get(seg);
+  if (m === undefined) {
+    const words = PATTERN_READERS.has(cmdOf(seg).cmd) ? [] : seg.words.concat(seg.redirects.map((r) => r.target));
+    m = worstSecret(words.map((word) => ({ word, certain: true })), (w) => wordSecret(w, home));
+    mentionCache.set(seg, m);
+  }
+  return m;
+}
+
+/**
+ * Safety net B. Whatever the parser made of the line, a word that names a secret path and is not
+ * the operand of any rule above asks: `echo "see ~/.ssh/id_rsa"`, `ls ~/.ssh`, `git add .env`, and
+ * a secret behind `a[0]=1 cat ~/.ssh/id_rsa`. It never denies, even for a private key, because only
+ * a rule that knows the verb knows the file is read. It is a fallback (see `beats`): any other hit
+ * is the better answer.
+ */
+function secretMentioned(seg, ctx) {
+  const m = mentionOf(seg, ctx.home);
+  return m === null ? null : { pathId: m.pathId, tier: 'ask', reason: 'secret path mentioned' };
+}
 
 const PLAIN_NAME = /^[A-Za-z0-9_][A-Za-z0-9_.+-]*$/;
 const PLAIN_PATH_CHARS = /^[A-Za-z0-9_.+~/-]+$/;
@@ -602,9 +911,22 @@ const RULES = [
   { id: 'disk-write', tier: 'deny', test: diskWrite },
   { id: 'disk-format', tier: 'deny', test: diskFormat },
   { id: 'fork-bomb', tier: 'deny', test: forkBomb },
+  // The rules for a specific action on a secret. The path-based ones answer with the tier the path
+  // classifier returns, so a deny-tier path denies; the rest only ask.
+  { id: 'copy-secret', tier: 'ask', test: copySecret },
+  { id: 'upload-secret', tier: 'ask', test: uploadSecret },
+  { id: 'pipe-secret', tier: 'ask', test: pipeSecret },
+  { id: 'write-secret', tier: 'ask', test: writeSecret },
+  { id: 'delete-secret', tier: 'ask', test: deleteSecret },
+  { id: 'source-secret', tier: 'ask', test: sourceSecret },
+  { id: 'env-dump', tier: 'ask', test: envDump },
+  { id: 'print-secret-var', tier: 'ask', test: printSecretVar },
+  { id: 'proc-environ', tier: 'ask', test: procEnviron },
   // read-secret is the last secret rule: a rule for a specific action goes above it, so it wins
   // a tie inside one segment. Its tier is the one the path classifier returns.
   { id: 'read-secret', tier: 'ask', test: readSecret },
+  // The safety nets. Net B is a fallback: it answers only when no other rule has a hit.
+  { id: 'secret-path-mentioned', tier: 'ask', fallback: true, test: secretMentioned },
   { id: 'unparsed-command', tier: 'ask', test: unparsedCommand },
   { id: 'unrecognized-command-word', tier: 'ask', test: unrecognizedCommandWord },
 ];
@@ -617,10 +939,15 @@ const NO_SEGMENT = Object.freeze({
   words: [], redirects: [], substs: [], pipeline: 0, position: 0, via: 'top', parent: null, depth: 0, unparsed: null,
 });
 
-/** Is hit `a` a better winner than `b`? Deny first, then the lowest position, then table order. */
+/**
+ * Is hit `a` a better winner than `b`? Deny first, then a hit from a rule that is not a fallback
+ * (a catch-all names no action, so any rule that does is the better answer wherever it hits), then
+ * the lowest position, then table order.
+ */
 function beats(a, b) {
   if (b === null) return true;
   if ((a.tier === 'deny') !== (b.tier === 'deny')) return a.tier === 'deny';
+  if (a.fallback !== b.fallback) return b.fallback;
   if (a.position !== b.position) return a.position < b.position;
   return a.ruleIndex < b.ruleIndex;
 }
@@ -662,6 +989,8 @@ function decide(payload, opts) {
     home,
     homeDir: typeof home === 'string' && posix.isAbsolute(home) ? tidy(home) : '',
     unparsed: parsed.unparsed,
+    segments: parsed.segments,
+    feeds: null, // built by pipeSecret when a pipe sink needs it
     hasCase: parsed.segments.some((seg) => cmdOf(seg).cmd === 'case'),
     testRest: testContinuations(parsed.segments),
   };
@@ -674,7 +1003,7 @@ function decide(payload, opts) {
       if (!r) return;
       const tier = r.tier || rule.tier;
       if (critical && tier !== 'deny') return;
-      const hit = { id: rule.id, tier, pathId: r.pathId, reason: r.reason || rule.id, position: seg.position, ruleIndex };
+      const hit = { id: rule.id, tier, pathId: r.pathId, reason: r.reason || rule.id, position: seg.position, ruleIndex, fallback: rule.fallback === true };
       if (beats(hit, best)) best = hit;
     });
   }
