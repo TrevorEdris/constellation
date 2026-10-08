@@ -248,8 +248,11 @@ test('read-secret: every reader denies a deny-tier path and asks for an ask-tier
     assert.equal(ask?.decision, 'ask', name);
     assert.equal(ask.id, 'read-secret', name);
     assert.equal(ask.pathId, 'env-file', name);
-    // A reader's name is only a reader as the command word.
-    assert.equal(run(`echo ${name} ~/.ssh/id_rsa`), null, name);
+    // A reader's name is only a reader as the command word. Anywhere else the key's name is only
+    // mentioned: net B asks, and never denies.
+    const text = run(`echo ${name} ~/.ssh/id_rsa`);
+    assert.equal(text?.decision, 'ask', name);
+    assert.equal(text.id, 'secret-path-mentioned', name);
   }
 });
 
@@ -317,12 +320,6 @@ test('read-secret: which words of a reader are paths', () => {
     ['cat *', null],
     ['cat [a-z]*.md', null],
     ['cat /h/.config/gcloud/credentials.db', 'gcloud-creds'],
-    // A command that is not a reader does not read.
-    ['ls .env', null],
-    ['file .env', null],
-    ['echo .env', null],
-    ['wc -l .env', null],
-    ['cd .ssh', null],
     // Any command reading a secret through `<` does.
     ['wc -l < .env', 'env-file'],
     ['tr a b < .env.local', 'env-file'],
@@ -340,6 +337,11 @@ test('read-secret: which words of a reader are paths', () => {
   const d = run('sort < ~/.ssh/id_rsa');
   assert.equal(d.decision, 'deny');
   assert.equal(d.pathId, 'ssh-private-key');
+  // A command that is not a reader does not read. Naming the secret is still a mention, which
+  // safety net B asks about (guard-secrets.test.js covers it), so it is not a read-secret hit.
+  for (const cmd of ['ls .env', 'file .env', 'echo .env', 'wc -l .env', 'cd .ssh']) {
+    assert.equal(run(cmd)?.id, 'secret-path-mentioned', cmd);
+  }
 });
 
 test('read-secret: the value of an option is neither the pattern nor a file', () => {
