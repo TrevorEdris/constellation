@@ -48,7 +48,7 @@
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { parse, commandOf } = require('./lib/shell-words.js');
+const { parse, commandOf, gitCmd } = require('./lib/shell-words.js');
 
 const posix = path.posix;
 
@@ -296,6 +296,152 @@ const FORK_BOMB = /:\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:/;
 
 function forkBomb(seg, ctx) {
   return seg.position === 0 && FORK_BOMB.test(ctx.command) ? { reason: 'fork bomb' } : null;
+}
+
+// -- Risky commands that ask ---------------------------------------------------------------------
+//
+// Commands that are legitimate often enough that the user, not the guard, decides: run downloaded
+// code, discard work (reset, clean, force-delete, force-push, rm of the current directory), loosen
+// permissions, drop docker volumes. Each is matched on the words of one segment, so the same text
+// inside a commit message or an `echo` is never a hit. They are all ask-tier.
+
+const DOWNLOADERS = new Set(['curl', 'wget']);
+const INTERPRETERS = new Set(['sh', 'bash', 'zsh', 'dash', 'python', 'python3', 'node', 'perl', 'ruby']);
+
+/**
+ * Does an interpreter run what is piped into it? Not when it was handed a program of its own: a
+ * `-c`, `-e`, `-E`, `-m` or `-p` option (`python3 -c '...'`, `node -e '...'`) or a script file
+ * (`python3 tool.py`); then stdin is only data. `-s` (`bash -s -- --yes`) and a bare `-` say the
+ * program is on stdin, whatever else is there.
+ */
+function readsProgramFromStdin(args) {
+  let ownProgram = false;
+  for (const w of args) {
+    if (w === '-s' || w === '-') return true;
+    if (w === '--eval' || w === '--print' || w === '--command') ownProgram = true;
+    else if (w.length > 1 && w[0] === '-' && w[1] !== '-') ownProgram = ownProgram || /[ceEmp]/.test(w);
+    else if (w !== '--' && w[0] !== '-') ownProgram = true;
+  }
+  return !ownProgram;
+}
+
+/** A curl or wget earlier in the same pipeline feeding a shell or interpreter that runs its stdin. */
+function curlPipeShell(seg, ctx) {
+  if (seg.via === 'xargs' || seg.via === 'find-exec') return null;
+  const { cmd, args } = cmdOf(seg);
+  if (!INTERPRETERS.has(cmd) || !readsProgramFromStdin(args)) return null;
+  const source = ctx.segments.find((s) => s.pipeline === seg.pipeline && s.position < seg.position
+    && s.via !== 'xargs' && s.via !== 'find-exec' && DOWNLOADERS.has(cmdOf(s).cmd));
+  return source === undefined ? null : { reason: `piping ${shown(cmdOf(source).cmd)} into ${shown(cmd)} runs downloaded code unseen` };
+}
+
+/** git's subcommand and arguments when the segment runs git (`git -C dir ...` included), else null. */
+function gitOf(seg) {
+  const { cmd, args } = cmdOf(seg);
+  if (cmd !== 'git') return null;
+  const g = gitCmd(args);
+  return g.sub === '' ? null : g;
+}
+
+/** The options of a git subcommand (words before `--`): long names without a value, and every short letter. */
+function gitFlags(args) {
+  const long = new Set();
+  let short = '';
+  for (const w of args) {
+    if (w === '--') break;
+    if (w.startsWith('--')) long.add(w.split('=')[0]);
+    else if (w.length > 1 && w[0] === '-') short += w.slice(1);
+  }
+  return { long, short };
+}
+
+function gitResetHard(seg) {
+  const g = gitOf(seg);
+  return g !== null && g.sub === 'reset' && g.args.includes('--hard') ? { reason: 'git reset --hard discards uncommitted work' } : null;
+}
+
+function gitCleanForce(seg) {
+  const g = gitOf(seg);
+  if (g === null || g.sub !== 'clean') return null;
+  const { long, short } = gitFlags(g.args);
+  const dryRun = long.has('--dry-run') || short.includes('n');
+  return !dryRun && (long.has('--force') || short.includes('f')) ? { reason: 'git clean with force deletes untracked files for good' } : null;
+}
+
+function gitWorktreeRemoveForce(seg) {
+  const g = gitOf(seg);
+  if (g === null || g.sub !== 'worktree' || g.args[0] !== 'remove') return null;
+  const { long, short } = gitFlags(g.args.slice(1));
+  return long.has('--force') || short.includes('f') ? { reason: 'forcing worktree removal discards its uncommitted work' } : null;
+}
+
+function gitBranchForceDelete(seg) {
+  const g = gitOf(seg);
+  if (g === null || g.sub !== 'branch') return null;
+  const { long, short } = gitFlags(g.args);
+  const del = short.includes('d') || long.has('--delete');
+  const force = short.includes('f') || long.has('--force');
+  return short.includes('D') || (del && force) ? { reason: 'force-deleting a branch can lose commits that are not merged' } : null;
+}
+
+// Options of git push that take the next word as their value.
+const PUSH_VALUED = new Set(['-o', '--push-option', '--repo', '--receive-pack', '--exec']);
+const DEFAULT_BRANCH = /^(?:refs\/heads\/)?(main|master)$/;
+
+/** The words of `git push` that are not options or their values: the remote and the refspecs. */
+function pushOperands(args) {
+  const out = [];
+  let ended = false;
+  for (let i = 0; i < args.length; i++) {
+    const w = args[i];
+    if (!ended && w === '--') ended = true;
+    else if (!ended && w.length > 1 && w[0] === '-') {
+      if (PUSH_VALUED.has(w)) i++;
+    } else out.push(w);
+  }
+  return out;
+}
+
+/** A force push (`-f`, `--force`, or a `+ref`) whose destination is main or master; `--force-with-lease` alone passes. */
+function gitForcePushDefault(seg) {
+  const g = gitOf(seg);
+  if (g === null || g.sub !== 'push') return null;
+  const { long, short } = gitFlags(g.args);
+  const forced = long.has('--force') || short.includes('f');
+  for (const ref of pushOperands(g.args)) {
+    const plus = ref.startsWith('+');
+    const spec = plus ? ref.slice(1) : ref;
+    const dst = spec.slice(spec.lastIndexOf(':') + 1);
+    const m = DEFAULT_BRANCH.exec(dst);
+    if (m !== null && (forced || plus)) return { reason: `force-pushing to ${m[1]} rewrites shared history` };
+  }
+  return null;
+}
+
+// The targets that mean "here" or "up from here", which a recursive rm would empty.
+const CWD_TARGET = /^(?:\.|\*|\.\*|(?:\.\.\/)*\.\.)$/;
+
+/** Recursive rm of `.`, `*`, `..` and their `./` forms. In the home directory that is a deny (rm-root-home). */
+function rmRecursiveCwd(seg, ctx) {
+  const { cmd, args } = cmdOf(seg);
+  if (cmd !== 'rm') return null;
+  const { targets, recursive } = rmArgs(args);
+  if (!recursive) return null;
+  const t = targets.find((x) => CWD_TARGET.test(tidy(x, ctx.home)));
+  return t === undefined ? null : { reason: `recursive rm of ${shown(t)} deletes the current directory or a parent` };
+}
+
+function chmod777(seg) {
+  const { cmd, args } = cmdOf(seg);
+  return cmd === 'chmod' && args.some((a) => /^0?777$/.test(a)) ? { reason: 'chmod 777 lets every user change the files' } : null;
+}
+
+function dockerVolumeRm(seg) {
+  const { cmd, args } = cmdOf(seg);
+  if (cmd !== 'docker') return null;
+  const i = args.indexOf('volume');
+  const verb = i === -1 ? undefined : args[i + 1];
+  return verb === 'rm' || verb === 'remove' || verb === 'prune' ? { reason: `docker volume ${verb} deletes volume data for good` } : null;
 }
 
 // -- Secret reads --------------------------------------------------------------------------------
@@ -911,6 +1057,16 @@ const RULES = [
   { id: 'disk-write', tier: 'deny', test: diskWrite },
   { id: 'disk-format', tier: 'deny', test: diskFormat },
   { id: 'fork-bomb', tier: 'deny', test: forkBomb },
+  // Risky but ordinary commands: the user decides.
+  { id: 'curl-pipe-shell', tier: 'ask', test: curlPipeShell },
+  { id: 'git-reset-hard', tier: 'ask', test: gitResetHard },
+  { id: 'git-clean-force', tier: 'ask', test: gitCleanForce },
+  { id: 'git-worktree-remove-force', tier: 'ask', test: gitWorktreeRemoveForce },
+  { id: 'git-branch-force-delete', tier: 'ask', test: gitBranchForceDelete },
+  { id: 'git-force-push-default', tier: 'ask', test: gitForcePushDefault },
+  { id: 'rm-recursive-cwd', tier: 'ask', test: rmRecursiveCwd },
+  { id: 'chmod-777', tier: 'ask', test: chmod777 },
+  { id: 'docker-volume-rm', tier: 'ask', test: dockerVolumeRm },
   // The rules for a specific action on a secret. The path-based ones answer with the tier the path
   // classifier returns, so a deny-tier path denies; the rest only ask.
   { id: 'copy-secret', tier: 'ask', test: copySecret },

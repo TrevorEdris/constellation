@@ -112,9 +112,12 @@ test('deny rules: the same words in harmless positions are not denied', () => {
   assert.equal(run('rm -rf *', { cwd: '/h/' })?.id, 'rm-root-home');
   assert.equal(run('rm -rf ./', { cwd: '/h' })?.id, 'rm-root-home');
   assert.equal(run('rm -rf ./*', { cwd: '/h' })?.id, 'rm-root-home');
-  assert.equal(run('rm -rf .', { cwd: CWD }), null);
-  assert.equal(run('rm -rf *', { cwd: CWD }), null);
-  assert.equal(run('rm -rf .', { cwd: '/h/project' }), null);
+  // Away from home the same commands are not a deny; they ask (rm-recursive-cwd).
+  for (const [cmd, cwd] of [['rm -rf .', CWD], ['rm -rf *', CWD], ['rm -rf .', '/h/project']]) {
+    const d = run(cmd, { cwd });
+    assert.equal(d?.decision, 'ask', cmd);
+    assert.equal(d.id, 'rm-recursive-cwd', cmd);
+  }
   assert.equal(run('rm -f *', { cwd: '/h' }), null, 'not recursive');
   assert.equal(run('rm -rf build', { cwd: '/h' }), null);
   // Every spelling of "recursive" counts: upper-case -R, a cluster holding it, and the long option.
@@ -123,8 +126,8 @@ test('deny rules: the same words in harmless positions are not denied', () => {
   assert.equal(run('rm --recursive .', { cwd: '/h' })?.id, 'rm-root-home');
   assert.equal(run('rm --recursive --force *', { cwd: '/h' })?.id, 'rm-root-home');
   assert.equal(run('rm --force *', { cwd: '/h' }), null, 'a long option that is not --recursive');
-  assert.equal(run('rm -R *', { cwd: CWD }), null);
-  assert.equal(run('rm --recursive .', { cwd: CWD }), null);
+  assert.equal(run('rm -R *', { cwd: CWD }).id, 'rm-recursive-cwd');
+  assert.equal(run('rm --recursive .', { cwd: CWD }).id, 'rm-recursive-cwd');
   const rows = [
     'rm -rf ~/projects/x/build',
     'rm -rf /h/projects',
@@ -956,7 +959,7 @@ test('decide ignores what is not a Bash command and never throws on odd payloads
   // Without a usable home or cwd, only the home rules go quiet.
   assert.equal(decide({ tool_name: 'Bash', tool_input: { command: 'rm -rf /' } }, { env: {}, home: '' }).id, 'rm-root-home');
   assert.equal(decide({ tool_name: 'Bash', tool_input: { command: 'rm -rf ~' } }, { env: {}, home: '' }), null);
-  assert.equal(decide({ tool_name: 'Bash', tool_input: { command: 'rm -rf .' }, cwd: '' }, { env: {}, home: '' }), null);
+  assert.equal(decide({ tool_name: 'Bash', tool_input: { command: 'rm -rf .' }, cwd: '' }, { env: {}, home: '' }).id, 'rm-recursive-cwd');
 });
 
 test('toOutput: the hook JSON for a decision, and {} for none', () => {

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.4 — 2026-10-07
+
+- feat(hooks): route Bash through the tiered guard and retire block-dangerous-commands
+
 ## 0.4.3 — 2026-10-07
 
 - feat(hooks): ask before copying, sending or printing secrets from Bash
