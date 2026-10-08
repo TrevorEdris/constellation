@@ -35,7 +35,7 @@ jobs:
             exit 1
           fi
 
-          if ! git diff --name-only "$BASE"...HEAD | grep -qE '^(\.claude-plugin|agents|hooks|skills|scripts)/'; then
+          if ! git diff --name-only "$BASE"...HEAD | grep -qE '^(\.claude-plugin|agents|docs|hooks|skills|scripts)/'; then
             echo "No plugin files changed; skipping bump check."
             exit 0
           fi

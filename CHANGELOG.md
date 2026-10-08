@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.3.0 — 2026-10-07
+
+- ci: run plugin checks on every pull request and add a version bump helper
 ## 0.2.5 — 2026-10-07
 
 - feat(writing-plans): hand off every plan as a 120-word approval card
