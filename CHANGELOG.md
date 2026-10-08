@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.9 — 2026-10-07
+
+- feat(ci): lint skill links, bundled-script calls and generated-file drift
+
 ## 0.3.8 — 2026-10-07
 
 - fix(skills): resolve dangling skill links and run bundled scripts through their interpreter
