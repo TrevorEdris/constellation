@@ -15,7 +15,7 @@ This skill is flexible facilitation, but two gates are non-negotiable:
 
 ```
 GATE 1 — Discovery before authoring (create mode): no PRD sections until the 8 discovery questions are answered or sourced.
-GATE 2 — Validation before handoff: the PRD must score >= 70 via the bundled validator (run `references/prd-validator/scripts/validate_prd.py`; see `references/prd-validator/SKILL.md`) before it leaves this skill.
+GATE 2 — Validation before handoff: the PRD must score >= 70 via the bundled validator (run `python3 references/prd-validator/scripts/validate_prd.py <PRD>`; see `references/prd-validator/SKILL.md`) before it leaves this skill.
 ```
 
 Skipping discovery produces a PRD that answers the wrong question. Skipping validation ships an untestable spec to engineering.
@@ -68,7 +68,7 @@ Checklist (one TodoWrite item each):
 2. **Existing-context check** — if discovery Q8 reveals existing code, suggest a reverse-engineering pass over the existing code before authoring.
 3. **Section authoring** — walk the PRD template section by section using `references/facilitation-prompts.md`; pre-fill from discovery answers; confirm each section before the next.
 4. **Write** the PRD to `PRD.md` (or the user-specified path) using `references/prd-template.md`.
-5. **Validate** — run `references/prd-validator/scripts/validate_prd.py` (see `references/prd-validator/SKILL.md`). If NEEDS WORK (< 70), fix the findings and re-validate. Repeat until PASS.
+5. **Validate** — run `python3 references/prd-validator/scripts/validate_prd.py <PRD>` (see `references/prd-validator/SKILL.md`). If NEEDS WORK (< 70), fix the findings and re-validate. Repeat until PASS.
 
 ### Discovery questions (Phase 1)
 

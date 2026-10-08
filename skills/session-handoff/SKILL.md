@@ -29,14 +29,14 @@ Determine which mode applies:
 Run the smart scaffold script to create a pre-filled handoff document:
 
 ```bash
-python scripts/create_handoff.py [task-slug]
+python3 scripts/create_handoff.py [task-slug]
 ```
 
-Example: `python scripts/create_handoff.py implementing-user-auth`
+Example: `python3 scripts/create_handoff.py implementing-user-auth`
 
 **For continuation handoffs** (linking to previous work):
 ```bash
-python scripts/create_handoff.py "auth-part-2" --continues-from 2024-01-15-auth.md
+python3 scripts/create_handoff.py "auth-part-2" --continues-from 2024-01-15-auth.md
 ```
 
 The script will:
@@ -62,7 +62,7 @@ Use the template structure in [references/handoff-template.md](references/handof
 Run the validation script to check completeness and security:
 
 ```bash
-python scripts/validate_handoff.py <handoff-file>
+python3 scripts/validate_handoff.py <handoff-file>
 ```
 
 The validator checks:
@@ -89,7 +89,7 @@ Report to user:
 List handoffs in the current project:
 
 ```bash
-python scripts/list_handoffs.py
+python3 scripts/list_handoffs.py
 ```
 
 This shows all handoffs with dates, titles, and completion status.
@@ -99,7 +99,7 @@ This shows all handoffs with dates, titles, and completion status.
 Before loading, check how current the handoff is:
 
 ```bash
-python scripts/check_staleness.py <handoff-file>
+python3 scripts/check_staleness.py <handoff-file>
 ```
 
 Staleness levels:

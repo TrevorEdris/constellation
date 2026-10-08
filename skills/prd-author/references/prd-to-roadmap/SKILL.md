@@ -23,7 +23,7 @@ Run the validator yourself before you write a single phase. A roadmap built on a
 python3 ../prd-validator/scripts/validate_prd.py <path-to-PRD> --verbose
 ```
 
-If the score is NEEDS WORK (< 70), STOP. Report the failing findings and route the user back to fix the PRD (constellation:prd-author) and re-validate (constellation:prd-validator, REQUIRED SUB-SKILL). Do not proceed on a draft.
+If the score is NEEDS WORK (< 70), STOP. Report the failing findings and route the user back to fix the PRD (`constellation:prd-author`) and re-validate (the `references/prd-validator/SKILL.md` guide in `constellation:prd-author`, REQUIRED SUB-SKILL). Do not proceed on a draft.
 
 ## Two rules that shape every roadmap
 
@@ -89,7 +89,7 @@ Feature entry (one phase, one capability):
 
 ## Integration
 
-- **Upstream:** constellation:prd-author (writes the PRD), constellation:prd-validator (REQUIRED SUB-SKILL — the gate this skill runs).
+- **Upstream:** `constellation:prd-author` (writes the PRD), the `references/prd-validator/SKILL.md` guide in `constellation:prd-author` (REQUIRED SUB-SKILL — the gate this skill runs).
 - **Downstream:** the ROADMAP feeds spec authoring and then constellation:writing-plans for step-level implementation plans. The only artifacts that decompose features into PRs live there, never here.
 
 ## References

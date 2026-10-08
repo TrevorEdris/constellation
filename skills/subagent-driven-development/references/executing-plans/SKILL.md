@@ -15,7 +15,7 @@ NO TASK EXECUTED BEFORE THE PLAN IS CRITICALLY REVIEWED. NO BLOCKER WORKED AROUN
 
 Violating the letter of the rules is violating the spirit of the rules. "I followed the gist of the plan" is not following the plan.
 
-**Announce at start:** "I'm using the executing-plans skill to implement this plan."
+**Announce at start:** "I'm using the executing-plans guide in constellation:subagent-driven-development to implement this plan."
 
 ## This is the inferior path — say so
 
@@ -41,7 +41,7 @@ One agent, one context, no isolation. Subagent-driven execution produces signifi
 4. If no concerns: create a TodoWrite list with one item per plan task and proceed.
 
 ### Step 2: Set up the workspace
-- **REQUIRED SUB-SKILL:** Use `constellation:using-git-worktrees` to set up an isolated workspace before editing.
+- **REQUIRED SUB-SKILL:** Use the `references/using-git-worktrees/SKILL.md` guide in `constellation:git-workflow` to set up an isolated workspace before editing.
 - Branch check: never start implementation on `main`/`master` without explicit user consent.
 
 ### Step 3: Execute tasks
@@ -54,8 +54,8 @@ For each task, in order:
 
 ### Step 4: Complete development
 After all tasks are complete and verified:
-- Announce: "I'm using the finishing-a-development-branch skill to complete this work."
-- **REQUIRED SUB-SKILL:** Use `constellation:finishing-a-development-branch` to verify tests, present options, and execute the choice.
+- Announce: "I'm using the finishing-a-development-branch guide in constellation:git-workflow to complete this work."
+- **REQUIRED SUB-SKILL:** Use the `references/finishing-a-development-branch/SKILL.md` guide in `constellation:git-workflow` to verify tests, present options, and execute the choice.
 
 ## STOP and ask — do not guess
 
@@ -108,7 +108,7 @@ Each of these is the moment a plan execution goes off the rails. Stop and reset 
 ## Integration
 
 - **Upstream:** `constellation:writing-plans` produces the plan this skill executes.
-- **Required before editing:** `constellation:using-git-worktrees`.
-- **Downstream hand-off:** `constellation:finishing-a-development-branch`.
+- **Required before editing:** the `references/using-git-worktrees/SKILL.md` guide in `constellation:git-workflow`.
+- **Downstream hand-off:** the `references/finishing-a-development-branch/SKILL.md` guide in `constellation:git-workflow`.
 - **Preferred alternative:** `constellation:subagent-driven-development` whenever subagents exist.
 - **Background disciplines:** `constellation:test-driven-development`, `constellation:systematic-debugging`, `constellation:verification-before-completion`.

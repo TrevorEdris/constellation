@@ -39,13 +39,13 @@ git diff --merge-base origin/HEAD
 
 Do not review merged worktree code, unrelated files, or the whole repo. If a finding sits outside `gh pr diff --name-only`, it is out of scope — note it separately, do not review it.
 
-Optionally run `scripts/diff-analysis.py --staged` (large files, new deps, test-vs-impl ratio, secret patterns) and `scripts/pr-context.sh <pr>` to orient.
+Optionally run `python3 scripts/diff-analysis.py --staged` (large files, new deps, test-vs-impl ratio, secret patterns) and `bash scripts/pr-context.sh <pr>` to orient.
 
 ## Step 2 — Validate against requirements FIRST
 
 Build the right thing before judging how well it is built.
 
-- Fetch the spec/plan; if Atlassian MCP is connected, fetch the linked ticket. `scripts/extract-ticket-ids.sh <pr>` pulls Jira IDs from the PR title, body, and branch.
+- Fetch the spec/plan; if Atlassian MCP is connected, fetch the linked ticket. `bash scripts/extract-ticket-ids.sh <pr>` pulls Jira IDs from the PR title, body, and branch.
 - For each acceptance criterion, find the file:line that satisfies it — or mark it MISSING.
 - Flag scope creep: changes with no corresponding requirement.
 

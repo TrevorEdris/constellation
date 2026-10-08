@@ -13,7 +13,7 @@ below or `gh pr diff --name-only`.
 
 ```
 Task:
-  Use the constellation:requesting-code-review template (REQUIRED SUB-SKILL).
+  Load `constellation:code-review` and fill its `references/requesting-code-review/references/code-reviewer-prompt.md` template (REQUIRED SUB-SKILL).
 
   WHAT_WAS_IMPLEMENTED: [from implementer's report]
   PLAN_OR_REQUIREMENTS: Task N from [plan-file]

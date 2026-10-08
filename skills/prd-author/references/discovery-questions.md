@@ -57,7 +57,7 @@ Present these to the user before writing any requirements. Don't skip them — t
 
 > "Is there existing code, an existing product, or an existing process that this relates to? Should we reverse-engineer requirements from what exists before writing new ones?"
 >
-> If yes, suggest running `constellation:reverse-engineer (discover mode)` before authoring the PRD.
+> If yes, read the existing code first; if a separate `reverse-engineer` skill is installed (not part of constellation), suggest its discover mode before authoring the PRD.
 
 ---
 
@@ -72,7 +72,7 @@ Present these to the user before writing any requirements. Don't skip them — t
 | 5. Constraints | Non-Functional Requirements, Dependencies, Scope Boundary |
 | 6. Success Definition | Success Metrics, Milestone deliverables |
 | 7. Non-Goals | Scope Boundary (out-of-scope) |
-| 8. Existing Context | Triggers constellation:reverse-engineer if applicable |
+| 8. Existing Context | Triggers an existing-code read, plus a separate `reverse-engineer` skill if installed |
 
 ---
 
