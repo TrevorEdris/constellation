@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.6 — 2026-10-07
+
+- fix(git-workflow): finish branches PR-first and worktree-safe, without Discard
+
 ## 0.3.5 — 2026-10-07
 
 - feat(git-workflow): add workspace.sh to detect, merge and clean up worktrees safely

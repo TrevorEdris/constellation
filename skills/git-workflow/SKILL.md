@@ -14,7 +14,8 @@ Active assistant for everyday git operations: produce well-formed conventional c
 These mirror the user's standing git-safety rules. They override convenience.
 
 - **Branch check first.** Run `git branch --show-current`. If on `main`/`master`/`develop`, STOP and ask before committing, merging, or pushing.
-- **Never push to `main`/`master` without explicit approval.** No force-push to a protected branch, ever.
+- **Never push to `main`/`master` without explicit approval.** Never force: no `--force` push without an explicit request, never to a protected branch, never on `git worktree remove`.
+- **"Merge to main" means push + PR.** Run `git remote -v` and `git log -5 --format=%s <base>`. A remote, or `(#N)` subjects, make the repo PR-based, so "merge / land / ship it to main" means push the branch and open a PR. Merge locally only for an approved local-only delivery (an approved plan with a `mode: local-only` item for this repo), and only through finish mode.
 - **Never commit secrets.** Scan the staged diff for `.env`, credentials, tokens, keys before committing. If found, unstage and warn.
 - **Prefer specific staging.** Stage named files (`git add path/...`); avoid `git add -A` / `git add .` unless the user asked for it.
 - **Prefix `gh` with the token.** The bare `GITHUB_TOKEN` env var is invalid here; run GitHub commands as `GITHUB_TOKEN= gh ...` so `gh` falls back to keyring auth.
@@ -31,7 +32,7 @@ Detect the sub-workflow from the request or context; if ambiguous, ask.
 | branch | User wants a new branch | Enforce naming, create branch |
 | conflict | `UU` markers in `git status` | Guide per-file resolution |
 | worktree | User wants an isolated workspace | Follow `references/using-git-worktrees/` |
-| finish | Work done, branch ready to dispose | Follow `references/finishing-a-development-branch/` |
+| finish | Work done, branch ready to dispose, or "merge / land / ship it to main" | Follow `references/finishing-a-development-branch/` |
 
 Auto-detect: staged files + no conflicts → commit; conflict markers → conflict; clean branch + no argument → ask.
 
@@ -104,7 +105,7 @@ Non-negotiable safety carried from that skill — apply even if you set up a wor
 
 ## Sub-Workflow: finish
 
-**Bundled reference:** follow `references/finishing-a-development-branch/` for branch disposition (run tests, then merge / PR / keep / discard, plus worktree cleanup). The "keep as-is" path pairs with `constellation:session-handoff`. Do not delete a branch or merge to a base without running the test suite first and getting explicit confirmation for destructive options.
+**Bundled reference:** follow `references/finishing-a-development-branch/` (test gate, workspace detection, PR-first menu, cleanup). The "keep as-is" path pairs with `constellation:session-handoff`.
 
 ## Integration
 

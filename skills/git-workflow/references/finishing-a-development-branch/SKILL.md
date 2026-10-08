@@ -5,103 +5,138 @@ description: Use when implementation is done and you must decide how to integrat
 
 # Finishing a Development Branch
 
-Type: rigid (discipline). Follow exactly. Do not adapt away the gate or the option set.
+Type: rigid (discipline). Follow exactly. Do not adapt away the gate or the menu.
 
-## Overview
+Finishing means a clean, verified integration of completed work, never a guess at intent. No integration action without green tests in this message and an explicit user choice.
 
-Finishing means a clean, verified integration of completed work — never a guess at intent.
+**Core principle:** Verify tests → Detect the workspace → Settle the base → Present the menu → Execute the choice → Clean up.
 
-Core principle: verify tests → determine base → present exactly four options → execute the chosen one → clean up correctly.
+**Announce at start:** "Using finishing-a-development-branch to complete this work."
 
-**Violating the letter of the rules is violating the spirit of the rules.**
+Script paths are relative to the git-workflow skill base directory (shown when the skill loads); run them by that absolute path from the repo.
 
-## The Iron Law
+## Step 1: Verify tests (gate)
 
-```
-NO INTEGRATION ACTION WITHOUT GREEN TESTS AND AN EXPLICIT USER CHOICE
-```
-
-You do not merge, push, open a PR, or delete anything until: (1) the full test suite passed in THIS message, and (2) the user picked one of the four options. Inferring the choice, or skipping the test run because "it passed earlier," violates the law.
-
-## The Process
-
-### Step 1: Verify tests (gate)
-
-Announce: "Using finishing-a-development-branch to complete this work."
-
-Run the project's full suite this message and read the output:
+Run the project's full suite in this message and read the output:
 
 ```bash
 npm test   # or: cargo test | pytest | go test ./...
 ```
 
-- Any failure: STOP. Report the failures. Do not proceed to Step 2.
+- Any failure: STOP. Report the failures. No menu until the suite is green.
 - 0 failures, this message: continue.
 
-This is the verification gate. A run from an earlier message does not count. See REQUIRED BACKGROUND below.
+A run from an earlier message does not count (see REQUIRED BACKGROUND under Integration). An explicit "merge it to main" from the user counts as the choice in Step 4; it does not waive this gate.
 
-### Step 2: Determine the base branch
+## Step 2: Detect the workspace
+
+Run this inside the workspace, before any `cd` (Step 5 changes directory):
 
 ```bash
-git merge-base HEAD main 2>/dev/null || git merge-base HEAD master 2>/dev/null
+bash scripts/workspace.sh detect [<base>]
 ```
 
-If ambiguous, ask: "This branch split from <base> — correct?" Do not assume.
+Pass `<base>` when the plan or conversation already names it. It prints `KEY=value` lines (`ISOLATION`, `HEAD`, `BRANCH`, `BASE`, `GIT_DIR`, `GIT_COMMON`, `WORKTREE_PATH`, `MAIN_ROOT`, `CLEANUP`, `REMOTE`, `DELIVERY`). Shell variables do not survive between commands, so substitute these values wherever later steps write `$MAIN_ROOT`, `$WORKTREE_PATH` or `$REMOTE`.
 
-### Step 3: Present exactly four options
+- `HEAD=detached`: an externally managed workspace; the menu has no local merge.
+- `DELIVERY=pr`: the repo has a remote, or its history shows merged pull requests. `DELIVERY=local`: neither.
+- `CLEANUP=git`: a worktree on a branch under `.worktrees/`, `worktrees/` or `.claude/worktrees/` of `MAIN_ROOT`; Step 6 may remove it. `CLEANUP=host`: anything else; the host owns it, leave it in place.
+- `ISOLATION=none`: a normal checkout; there is no worktree to remove.
 
-Present these four, verbatim, with no added explanation:
+## Step 3: Determine the base branch
+
+The base is what this work forked from: the plan, the conversation, or the branch's upstream. If none of them names it, ask: "This branch split from <BASE guess> - is that correct?" Confirm before merging or opening a PR; the wrong base is expensive to undo. If the base differs from `BASE=`, rerun `bash scripts/workspace.sh detect <base>` (still before any `cd`): `DELIVERY` reads that base's history.
+
+## Step 4: Present the menu
+
+Pick the menu from `HEAD`, then `DELIVERY`. Present it exactly as written, with `<branch>` and `<base>` filled in, then wait. Discard is never on the menu.
+
+PR-based (`DELIVERY=pr`):
 
 ```
-Implementation complete. What would you like to do?
+Implementation complete on <branch>. This repo is PR-based.
 
-1. Merge back to <base-branch> locally
-2. Push and create a Pull Request
-3. Keep the branch as-is (I'll handle it later)
-4. Discard this work
+1. Push and open a Pull Request against <base>
+2. Keep the branch as-is (I'll handle it later)
 
 Which option?
 ```
 
-Never collapse to "what next?", never add a fifth option, never recommend one. Wait for the user.
+Add `3. Merge into <base> locally (approved local-only delivery)` only when the active PLAN qualifies: its `status` is `approved` or `in-progress`, and its block-form `delivery:` list has a `mode: local-only` item for this repo. Nothing else qualifies; the script checks again.
 
-### Step 4: Execute the chosen option
+Local (`DELIVERY=local`):
 
-#### Option 1 — Merge locally
+```
+Implementation complete on <branch>. No remote and no PR history.
 
-```bash
-git checkout <base-branch>
-git pull
-git merge <feature-branch>
-<test command>          # re-run the suite ON the merged result
-git branch -d <feature-branch>   # only after merge tests pass
+1. Merge into <base> locally
+2. Keep the branch as-is (I'll handle it later)
+
+Which option?
 ```
 
-If post-merge tests fail: STOP, report, do not delete the branch. Then cleanup worktree (Step 5).
+Detached HEAD:
 
-#### Option 2 — Push and create PR
+```
+Implementation complete. You're on a detached HEAD (externally managed workspace).
 
-```bash
-git push -u origin <feature-branch>
-gh pr create --title "<title>" --body "$(cat <<'EOF'
-## Summary
-<2-3 bullets of what changed>
+1. Push as a new branch and open a Pull Request
+2. Keep as-is (I'll handle it later)
 
-## Test Plan
-- [ ] <verification steps>
-EOF
-)"
+Which option?
 ```
 
-Keep the worktree (the PR is in flight). Then Step 5.
+- `DELIVERY=pr` with an empty `REMOTE`: no menu. Say "This repo is PR-based but has no remote. Add a remote and I'll push and open a PR, or approve a local-only delivery in the plan." and stop. No push, no local merge.
+- "Merge / land / ship it (to main)" is already a choice. With `DELIVERY=pr` it selects option 1 without a menu; say "PR-based repo: pushing and opening a PR instead of merging locally." With `DELIVERY=local` it selects the local merge.
+- Pushes use `$REMOTE`, never a hard-coded `origin`.
 
-#### Option 3 — Keep as-is
+## Step 5: Execute the choice
 
-Report: "Keeping branch <name>. Worktree preserved at <path>." Do not clean up anything.
+### Push and open a Pull Request
 
-#### Option 4 — Discard (typed confirmation required)
+```bash
+git push -u "$REMOTE" <branch>
+```
 
-Show exactly what will be destroyed, then require a typed confirmation:
+From a detached HEAD, check the new name with `bash scripts/branch-check.sh "<name>"`, then run `git push "$REMOTE" HEAD:refs/heads/<name>` instead.
+
+Then follow the `pr` sub-workflow in the git-workflow SKILL.md from step 4 (the repo's PR template wins; the push above replaces its step 5), creating the PR against the base:
+
+```bash
+GITHUB_TOKEN= gh pr create --title "<title>" --body "<body>" --base <base>
+```
+
+From a detached HEAD, add `--head <name>`. Report the PR URL.
+
+- If `gh` is missing or fails (for example a non-GitHub remote): print the title, the body and `git remote get-url "$REMOTE"`, say the branch is pushed, and stop.
+- A rejected push means the remote moved. Investigate and report; never force it.
+- The worktree stays: PR feedback gets fixed there.
+- **Stack:** when the active PLAN has a `delivery` item with `mode: stack` for this branch, the base is that item's `base` (the lower stack branch), and the remote is its `remote` unless that is `none`, else `$REMOTE`. Push and open the PR as above. Run no `gh stack` commands.
+
+### Merge locally
+
+Local menu option 1, or option 3 of the PR-based menu. Run it from the main checkout, with the project's test command last:
+
+```bash
+cd "$MAIN_ROOT"
+bash scripts/workspace.sh merge-local <base> <branch> [--plan <PLAN path>] -- <test command>
+```
+
+Pass `--plan` for option 3. The script checks out the base in `MAIN_ROOT` (the base is usually checked out there, and doing it inside a worktree exits 128), merges, and runs the tests on the merged result. Read the output lines:
+
+- `PREVIOUS_BRANCH=`: when it is not the base, tell the user `MAIN_ROOT` was on that branch and now sits on the base.
+- Exit 0 with `MERGED=<sha>`: the merged result is green. Go to Step 6.
+- Exit 5: the merged result fails its tests. STOP and report `UNDO=` (`git -C <MAIN_ROOT> reset --merge <sha>`, which keeps unrelated edits) and `KEPT_BRANCH=`. The branch and worktree stay; the user decides whether to undo.
+- Exit 4: this repo is PR-based and no approved local-only plan covers it. Offer the PR path.
+- Any other nonzero exit: stop and show `REFUSED=`. Exit 3 also lists `BLOCKING=` files: tracked changes in `MAIN_ROOT` block the merge, so ask what to do with them.
+
+### Keep as-is
+
+Report: "Keeping branch <name>. Worktree preserved at <path>." Clean up nothing.
+
+### Discard (explicit request only)
+
+Start this only when the user asks to throw the work away in so many words. Show what is lost, then require the typed word:
 
 ```
 This will permanently delete:
@@ -112,108 +147,51 @@ This will permanently delete:
 Type 'discard' to confirm.
 ```
 
-Wait for the literal word `discard`. Anything else (including "yes", "y", "go ahead") is NOT confirmation — re-ask or abort. Only on exact match:
+Only the literal word `discard` counts; "yes", "y" and "go ahead" do not. On a match, run Step 6 with `--discard --confirm discard`. In a normal checkout (`ISOLATION=none`) first check out the base in `MAIN_ROOT`: git will not delete the branch it has checked out.
+
+## Step 6: Clean up
+
+Runs after a local merge and after a confirmed discard. A PR or Keep leaves the worktree and branch alone. Inside an `EnterWorktree` session skip this step; the session owns the worktree, and `ExitWorktree` runs only when the user asks.
+
+Removal must start outside the worktree, so `cd` first, in the same block:
 
 ```bash
-git checkout <base-branch>
-git branch -D <feature-branch>
+cd "$MAIN_ROOT"
+bash scripts/workspace.sh cleanup "$WORKTREE_PATH" <branch>
 ```
 
-Then Step 5.
+`<branch>` is the work's branch, never the base. For a confirmed discard, add `--discard --confirm discard`.
 
-### Step 5: Worktree cleanup
+- Exit 0: report `REMOVED_WORKTREE=` and `DELETED_BRANCH=`. Name every `IGNORED=` path (such as `.env` or `node_modules/`) as deleted with the worktree. `LEFT_IN_PLACE=` means the host owns the workspace; say so and leave it.
+- Exit 3: files exist only in the worktree. Show the `BLOCKING=` lines and ask: commit them, move them into `MAIN_ROOT`, or delete exactly those. Carry out the answer, then rerun. After a local merge, a commit made now is not in the base yet: rerun the Step 5 merge, then this step.
+- Exit 1 or 2: nothing was forced. Report `REFUSED=`. If it names the upstream, nothing was removed: push the branch (or confirm it landed through that upstream) and rerun. If it says the branch is not merged into the HEAD, a squash- or rebase-merged PR is the usual cause (its commits are not ancestors of the base), so the refusal is expected: confirm the merge with `GITHUB_TOKEN= gh pr view <branch> --json state`, tell the user, and let them retire the branch with an explicit Discard request (typed `discard`); never `-D` or `--force` directly. Otherwise fix what it names; do not work around it.
 
-Check whether the branch lives in a worktree:
+## Quick Reference
 
-```bash
-git worktree list | grep "$(git branch --show-current)"
-```
+| Choice | Merge | Push | Keep worktree | Delete branch |
+|--------|-------|------|---------------|---------------|
+| Push and open a PR | - | yes | yes | - |
+| Merge locally | yes | - | no (Step 6) | yes (safe delete) |
+| Keep as-is | - | - | yes | - |
+| Discard (explicit request only) | - | - | no (Step 6) | yes (typed `discard`) |
 
-Clean up per the matrix — never automatically for Options 2 and 3:
-
-| Option | Merge | Push | Cleanup branch | Cleanup worktree |
-|--------|-------|------|----------------|------------------|
-| 1. Merge locally | yes | — | yes (`-d`) | yes |
-| 2. Create PR | — | yes | — | NO (PR in flight) |
-| 3. Keep as-is | — | — | — | NO |
-| 4. Discard | — | — | yes (`-D` force) | yes |
-
-```bash
-git worktree remove <worktree-path>   # Options 1 and 4 only
-```
-
-## Red Flags — STOP
-
-These thoughts mean stop and follow the process:
-
-- "Tests passed earlier, no need to re-run" — re-run THIS message.
-- "I'll just merge, that's obviously what they want" — present the four options; wait.
-- "They said yes, that's enough to discard" — only the typed word `discard` counts.
-- "I'll remove the worktree to tidy up after the PR" — Option 2 keeps the worktree.
-- "Merge looks clean, skip the post-merge test run" — re-run on the merged result.
-- "I'll add a 'just commit' shortcut option" — exactly four, no more.
-- About to `push --force` without an explicit user request.
-
-## Excuse → Reality
+## Common Rationalizations
 
 | Excuse | Reality |
 |--------|---------|
-| "Tests passed before, skip the run" | Re-run this message. The earlier run is not evidence now. |
-| "It's obvious they want a merge" | Present four options. Inferring intent is not a choice. |
-| "Open-ended 'what next' is friendlier" | Ambiguity loses work. Four structured options, verbatim. |
-| "They confirmed with 'yes', discard it" | Only the literal word `discard` authorizes deletion. |
-| "Tidy up the worktree after pushing" | Option 2 keeps the worktree; the PR still needs it. |
-| "Merge was clean, no need to re-test" | Merge can break what neither branch broke alone. Re-run. |
-| "Force-push to fix the remote quickly" | Force-push only on explicit request. |
-
-## Good / Bad pairs
-
-Test gate:
-```
-✅ [Run full suite this message] [see: 41/41 pass] → present options
-❌ "Tests were green last time, here are your options"
-```
-
-Option presentation:
-```
-✅ Present the four options verbatim, no recommendation, wait
-❌ "Looks done — want me to merge to main?"
-```
-
-Discard confirmation:
-```
-✅ Show commits/branch/worktree → wait for literal `discard`
-❌ User says "yeah delete it" → run git branch -D
-```
-
-Worktree cleanup:
-```
-✅ Option 2 → leave worktree in place, report PR URL
-❌ Option 2 → git worktree remove (PR is still open)
-```
-
-## Never / Always
-
-Never:
-- Proceed with failing tests.
-- Merge without re-running tests on the merged result.
-- Delete work without the typed `discard` confirmation.
-- Force-push without an explicit request.
-- Auto-remove a worktree for Option 2 or 3.
-
-Always:
-- Verify tests in THIS message before offering options.
-- Present exactly four options, verbatim.
-- Re-run tests after a local merge.
-- Clean up the worktree for Options 1 and 4 only.
+| "Tests passed earlier this session" | Run the suite on the tree you are about to integrate, in this message. |
+| "'Merge it to main' means merge locally" | In a PR-based repo it means push and open a PR. A local merge needs an approved local-only plan; otherwise the script refuses with exit 4. |
+| "`git checkout main` here is quicker" | The base is checked out in `MAIN_ROOT`, so it exits 128 inside a worktree. Use `merge-local`, which runs where the base is free. |
+| "Removal refused, so `--force` just finishes the cleanup" | The refusal means files exist only in that worktree. Force destroys them for good. Show the `BLOCKING=` files and ask. |
+| "The merged failure is flaky" | A failing merged result stops everything. Report `UNDO=`; branch and worktree stay while you investigate. |
+| "They seem done with this work, so offer Discard" | Discard is not on the menu. Only an explicit request starts it, and only the typed `discard` authorizes it. |
+| "The PR is up, so tidy the worktree" | PR feedback gets fixed in that worktree. It stays until the work lands. |
+| "The push was rejected, so force it" | The remote moved. Investigate; force only on an explicit request, never to a protected branch. |
+| "The base is obviously main" | Take it from the plan, the conversation or the upstream, else ask. |
 
 ## Integration
 
-- Called by: constellation:subagent-driven-development (after all tasks complete) and constellation:executing-plans (after all batches complete) — this is the standard hand-off when implementation finishes.
-- REQUIRED BACKGROUND: constellation:verification-before-completion — supplies the fresh-evidence gate the Step 1 test run satisfies; no "done" without an in-message run.
-- Pairs with constellation:using-git-worktrees — cleans up the worktree that skill created (matrix above).
-- Pairs with constellation:git-workflow — for conventional commit messages, PR descriptions, and branch-naming when executing Options 1 and 2.
-
-## The Bottom Line
-
-Green tests this message, the four options verbatim, the user's explicit pick, then the exact cleanup for that pick. No inference, no shortcuts.
+- Called by: `constellation:subagent-driven-development` after all tasks complete (its inline executing-plans mode included).
+- REQUIRED BACKGROUND: `constellation:verification-before-completion` supplies the fresh-evidence gate that Step 1 satisfies; no "done" without an in-message run.
+- Pairs with the worktree reference `references/using-git-worktrees/`: Step 6 removes the worktree it created.
+- Pairs with `constellation:git-workflow` (PR body, branch names) and, for Keep as-is, `constellation:session-handoff`.
