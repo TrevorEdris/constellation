@@ -172,12 +172,9 @@ test('hooks.json routes Bash to guard.js', () => {
   const hooks = JSON.parse(fs.readFileSync(HOOKS_JSON, 'utf8')).hooks;
   const entries = hooks.PreToolUse;
   const commandsOf = (e) => e.hooks.map((h) => h.command);
-  const bash = entries.find((e) => e.matcher === 'Bash');
+  const bash = entries.find((e) => e.matcher.split('|').includes('Bash'));
   assert.ok(bash, 'a PreToolUse entry for Bash');
   assert.deepEqual(commandsOf(bash), ['node "${CLAUDE_PLUGIN_ROOT}/hooks/guard.js"']);
-  // protect-secrets no longer sees Bash: guard.js does.
-  const secrets = entries.find((e) => commandsOf(e).some((c) => c.includes('protect-secrets.js')));
-  assert.equal(secrets.matcher, 'Read|Edit|Write');
   // The old guard is gone, from the file and from the config.
   assert.ok(!fs.existsSync(path.join(__dirname, '..', 'block-dangerous-commands.js')));
   const text = fs.readFileSync(HOOKS_JSON, 'utf8');

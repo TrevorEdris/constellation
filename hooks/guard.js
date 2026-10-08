@@ -41,8 +41,13 @@
  * so does any command the parser reports as unparsed (`unparsed-command`: too long, nested too
  * deep, `env -S`, an option it cannot place). A deny found in the part that was read still wins.
  *
+ * The file tools (Read, Edit, MultiEdit, Write, NotebookEdit) and Grep are checked too, under the
+ * rule `file-secret`: the path they name goes through classifyPath, and Grep's `glob` through
+ * globTargetsSecret (its `pattern` is text to find and is never classified). Any other tool
+ * returns null.
+ *
  * The hook fails open: any exception is logged as ERROR and the output is `{}`. It always
- * exits 0. This module handles Bash only for now; other tools return null.
+ * exits 0.
  */
 
 const fs = require('node:fs');
@@ -1087,6 +1092,43 @@ const RULES = [
   { id: 'unrecognized-command-word', tier: 'ask', test: unrecognizedCommandWord },
 ];
 
+// -- Files and Grep ------------------------------------------------------------------------------
+
+const FILE_TOOLS = { Read: 'reading', Edit: 'editing', MultiEdit: 'editing', Write: 'writing', NotebookEdit: 'editing' };
+const FILE_WHY = { Read: 'can expose secrets', Edit: 'can change a secret', MultiEdit: 'can change a secret', Write: 'can overwrite a secret', NotebookEdit: 'can change a secret' };
+
+/**
+ * The hit for a file tool or Grep call, or null. A file tool names one path (`file_path`, or
+ * `notebook_path`, or `path`: whichever the tool uses). Grep names a place to search (`path`) and
+ * maybe a filter (`glob`); either can point at a secret. The tier is the one the classifier gives.
+ */
+function fileHit(payload, home) {
+  const tool = payload.tool_name;
+  const input = payload.tool_input;
+  if (input === null || typeof input !== 'object') return null;
+  if (Object.hasOwn(FILE_TOOLS, tool)) {
+    const p = input.file_path ?? input.notebook_path ?? input.path;
+    const c = classifyPath(p, home);
+    return c === null ? null : { tier: c.tier, pathId: c.pathId, reason: `${FILE_TOOLS[tool]} ${shown(p)} (${c.pathId}) ${FILE_WHY[tool]}` };
+  }
+  if (tool !== 'Grep') return null;
+  let best = null;
+  for (const [word, c] of [[input.path, classifyPath(input.path, home)], [input.glob, globTargetsSecret(input.glob, home)]]) {
+    if (c !== null && (best === null || (c.tier === 'deny' && best.tier !== 'deny'))) {
+      best = { tier: c.tier, pathId: c.pathId, reason: `searching ${shown(word)} (${c.pathId}) can expose secrets` };
+    }
+  }
+  return best;
+}
+
+/** What a call acts on, for the log: the command, the file path, or Grep's path and glob. */
+function targetOf(payload) {
+  const input = payload.tool_input || {};
+  if (payload.tool_name === 'Bash') return String(input.command);
+  if (payload.tool_name === 'Grep') return [input.path, input.glob].filter((v) => typeof v === 'string' && v !== '').join(' ');
+  return String(input.file_path ?? input.notebook_path ?? input.path ?? '');
+}
+
 // -- Deciding ------------------------------------------------------------------------------------
 
 // Stands in when a command has no segments at all (only comments, say), so that rules about the
@@ -1134,7 +1176,12 @@ function finish(hit, payload, env) {
  */
 function decide(payload, opts) {
   const { env = process.env, home = os.homedir() } = opts || {};
-  if (!payload || payload.tool_name !== 'Bash') return null;
+  if (!payload) return null;
+  if (payload.tool_name !== 'Bash') {
+    const f = fileHit(payload, home);
+    if (f === null || (env.CONSTELLATION_GUARD === 'critical' && f.tier !== 'deny')) return null;
+    return finish({ id: 'file-secret', ...f }, payload, env);
+  }
   const command = payload.tool_input && payload.tool_input.command;
   if (typeof command !== 'string' || command === '') return null;
 
@@ -1203,13 +1250,12 @@ async function main() {
     const payload = JSON.parse(input);
     const d = decide(payload, { env, home });
     if (d !== null) {
-      const cmd = payload.tool_input.command;
       log(env, home, {
         decision: d.decision,
         id: d.id,
         pathId: d.pathId,
         tool: payload.tool_name,
-        target: cmd.slice(0, 200),
+        target: targetOf(payload).slice(0, 200),
         session_id: payload.session_id,
         cwd: payload.cwd,
         permission_mode: payload.permission_mode,
