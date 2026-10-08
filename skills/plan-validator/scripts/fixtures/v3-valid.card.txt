@@ -1,0 +1,13 @@
+**Approve "Wishlist: share a list by link"?** Reply go to take every default, or answer by number.
+**Needs your call:**
+1. Share links expire? → **after 30 days** (limits leaked links; if wrong: one config value)
+2. Link viewers see claimed items? → **no** (protects the surprise invariant; if wrong: one flag)
+3. Run → **subagent-driven** (5 independent tasks; or inline)
+**Ships as:** 1 PR, feat/share-link → origin/main (remote checked MM-DD HH:MM)
+**Delivers:** A signed-in user can share a read-only wishlist link with anyone.
+**Size:** ~430 lines · 9 files · 5 tasks · 1 endpoint · 1 PR
+**Made for you:**
+- D4 Token is 128-bit random, stored hashed (if wrong: rotate all tokens)
+- D5 Viewer reuses the list component (if wrong: one file)
+**Flags:** none
+Plan: {plan} · validator 100 PASS · card 37e114a
