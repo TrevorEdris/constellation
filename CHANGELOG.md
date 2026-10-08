@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.4.0 — 2026-10-07
+
+- feat(hooks): add quote-aware shell tokenizer for guard rules
 ## 0.3.10 — 2026-10-07
 
 - fix(git-workflow): route merge, land and ship-to-main requests to the skill
