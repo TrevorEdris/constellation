@@ -11,6 +11,12 @@ Usage:
 Exit codes:
     0 — PASS (score >= 70, no blocking issues)
     1 — NEEDS WORK (score < 70 or blocking issues found)
+
+Schema dispatch: a plan whose frontmatter says exactly `schema: plan/v3` gets
+errors for card, delivery, placeholder and step findings. Every other plan is
+legacy: the same checks as before, new checks as warnings, plus one `legacy`
+warning. No new check changes the score, so a legacy plan's PASS/NEEDS WORK
+status never changes because of the v3 work.
 """
 
 import argparse
@@ -19,11 +25,17 @@ import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any, NamedTuple, Optional
 
 
 # ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
+
+
+# Categories a human reviewer should see on the approval card; every other
+# category is for the agent that wrote the plan.
+HUMAN_CATEGORIES = frozenset({"git", "brief", "card", "delivery"})
 
 
 @dataclass
@@ -34,6 +46,11 @@ class Issue:
     category: str
     message: str
     line: int = 0
+
+    @property
+    def audience(self) -> str:
+        """Who should act on this finding: "human" or "agent"."""
+        return "human" if self.category in HUMAN_CATEGORIES else "agent"
 
 
 @dataclass
@@ -149,6 +166,211 @@ def section_content(lines: list[str], start: int, end: int) -> str:
     if start == 0:
         return ""
     return "\n".join(lines[start:end])
+
+
+# ---------------------------------------------------------------------------
+# Frontmatter parsing and schema dispatch
+# ---------------------------------------------------------------------------
+
+SCHEMA_V3 = "plan/v3"
+STATUS_TOKENS = ("draft", "awaiting-approval", "approved", "in-progress", "complete")
+
+
+class FrontmatterProblem(NamedTuple):
+    """Something in the frontmatter that is tolerated in legacy plans and an error in v3."""
+
+    code: str  # "inline-comment" | "syntax" | "unterminated"
+    line: int  # 1-indexed line in the file
+    message: str
+
+
+class Frontmatter(NamedTuple):
+    """Result of parse_frontmatter; unpacks as (data, end_line, problems).
+
+    data: top-level keys. Scalars are str, `null`/`~`/empty are None, flow and
+        block lists are list[str], and a block list of `key: value` items is
+        list[dict]. Values stay strings; callers convert (e.g. `prs`).
+    end_line: 1-indexed line of the closing `---`, so lines[end_line:] is the
+        body. 0 when the file has no (complete) frontmatter.
+    """
+
+    data: dict[str, Any]
+    end_line: int
+    problems: list[FrontmatterProblem]
+
+
+_KEY_RE = re.compile(r"^([A-Za-z_][\w-]*):(?:[ \t]+(.*))?$")
+_DASH_RE = re.compile(r"^(\s*)-(?:(\s+)(.*))?$")
+_COMMENT_RE = re.compile(r"(?:^|\s)#")
+_EMPTY = object()  # a value with no text at all (a block list may follow)
+
+
+def _unquote(text: str) -> str:
+    text = text.strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "'\"":
+        return text[1:-1]
+    return text
+
+
+def _parse_value(raw: str, key: str, line_no: int, problems: list[FrontmatterProblem]) -> Any:
+    """Parse the text after `key:`; returns str, list[str], None or _EMPTY.
+
+    An unquoted value's inline ` #` comment is stripped and recorded as a
+    problem. A quoted value is taken verbatim up to its closing quote.
+    """
+    text = raw.strip()
+    if text[:1] in ("'", '"'):
+        close = text.find(text[0], 1)
+        if close != -1:
+            return text[1:close]
+    comment = _COMMENT_RE.search(text)
+    if comment:
+        problems.append(
+            FrontmatterProblem(
+                "inline-comment",
+                line_no,
+                f"Inline '#' comment after '{key}:'. Remove it; v3 frontmatter values take no trailing comments.",
+            )
+        )
+        text = text[: comment.start()].rstrip()
+    if not text:
+        return _EMPTY
+    if text.startswith("["):
+        if not text.endswith("]"):
+            problems.append(FrontmatterProblem("syntax", line_no, f"Unclosed list for '{key}:'; put a flow list on one line."))
+            return text
+        return [_unquote(item) for item in text[1:-1].split(",") if item.strip()]
+    if text in ("null", "~"):
+        return None
+    return text
+
+
+def _none_if_empty(value: Any) -> Any:
+    return None if value is _EMPTY else value
+
+
+def _parse_block_list(
+    lines: list[str], start: int, end: int, key: str, problems: list[FrontmatterProblem]
+) -> tuple[Optional[list[Any]], int]:
+    """Parse the block list under `key:` from lines[start:end].
+
+    Returns (items, next_index); items is None when no list items follow. Items
+    are scalars or dicts of `key: value` pairs. Anything deeper is a problem.
+    """
+    items: list[Any] = []
+    current: Optional[dict[str, Any]] = None
+    key_col = 0
+    dash_indent: Optional[int] = None
+    i = start
+    while i < end:
+        raw = lines[i].rstrip()
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            i += 1
+            continue
+        indent = len(raw) - len(raw.lstrip())
+        dash = _DASH_RE.match(raw)
+        if indent == 0 and not dash:
+            break  # the next top-level key
+        line_no = i + 1
+        if dash:
+            if dash_indent is None:
+                dash_indent = len(dash.group(1))
+            if len(dash.group(1)) != dash_indent:
+                problems.append(FrontmatterProblem("syntax", line_no, f"Inconsistent list indentation under '{key}:'."))
+                current = None
+            else:
+                content = dash.group(3) or ""
+                pair = _KEY_RE.match(content)
+                if pair:
+                    current = {}
+                    items.append(current)
+                    key_col = dash_indent + 1 + len(dash.group(2))
+                    current[pair.group(1)] = _none_if_empty(
+                        _parse_value(pair.group(2) or "", pair.group(1), line_no, problems)
+                    )
+                else:
+                    current = None
+                    items.append(_none_if_empty(_parse_value(content, key, line_no, problems)))
+        else:
+            pair = _KEY_RE.match(stripped)
+            if current is not None and indent == key_col and pair:
+                current[pair.group(1)] = _none_if_empty(
+                    _parse_value(pair.group(2) or "", pair.group(1), line_no, problems)
+                )
+            else:
+                problems.append(
+                    FrontmatterProblem("syntax", line_no, f"Cannot parse line under '{key}:'; use a flat block list.")
+                )
+        i += 1
+    return (items or None), i
+
+
+def parse_frontmatter(text: str) -> Frontmatter:
+    """Parse the leading `---` frontmatter block: block YAML, no nesting beyond a list of items."""
+    lines = text.splitlines()
+    if not lines or lines[0].rstrip() != "---":
+        return Frontmatter({}, 0, [])
+    end = next((n for n in range(1, len(lines)) if lines[n].rstrip() == "---"), None)
+    if end is None:
+        return Frontmatter({}, 0, [FrontmatterProblem("unterminated", 1, "Frontmatter opens with '---' but never closes.")])
+
+    data: dict[str, Any] = {}
+    problems: list[FrontmatterProblem] = []
+    i = 1
+    while i < end:
+        raw = lines[i].rstrip()
+        i += 1
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        pair = _KEY_RE.match(raw)
+        if not pair:
+            problems.append(FrontmatterProblem("syntax", i, f"Cannot parse frontmatter line: {raw.strip()!r}"))
+            continue
+        key = pair.group(1)
+        value = _parse_value(pair.group(2) or "", key, i, problems)
+        if value is _EMPTY:
+            items, i = _parse_block_list(lines, i, end, key, problems)
+            value = items
+        data[key] = value
+    return Frontmatter(data, end + 1, problems)
+
+
+def is_v3(fm: Frontmatter) -> bool:
+    """True only for the exact schema `plan/v3`; every other plan is legacy."""
+    return fm.data.get("schema") == SCHEMA_V3
+
+
+def check_schema(fm: Frontmatter, report: ValidationReport) -> None:
+    """Dispatch on schema. Adds findings only; it never changes the score."""
+    if not is_v3(fm):
+        schema = fm.data.get("schema")
+        label = schema if isinstance(schema, str) and schema else "none"
+        report.issues.append(
+            Issue(
+                severity="warning",
+                category="legacy",
+                message=(
+                    f"Legacy plan (schema: {label}). The approval-card checks report as warnings only "
+                    f"and never change the score. Use 'schema: {SCHEMA_V3}' to get the card gate."
+                ),
+            )
+        )
+        return
+
+    for problem in fm.problems:
+        report.issues.append(Issue(severity="error", category="schema", message=problem.message, line=problem.line))
+
+    status = fm.data.get("status")
+    if status not in STATUS_TOKENS:
+        shown = f"got '{status}'" if isinstance(status, str) else "it is missing"
+        report.issues.append(
+            Issue(
+                severity="error",
+                category="schema",
+                message=f"status must be one of {', '.join(STATUS_TOKENS)}; {shown}.",
+            )
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -363,7 +585,7 @@ def check_oversized_code_blocks(lines: list[str], report: ValidationReport) -> N
                 report.issues.append(
                     Issue(
                         severity="warning",
-                        category="scope",
+                        category="code-size",
                         message=f"Code block at line {block_start} is {block_lines} lines. Plans should describe changes, not implement them.",
                         line=block_start,
                     )
@@ -704,6 +926,251 @@ def check_brief(lines: list[str], report: ValidationReport) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Placeholder, v2-step and Traceability-row checks
+#
+# These report an error on a `plan/v3` plan and a warning on every other plan,
+# and none of them touches the score: a legacy plan's PASS/NEEDS WORK status
+# must not change because of them (C13), and a v3 plan is blocked by the error
+# severity alone.
+# ---------------------------------------------------------------------------
+
+PLACEHOLDER_REPORT_CAP = 10
+
+_FENCE_OPEN_RE = re.compile(r"^\s*(`{3,}|~{3,})(.*)$")
+_HEADING_RE = re.compile(r"^ {0,3}(#{1,6})\s+(\S.*)$")
+# Inline code, so a command such as `card.py render <PLAN>` is not a placeholder.
+# re.S lets a span run across a line break; _mask_code_spans feeds it whole paragraphs.
+_CODE_SPAN_RE = re.compile(r"(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)", re.S)
+
+_FIELD_PLACEHOLDER_RE = re.compile(r"\{\{[^}]*\}\}")
+_ANGLE_PLACEHOLDER_RE = re.compile(r"<(?![/!])(?!(?:details|summary|br|sub|sup|kbd|img|a)\b)[A-Za-z][^<>\n]*>")
+_AUTOLINK_RE = re.compile(r"<[A-Za-z][A-Za-z0-9+.\-]{1,31}:[^\s<>]*>")
+_EMAIL_RE = re.compile(r"<[^\s@<>]+@[^\s@<>]+>")
+_MARKER_RE = re.compile(r"\bTBD\b|\bTODO\b")
+_ELLIPSIS_LINE_RE = re.compile(r"^\s*(?:\*\*[^*]+\*\*\s*)?\.\.\.\s*$")
+_BOLD_CELL_RE = re.compile(r"\*\*[^*]+\*\*")
+_SEPARATOR_CELL_RE = re.compile(r":?-+:?")
+_TABLE_PIPE_RE = re.compile(r"(?<!\\)\|")
+
+_V2_STEP_RE = re.compile(r"^\s*\d+\.\s+\*\*\((\d+\.\d+)\)")
+_V2_VERIFY_RE = re.compile(r"\bVerify\b[^:\n]{0,20}:|Expected:")
+
+
+def _finding_severity(lines: list[str]) -> str:
+    """"error" for a `plan/v3` plan, "warning" for every other plan."""
+    return "error" if is_v3(parse_frontmatter("\n".join(lines))) else "warning"
+
+
+def _fence_mask(lines: list[str]) -> list[bool]:
+    """True for each line inside a fenced code block, the fence lines included.
+
+    A fence closes on the same character at least as long as the opener, so a
+    ``` line inside a ```` block does not end it. An unclosed fence runs to EOF.
+    """
+    mask: list[bool] = []
+    fence: Optional[tuple[str, int]] = None
+    for line in lines:
+        stripped = line.strip()
+        if fence is None:
+            opener = _FENCE_OPEN_RE.match(line)
+            if opener and not (opener.group(1)[0] == "`" and "`" in opener.group(2)):
+                fence = (opener.group(1)[0], len(opener.group(1)))
+                mask.append(True)
+            else:
+                mask.append(False)
+        else:
+            mask.append(True)
+            if stripped and set(stripped) == {fence[0]} and len(stripped) >= fence[1]:
+                fence = None
+    return mask
+
+
+def _find_section(lines: list[str], mask: list[bool], title: "re.Pattern[str]", max_level: int) -> Optional[tuple[int, int]]:
+    """(heading index, end index) of the first heading whose title matches, ignoring fenced code.
+
+    Only headings of level <= max_level qualify. The section runs to the next
+    heading of the same or a shallower level (deeper headings stay inside it).
+    """
+    headings = [
+        (idx, len(m.group(1)), m.group(2))
+        for idx, line in enumerate(lines)
+        if not mask[idx] and (m := _HEADING_RE.match(line))
+    ]
+    for pos, (idx, level, text) in enumerate(headings):
+        if level <= max_level and title.match(text):
+            end = next((j for j, lv, _ in headings[pos + 1 :] if lv <= level), len(lines))
+            return idx, end
+    return None
+
+
+def _table_cells(line: str) -> Optional[list[str]]:
+    """Cells of a Markdown table row, or None when the line is not one."""
+    stripped = line.strip()
+    if not stripped.startswith("|") or stripped == "|":
+        return None
+    inner = stripped[1:-1] if stripped.endswith("|") else stripped[1:]
+    return [cell.strip() for cell in _TABLE_PIPE_RE.split(inner)]
+
+
+def _is_separator_row(cells: list[str]) -> bool:
+    """A delimiter row such as `|---|:---:|`: it is not a data row."""
+    return all(_SEPARATOR_CELL_RE.fullmatch(cell) for cell in cells)
+
+
+def _mask_code_spans(lines: list[str], fenced: list[bool], fill: str) -> list[str]:
+    """Each line with every inline code span overwritten by `fill`, newlines kept.
+
+    A span can wrap across a line break (`Promise<Foo>` split after "Promise"),
+    so spans are matched per paragraph: a run of non-blank lines outside fenced
+    blocks. A backtick never pairs with one in another paragraph or past a fence.
+    The line count and each line's other characters are unchanged.
+    """
+    masked = list(lines)
+    idx = 0
+    while idx < len(lines):
+        if fenced[idx] or not lines[idx].strip():
+            idx += 1
+            continue
+        end = idx
+        while end < len(lines) and not fenced[end] and lines[end].strip():
+            end += 1
+        paragraph = _CODE_SPAN_RE.sub(lambda m: "".join("\n" if c == "\n" else fill for c in m.group()), "\n".join(lines[idx:end]))
+        masked[idx:end] = paragraph.split("\n")
+        idx = end
+    return masked
+
+
+def _placeholder_reasons(text: str, cell_text: str) -> list[str]:
+    """What is unfilled on this line (empty list when nothing is).
+
+    `text` is the line with its code spans blanked with spaces; `cell_text` has
+    them filled with a letter instead, because code in a table cell still fills it.
+    """
+    reasons = _FIELD_PLACEHOLDER_RE.findall(text)
+    reasons += [
+        found
+        for found in _ANGLE_PLACEHOLDER_RE.findall(text)
+        if not (_AUTOLINK_RE.fullmatch(found) or _EMAIL_RE.fullmatch(found))
+    ]
+    reasons += _MARKER_RE.findall(text)
+
+    cells = _table_cells(cell_text)
+    if cells is not None:
+        filled = [cell for cell in cells if cell]
+        if not filled or (len(filled) == 1 and cells[0] and _BOLD_CELL_RE.fullmatch(cells[0])):
+            reasons.append("empty table row")
+
+    if _ELLIPSIS_LINE_RE.match(text):
+        reasons.append("a line that is only '...'")
+    if text.lstrip().startswith("> Template:"):
+        reasons.append("template guidance line")
+    return reasons
+
+
+def check_placeholders(lines: list[str], report: ValidationReport) -> None:
+    """Flag text a plan author was meant to replace: `{{FIELD}}`, `<angle>` slots, TBD/TODO,
+    empty table rows, a bare `...` line and `> Template:` guidance.
+
+    Everything outside fenced code blocks and inline code spans is scanned, the
+    frontmatter included. One finding per line, at most 10, then "+N more".
+    """
+    severity = _finding_severity(lines)
+    mask = _fence_mask(lines)
+    texts = _mask_code_spans(lines, mask, " ")
+    cell_texts = _mask_code_spans(lines, mask, "x")
+    found = [
+        (idx + 1, reasons)
+        for idx in range(len(lines))
+        if not mask[idx] and (reasons := _placeholder_reasons(texts[idx], cell_texts[idx]))
+    ]
+    for line_no, reasons in found[:PLACEHOLDER_REPORT_CAP]:
+        report.issues.append(
+            Issue(
+                severity=severity,
+                category="placeholder",
+                message=f"Unfilled placeholder ({', '.join(reasons)}). Fill it in or delete it.",
+                line=line_no,
+            )
+        )
+    if len(found) > PLACEHOLDER_REPORT_CAP:
+        report.issues.append(
+            Issue(
+                severity=severity,
+                category="placeholder",
+                message=f"+{len(found) - PLACEHOLDER_REPORT_CAP} more unfilled placeholder lines not shown.",
+            )
+        )
+
+
+def check_v2_steps(lines: list[str], report: ValidationReport) -> None:
+    """Check each `1. **(1.1)** ...` step under `## Ordered steps` for a verification and a file path.
+
+    The older step checks only see `### Step N` headings, so these numbered
+    steps were never checked. A step's body runs to the next step or heading.
+    """
+    mask = _fence_mask(lines)
+    section = _find_section(lines, mask, re.compile(r"ordered\s+steps\b", re.IGNORECASE), 2)
+    if section is None:
+        return
+    start, end = section
+    severity = _finding_severity(lines)
+
+    steps = [i for i in range(start + 1, end) if not mask[i] and _V2_STEP_RE.match(lines[i])]
+    headings = {i for i in range(start + 1, end) if not mask[i] and _HEADING_RE.match(lines[i])}
+    stops = sorted(headings | set(steps) | {end})
+    for i in steps:
+        step_id = _V2_STEP_RE.match(lines[i]).group(1)
+        body = "\n".join(lines[i : next(stop for stop in stops if stop > i)])
+        if not _V2_VERIFY_RE.search(body):
+            report.issues.append(
+                Issue(
+                    severity=severity,
+                    category="verification",
+                    message=f"Step {step_id} has no 'Verify:' or 'Expected:' line. Say how to confirm the step worked.",
+                    line=i + 1,
+                )
+            )
+        if not FILE_PATH_PATTERN.search(body):
+            report.issues.append(
+                Issue(
+                    severity=severity,
+                    category="specificity",
+                    message=f"Step {step_id} names no file path. Name the exact file the step touches.",
+                    line=i + 1,
+                )
+            )
+
+
+def check_traceability_rows(lines: list[str], report: ValidationReport) -> None:
+    """A Traceability section that exists must hold at least one data row.
+
+    The header and delimiter rows and rows with every cell empty do not count.
+    A missing section is `check_traceability_table`'s finding, not this one's.
+    """
+    mask = _fence_mask(lines)
+    section = _find_section(lines, mask, re.compile(r"traceability\b", re.IGNORECASE), 3)
+    if section is None:
+        return
+    start, end = section
+    rows = [cells for i in range(start + 1, end) if not mask[i] and (cells := _table_cells(lines[i])) is not None]
+    for pos, cells in enumerate(rows):
+        is_header = pos + 1 < len(rows) and _is_separator_row(rows[pos + 1])
+        if not is_header and not _is_separator_row(cells) and any(cells):
+            return
+    report.issues.append(
+        Issue(
+            severity=_finding_severity(lines),
+            category="traceability",
+            message=(
+                "Traceability section has no table data rows. Add one row per discovery finding "
+                "(Discovery finding | Plan step), or say why a finding is out of scope."
+            ),
+            line=start + 1,
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
 # Report rendering
 # ---------------------------------------------------------------------------
 
@@ -722,19 +1189,19 @@ def render_text(report: ValidationReport, verbose: bool = False) -> str:
         out.append(f"\nERRORS ({len(report.errors)}):")
         for issue in report.errors:
             loc = f" [line {issue.line}]" if issue.line else ""
-            out.append(f"  [ERROR] [{issue.category}]{loc} {issue.message}")
+            out.append(f"  [ERROR] [{issue.category}] ({issue.audience}){loc} {issue.message}")
 
     if report.warnings:
         out.append(f"\nWARNINGS ({len(report.warnings)}):")
         for issue in report.warnings:
             loc = f" [line {issue.line}]" if issue.line else ""
-            out.append(f"  [WARN]  [{issue.category}]{loc} {issue.message}")
+            out.append(f"  [WARN]  [{issue.category}] ({issue.audience}){loc} {issue.message}")
 
     infos = [i for i in report.issues if i.severity == "info"]
     if verbose and infos:
         out.append(f"\nINFO ({len(infos)}):")
         for issue in infos:
-            out.append(f"  [INFO]  [{issue.category}] {issue.message}")
+            out.append(f"  [INFO]  [{issue.category}] ({issue.audience}) {issue.message}")
 
     if not report.issues:
         out.append("\nNo issues found.")
@@ -752,6 +1219,7 @@ def render_json(report: ValidationReport) -> str:
             {
                 "severity": i.severity,
                 "category": i.category,
+                "audience": i.audience,
                 "message": i.message,
                 "line": i.line or None,
             }
@@ -768,8 +1236,12 @@ def render_json(report: ValidationReport) -> str:
 # ---------------------------------------------------------------------------
 
 
-def validate_plan(path: Path) -> ValidationReport:
-    """Run all checks on a plan file and return the aggregated report."""
+def validate_plan(path: Path, probe: bool = True) -> ValidationReport:
+    """Run all checks on a plan file and return the aggregated report.
+
+    probe: reserved for the live git-remote probe of v3 delivery repos, which
+    arrives with the delivery checks. No check reads it yet.
+    """
     report = ValidationReport(path=str(path))
 
     if not path.exists():
@@ -797,6 +1269,8 @@ def validate_plan(path: Path) -> ValidationReport:
 
     lines = content.splitlines()
 
+    check_schema(parse_frontmatter(content), report)
+
     check_target_repos(lines, report)
     check_files_to_modify(lines, report)
     check_ordered_steps(lines, report)
@@ -815,6 +1289,9 @@ def validate_plan(path: Path) -> ValidationReport:
     check_git_branch(lines, report)
     check_git_commit_plan(lines, report)
     check_brief(lines, report)
+    check_placeholders(lines, report)
+    check_v2_steps(lines, report)
+    check_traceability_rows(lines, report)
 
     report.score = max(0, report.score)
     return report

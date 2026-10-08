@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.0 — 2026-10-07
+
+- fix(plan-validator): parse frontmatter and flag placeholders and unverified steps
+
 ## 0.1.0 (unreleased)
 
 Initial release.
