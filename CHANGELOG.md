@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.5 — 2026-10-07
+
+- fix(hooks): guard secrets across Grep, MultiEdit and NotebookEdit
+
 ## 0.4.4 — 2026-10-07
 
 - feat(hooks): route Bash through the tiered guard and retire block-dangerous-commands
