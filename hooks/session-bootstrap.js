@@ -8,8 +8,11 @@
  *
  * Order: no valid session id or no transcript does nothing; a session that
  * already resolves (rebinding its pointer if only a scan found it) is left
- * alone; headless runs (`claude -p`, the Agent SDK) are skipped unless
- * CONSTELLATION_SCAFFOLD=always; anything else is scaffolded by new-session.sh.
+ * alone; a first prompt that names a PLAN inside the root binds the session to
+ * that PLAN's dir; a dir the agent made by hand this session is stamped with
+ * the session id and bound; headless runs (`claude -p`, the Agent SDK) are
+ * skipped unless CONSTELLATION_SCAFFOLD=always; anything else is scaffolded by
+ * new-session.sh.
  *
  * @hook {"event":"Stop","matcher":"","description":"Auto-scaffolds a SESSION.md from the real session title"}
  */
@@ -17,6 +20,7 @@ const { execFileSync } = require('child_process');
 const path = require('path');
 const {
   sessionRoot, today, isValidSessionId, readPointer, bindSession, resolveSessionDir,
+  sessionDirFromPrompt, findAdoptableDir, stampSessionId,
   isHeadless, latestCustomTitle, firstRealPromptText, detectTicket, slugifyTitle,
 } = require('./lib/session');
 
@@ -67,12 +71,26 @@ async function main() {
     return;
   }
 
+  // A first prompt that names a PLAN inside the root puts the session in that
+  // PLAN's dir. Binding comes first (and stamping, below, only after it), so a
+  // pointer that cannot be written leaves the dir untouched and falls through.
+  const firstPrompt = firstRealPromptText(transcriptPath) || '';
+  const planDir = sessionDirFromPrompt(root, firstPrompt);
+  if (planDir && bindSession(root, sessionId, planDir)) { console.log('{}'); return; }
+
+  // A dir the agent made by hand this session is the session's journal.
+  const adopted = findAdoptableDir(root, transcriptPath);
+  if (adopted && bindSession(root, sessionId, adopted)) {
+    stampSessionId(adopted, sessionId);
+    console.log('{}');
+    return;
+  }
+
   if (isHeadless(process.env, transcriptPath)) { console.log('{}'); return; }
 
-  const title = latestCustomTitle(transcriptPath) || firstRealPromptText(transcriptPath);
+  const title = latestCustomTitle(transcriptPath) || firstPrompt;
   if (!title) { console.log('{}'); return; }
 
-  const firstPrompt = firstRealPromptText(transcriptPath) || '';
   const ticket = detectTicket(title) || detectTicket(firstPrompt);
   const failure = scaffold({ slug: slugifyTitle(title, ticket), ticket, sessionId });
 

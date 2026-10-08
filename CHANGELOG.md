@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.2 — 2026-10-07
+
+- fix(session): adopt agent-made session dirs and PLAN-named dirs
+
 ## 0.3.1 — 2026-10-07
 
 - fix(session): journal each session in its own local-dated dir
