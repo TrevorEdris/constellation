@@ -46,6 +46,10 @@
  * globTargetsSecret (its `pattern` is text to find and is never classified). Any other tool
  * returns null.
  *
+ * Merging or pushing into the default branch asks too (hooks/lib/merge-guard.js: `merge-into-default`,
+ * `push-to-default`). That check reads the repository through git, so it runs once per command
+ * after the rules and stays silent when `cwd` is missing or not a repository.
+ *
  * The hook fails open: any exception is logged as ERROR and the output is `{}`. It always
  * exits 0.
  */
@@ -54,6 +58,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { parse, commandOf, gitCmd } = require('./lib/shell-words.js');
+const { checkIntegration } = require('./lib/merge-guard.js');
 
 const posix = path.posix;
 
@@ -1209,6 +1214,12 @@ function decide(payload, opts) {
       const hit = { id: rule.id, tier, pathId: r.pathId, reason: r.reason || rule.id, position: seg.position, ruleIndex, fallback: rule.fallback === true };
       if (beats(hit, best)) best = hit;
     });
+  }
+  // The merge guard needs git, so it is its own call; its hit competes like any other ask.
+  const integ = checkIntegration(parsed.segments, { cwd: ctx.cwd, sessionId: payload.session_id, env, home });
+  if (integ !== null) {
+    const hit = { id: integ.id, tier: 'ask', reason: integ.reason, position: integ.position, ruleIndex: RULES.length, fallback: false };
+    if (beats(hit, best)) best = hit;
   }
   return best === null ? null : finish(best, payload, env);
 }
