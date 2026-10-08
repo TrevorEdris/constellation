@@ -15,6 +15,8 @@ IF A SKILL APPLIES TO YOUR TASK, YOU DO NOT HAVE A CHOICE. YOU MUST USE IT.
 This is not negotiable. You cannot rationalize your way out of it. If an invoked skill turns out to be wrong for the situation, you don't need to use it — checking is cheap, skipping is not.
 </EXTREMELY-IMPORTANT>
 
+In a repo with a remote, never merge into or push to the default branch: push the branch and open a PR (`constellation:git-workflow`). Always invoke skills by their `constellation:` name; bare names may resolve to other plugins' skills.
+
 ## Instruction priority
 
 1. **User's explicit instructions** (CLAUDE.md, AGENTS.md, direct requests) — highest priority.
@@ -41,7 +43,7 @@ digraph skill_flow {
     "User message received" [shape=doublecircle];
     "About to design/plan/build?" [shape=diamond];
     "Already brainstormed?" [shape=diamond];
-    "Invoke brainstorming skill" [shape=box];
+    "Invoke constellation:brainstorming skill" [shape=box];
     "Might any skill apply?" [shape=diamond];
     "Invoke the skill" [shape=box];
     "Announce: 'Using [skill] to [purpose]'" [shape=box];
@@ -53,9 +55,9 @@ digraph skill_flow {
     "User message received" -> "About to design/plan/build?";
     "About to design/plan/build?" -> "Already brainstormed?" [label="yes"];
     "About to design/plan/build?" -> "Might any skill apply?" [label="no"];
-    "Already brainstormed?" -> "Invoke brainstorming skill" [label="no"];
+    "Already brainstormed?" -> "Invoke constellation:brainstorming skill" [label="no"];
     "Already brainstormed?" -> "Might any skill apply?" [label="yes"];
-    "Invoke brainstorming skill" -> "Might any skill apply?";
+    "Invoke constellation:brainstorming skill" -> "Might any skill apply?";
     "Might any skill apply?" -> "Invoke the skill" [label="yes, even 1%"];
     "Might any skill apply?" -> "Respond (including clarifications)" [label="definitely not"];
     "Invoke the skill" -> "Announce: 'Using [skill] to [purpose]'";
@@ -65,6 +67,13 @@ digraph skill_flow {
     "Create a todo per item" -> "Follow skill exactly";
 }
 ```
+
+## Trigger phrases
+
+| The request sounds like | Invoke |
+|---|---|
+| merge / land / ship it (to main), finish or wrap up the branch, open a PR | `constellation:git-workflow` |
+| worktree, isolated workspace, work on this in parallel | `constellation:git-workflow` (its `references/using-git-worktrees`) |
 
 ## Red flags — these thoughts mean STOP, you're rationalizing
 
@@ -80,22 +89,24 @@ digraph skill_flow {
 
 ## Skill priority
 
-1. **Process skills first** (brainstorming, systematic-debugging, the discover-plan-implement workflow) — these decide HOW to approach the task.
+1. **Process skills first** (constellation:brainstorming, constellation:systematic-debugging) — these decide HOW to approach the task.
 2. **Implementation skills second** (code-review, design, infra) — these guide execution.
 
-"Let's build X" → brainstorming, then planning, then implementation skills.
-"Fix this bug" → systematic-debugging first, then domain skills.
+"Let's build X" → constellation:brainstorming, then planning, then implementation skills.
+"Fix this bug" → constellation:systematic-debugging first, then domain skills.
 
 ## Skill types
 
-- **Rigid** (test-driven-development, systematic-debugging, verification-before-completion): follow exactly. Do not adapt away discipline.
+- **Rigid** (constellation:test-driven-development, constellation:systematic-debugging, constellation:verification-before-completion): follow exactly. Do not adapt away discipline.
 - **Flexible** (patterns, design heuristics): adapt principles to context.
 
 Each skill states which it is.
 
 ## This workspace's standing rules (always on)
 
-- **Discover → Plan → Implement** with an explicit approval gate; PLAN must pass `plan-validator` (PASS ≥ 70) before being shown. Maintain `.ai/sessions/<date>_<TICKET>_<slug>/` docs automatically.
+- **Discover → Plan → Implement** with an explicit approval gate. The gate is the card from `card.py render` (constellation:writing-plans); it supersedes any "present the plan" rule and carries the score.
+- Validate v3 plans only with constellation:plan-validator.
+- Sessions live in `$SESSION_ROOT/<date>_<TICKET>_<slug>/` (default `~/src/.ai/sessions`); maintain their docs automatically.
 - **Verify by running**, not by reasoning: no completion claim without fresh in-message evidence.
 - Concise output, one insight per line, no filler. Include a confidence level when it adds signal.
 - Never use the section-sign character — write the word "section".

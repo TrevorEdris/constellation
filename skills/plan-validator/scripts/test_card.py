@@ -30,6 +30,7 @@ from conftest import FIXTURES, git_env, v3_plan
 
 SCRIPT = Path(card.__file__).resolve()
 GOLDEN = FIXTURES / "v3-valid.card.txt"
+SKILL = SCRIPT.parents[2] / "writing-plans" / "SKILL.md"
 
 TIME_RE = re.compile(r"\(remote checked \d\d-\d\d \d\d:\d\d\)")
 MASKED_TIME = "(remote checked MM-DD HH:MM)"
@@ -102,6 +103,34 @@ def test_render_within_120_and_questions_by_60(tmp_path):
     assert last_question_end <= 60
     # The check time is counted as printed; without its 4 words the card would be 114
     assert (words, last_question_end) == (118, 58)
+
+
+def _skill_example_cards() -> list[str]:
+    """The text of every fenced block in writing-plans/SKILL.md that opens with a card's ask line."""
+    blocks, current = [], None
+    for line in SKILL.read_text(encoding="utf-8").splitlines():
+        if line.lstrip().startswith("```"):
+            if current is None:
+                current = []
+            else:
+                blocks.append(current)
+                current = None
+        elif current is not None:
+            current.append(line.strip())
+    return ["\n".join(block) + "\n" for block in blocks if block and block[0].startswith("**Approve ")]
+
+
+def test_skill_example_card_within_budget():
+    # The card the skill shows the agent as its model must itself fit the budget it teaches
+    cards = _skill_example_cards()
+    assert len(cards) == 1, "writing-plans/SKILL.md must show exactly one fenced example card"
+    example = cards[0]
+    positions = [example.find(label) for label in vp.CARD_LABELS]
+    assert -1 not in positions and positions == sorted(positions), "the example carries every card label, in order"
+    assert example.splitlines()[-1].startswith(card.FOOTER_PREFIX), "the example ends with the footer render prints"
+    words, last_question_end = card.card_word_stats(example)
+    assert words <= 120
+    assert last_question_end <= 60
 
 
 def test_ships_as_has_live_check_time(tmp_path):
@@ -661,6 +690,12 @@ def _approve(answers=None):
         pytest.param("2 PostgreSQL with pooled connections and read replicas, go", 3, "ambiguous", {}, id="answer-of-7-words"),
         pytest.param("go 3 inline", 3, "ambiguous", {}, id="answer-after-go-is-text"),
         pytest.param("4 yes, go", 3, "ambiguous", {}, id="answer-above-count"),
+        # A question numbered twice is unclear whichever answer comes last: the earlier one may hold the hedge
+        pytest.param("2 stop, 2 yes, go", 3, "ambiguous", {}, id="repeated-number-hides-a-hedge"),
+        pytest.param("2 yes, 2 stop, go", 3, "ambiguous", {}, id="repeated-number-hedge-last"),
+        pytest.param("2 no, 2 yes", 3, "ambiguous", {}, id="repeated-number-conflicting-answers"),
+        pytest.param("2 no, 2 no, go", 3, "ambiguous", {}, id="repeated-number-same-answer"),
+        pytest.param("2 yes, 2 no, go, wait", 3, "change", {}, id="repeated-number-then-hedge-is-a-change"),
         pytest.param("0 yes, go", 3, "ambiguous", {}, id="answer-below-one"),
         pytest.param("2 no but only admins, go", 3, "ambiguous", {}, id="answer-with-but"),
         pytest.param("2 maybe, go", 3, "ambiguous", {}, id="answer-maybe"),
@@ -743,8 +778,13 @@ def test_a_name_inside_a_longer_word_is_not_stripped(reply, plan_path):
 
 def test_answers_are_returned_only_for_an_approval():
     assert card.classify_reply("2 no, go", 3).answers == {2: "no"}
-    for reply in ("2 no, go, wait", "2 maybe, go", "2 no, but go", "2 no, go 3 inline"):
+    for reply in ("2 no, go, wait", "2 maybe, go", "2 no, but go", "2 no, go 3 inline", "2 stop, 2 yes, go"):
         assert card.classify_reply(reply, 3).answers == {}, reply
+
+
+def test_a_repeated_question_number_says_which_answer_was_given_twice():
+    result = card.classify_reply("1 yes, 2 stop, 2 yes, go", 3)
+    assert (result.kind, result.answers, result.reason) == ("ambiguous", {}, "answer 2 given twice")
 
 
 # ---------------------------------------------------------------------------
@@ -1306,6 +1346,20 @@ def test_bad_run_answer_is_ambiguous(tmp_path, reply):
     assert f"Reply needing confirmation on card 37e114a ({plan})\n  > {reply}\n" in _masked(session.read_text(encoding="utf-8"), days)
 
 
+@pytest.mark.parametrize("reply", ["2 stop, 2 no, go", "2 no, 2 yes"])
+def test_a_repeated_question_number_never_approves(tmp_path, reply):
+    # The earlier answer ("stop") must not be overwritten by the later one before it is checked
+    plan = _awaiting(tmp_path)
+    session = _session(tmp_path)
+    before = plan.read_bytes()
+
+    (out, code), days = _decide(plan, reply, session)
+
+    assert (out, code) == (CONFIRM, 3)
+    assert plan.read_bytes() == before and b"status: awaiting-approval\n" in before
+    assert f"Reply needing confirmation on card 37e114a ({plan})\n  > {reply}\n" in _masked(session.read_text(encoding="utf-8"), days)
+
+
 def test_a_reply_naming_the_plan_approves(tmp_path):
     # The plan's own path is taken out of the reply first: this directory's name holds the hedge word "Remove"
     plan = _awaiting(tmp_path / PLAN_DIR)
@@ -1527,3 +1581,14 @@ def test_cli_exit_codes(tmp_path):
         result = _run_cli("approve", plan, "--reply", reply, "--session-md", _session(tmp_path / name))
         codes[name] = (result.returncode, result.stderr)
     assert codes == {"approve": (0, ""), "change": (2, ""), "ambiguous": (3, "")}
+
+
+def test_cli_repeated_question_number_exits_3_and_leaves_the_plan_awaiting(tmp_path):
+    plan = _awaiting(tmp_path)
+    before = plan.read_bytes()
+
+    result = _run_cli("approve", plan, "--reply", "2 stop, 2 no, go", "--session-md", _session(tmp_path))
+
+    assert (result.returncode, result.stderr) == (3, "")
+    assert result.stdout == CONFIRM
+    assert plan.read_bytes() == before and b"status: awaiting-approval\n" in before
