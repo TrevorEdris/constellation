@@ -1107,7 +1107,7 @@ test('e2e: a search for the name of a key is not a read of the key', () => {
 
 test('e2e: input that is not a decision prints {} and exits 0, failing open', () => {
   const inputs = ['', 'not json', '{"tool_name":', 'null', '42', '[]', '"cat .env"', JSON.stringify({ tool_name: 'Bash' }),
-    JSON.stringify({ tool_name: 'Read', tool_input: { file_path: '/h/.env' } })];
+    JSON.stringify({ tool_name: 'Glob', tool_input: { pattern: '.env' } })];
   for (const input of inputs) {
     const r = spawnGuard(input);
     assert.equal(r.status, 0, JSON.stringify(input));
