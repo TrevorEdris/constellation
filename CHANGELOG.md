@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.2 — 2026-10-07
+
+- feat(hooks): add tiered guard core with critical deny rules
+
 ## 0.4.1 — 2026-10-07
 
 - feat(hooks): parse substitutions, -c, xargs and find -exec into command segments
