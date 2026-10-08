@@ -27,21 +27,21 @@ const CTX_BATCH = 'mcp__plugin_context-mode_context-mode__ctx_batch_execute';
  * A transcript file. Like a real one it opens with a timestamp-less
  * bridge-session line. The first prompt carries the session start, `offsetMs`
  * from now; each entry of `tools` ({name, input}) follows as an assistant
- * tool_use block.
+ * tool_use block. `entrypoint` is the client every entry names.
  */
-function writeTranscript({ offsetMs = -60000, prompt = 'Set up the journal', tools = [], title = 'Fix login bug' } = {}) {
+function writeTranscript({ offsetMs = -60000, prompt = 'Set up the journal', tools = [], title = 'Fix login bug', entrypoint = 'cli' } = {}) {
   const start = new Date(Date.now() + offsetMs).toISOString();
   const entries = [
     { type: 'bridge-session' },
-    { type: 'user', entrypoint: 'cli', timestamp: start, message: { role: 'user', content: prompt } },
+    { type: 'user', entrypoint, timestamp: start, message: { role: 'user', content: prompt } },
   ];
   if (title) entries.push({ type: 'custom-title', customTitle: title });
   tools.forEach((tool, i) => entries.push({
-    type: 'assistant', entrypoint: 'cli', timestamp: start,
+    type: 'assistant', entrypoint, timestamp: start,
     message: { role: 'assistant', content: [{ type: 'tool_use', id: `toolu_${i}`, name: tool.name, input: tool.input }] },
   }));
   entries.push({
-    type: 'assistant', entrypoint: 'cli', timestamp: start,
+    type: 'assistant', entrypoint, timestamp: start,
     message: { role: 'assistant', content: [{ type: 'text', text: 'Done.' }] },
   });
   const file = path.join(makeTmp(), 'transcript.jsonl');
@@ -424,23 +424,49 @@ test('a session that already resolves is neither re-bound to a named PLAN nor ad
   assert.deepEqual(after, snapshot);
 });
 
-test('a headless run still binds a named PLAN and adopts a hand-made dir', () => {
-  // G11 puts both steps ahead of the headless skip; only the scaffold is skipped.
-  const headless = { CLAUDE_CODE_ENTRYPOINT: 'sdk-cli' };
-
-  {
-    const env = hookEnv(headless);
+test('a headless run neither binds a named PLAN nor adopts a hand-made dir', () => {
+  // Workflow subagents are briefed with a PLAN path under the root. Binding them
+  // would aim every parallel agent at that one PLAN's SESSION.md, so a headless
+  // run gets no journal at all: the hook touches nothing under the root.
+  const named = env => {
     const old = makeSessionDir(env.SESSION_ROOT, '2026-10-01_Old', '---\nschema: v1\nsession_id: other-id\n---\n\n# Old\n');
     fs.writeFileSync(path.join(old, 'PLAN.md'), '# Plan\n');
-    assert.deepEqual(stop(env, SESSION, writeTranscript({ prompt: `Implement ${old}/PLAN.md` })).json, {});
+    return writeTranscript({ prompt: `Implement ${old}/PLAN.md`, entrypoint: env.CLAUDE_CODE_ENTRYPOINT || 'sdk-cli' });
+  };
+  const handMade = env => writeTranscript({
+    tools: [writeTool(makeSessionDir(env.SESSION_ROOT, '2026-10-07_Hand-Made', '# journal\n'))],
+    entrypoint: env.CLAUDE_CODE_ENTRYPOINT || 'sdk-cli',
+  });
+
+  // CLAUDE_CODE_ENTRYPOINT says headless, or, without it, the transcript's own entrypoint does.
+  for (const [how, extra] of [['by env', { CLAUDE_CODE_ENTRYPOINT: 'sdk-cli' }], ['by transcript', {}]]) {
+    for (const [what, prepare] of [['a named PLAN', named], ['a hand-made dir', handMade]]) {
+      const env = hookEnv(extra);
+      const transcript = prepare(env);
+      const before = tree(env.SESSION_ROOT);
+
+      const res = stop(env, SESSION, transcript);
+
+      assert.equal(res.status, 0, res.stderr);
+      assert.deepEqual(res.json, {}, `${how}, ${what}`);
+      assert.deepEqual(tree(env.SESSION_ROOT), before, `${how}, ${what}: a headless run wrote under the root`);
+      assert.ok(!fs.existsSync(path.join(env.SESSION_ROOT, '.sessions')), `${how}, ${what}: a pointer was bound`);
+    }
+  }
+
+  // CONSTELLATION_SCAFFOLD=always lifts the skip for both.
+  {
+    const env = hookEnv({ CLAUDE_CODE_ENTRYPOINT: 'sdk-cli', CONSTELLATION_SCAFFOLD: 'always' });
+    const old = path.join(env.SESSION_ROOT, '2026-10-01_Old');
+    assert.deepEqual(stop(env, SESSION, named(env)).json, {});
     assert.deepEqual(visible(env.SESSION_ROOT), ['2026-10-01_Old']);
     assert.equal(pointerOf(env.SESSION_ROOT, SESSION), fs.realpathSync(old) + '\n');
   }
-
   {
-    const env = hookEnv(headless);
-    const dir = makeSessionDir(env.SESSION_ROOT, '2026-10-07_Hand-Made', '# journal\n');
-    assert.deepEqual(stop(env, SESSION, writeTranscript({ tools: [writeTool(dir)] })).json, {});
+    const env = hookEnv({ CLAUDE_CODE_ENTRYPOINT: 'sdk-cli', CONSTELLATION_SCAFFOLD: 'always' });
+    const transcript = handMade(env);
+    const dir = path.join(env.SESSION_ROOT, '2026-10-07_Hand-Made');
+    assert.deepEqual(stop(env, SESSION, transcript).json, {});
     assert.deepEqual(visible(env.SESSION_ROOT), ['2026-10-07_Hand-Made']);
     assert.equal(fs.readFileSync(path.join(dir, 'SESSION.md'), 'utf8'), `---\nsession_id: ${SESSION}\n---\n\n# journal\n`);
     assert.equal(pointerOf(env.SESSION_ROOT, SESSION), fs.realpathSync(dir) + '\n');

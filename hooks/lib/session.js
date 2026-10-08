@@ -15,6 +15,9 @@
  * A session with no dir yet can still be matched to one: a first prompt that
  * names a PLAN inside the root (sessionDirFromPrompt), or a dir the agent made
  * by hand this session (findAdoptableDir, then stampSessionId).
+ *
+ * The agent is told where its journal is once per session: <root>/.sessions/<id>.announced
+ * holds the dir it was told about, or `pending` (readMarker, writeMarker).
  */
 const fs = require('fs');
 const os = require('os');
@@ -128,6 +131,28 @@ function bindSession(root, id, dir) {
   }
 }
 
+/** <root>/.sessions/<id>.announced. A valid id has no dot, so this never names a pointer. */
+function markerPath(root, id) {
+  return isValidSessionId(id) ? path.join(root, '.sessions', `${id}.announced`) : null;
+}
+
+/** What the agent was last told about `id`'s journal: a dir, or `pending`. null when nothing, or for an invalid id. */
+function readMarker(root, id) {
+  const file = markerPath(root, id);
+  return file ? readSafe(file) : null;
+}
+
+/** Records what the agent was just told: the journal's dir, or `pending`. Returns false, writing nothing, for an invalid id. */
+function writeMarker(root, id, value) {
+  const file = markerPath(root, id);
+  if (!file) return false;
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, value);
+    return true;
+  } catch { return false; }
+}
+
 /** The root's direct, non-dot child dir whose SESSION.md carries `sessionId`; newest SESSION.md wins. */
 function scanForSession(root, sessionId) {
   let names;
@@ -215,7 +240,8 @@ function transcriptEntrypoint(transcriptPath) {
 
 /**
  * True for a run no person is watching (`claude -p`, the Agent SDK), which
- * should not litter the sessions root with a journal. CLAUDE_CODE_ENTRYPOINT
+ * gets no journal: the Stop hook neither scaffolds, adopts nor binds a dir for
+ * it, and the reminder and session-start stay silent about one. CLAUDE_CODE_ENTRYPOINT
  * decides when set; otherwise the transcript's first entrypoint does.
  * CONSTELLATION_SCAFFOLD=always turns the skip off.
  */
@@ -252,6 +278,18 @@ function slugifyTitle(title, ticket) {
   text = text.replace(/[^\w\s-]/g, ' ');
   const words = text.split(/[\s_-]+/).filter(Boolean);
   return words.join('-').slice(0, 60).replace(/-+$/, '') || 'session';
+}
+
+// --- What the agent is told ---------------------------------------------------
+
+/** The line that tells the agent where its journal is. */
+function journalLine(dir) {
+  return `Session journal: ${path.join(dir, 'SESSION.md')}. Journal there; do not create another session dir. Keep '## Decisions' and '## Status' current.`;
+}
+
+/** The line for a session with no journal yet: one is coming, or the agent's own dir will be adopted. */
+function pendingLine(root) {
+  return `Session journal: not created yet. Constellation creates it under ${root} when this turn ends, or adopts a session dir you create there this turn.`;
 }
 
 // --- Matching a session to a dir that already exists -------------------------
@@ -405,6 +443,7 @@ function sessionDirFromPrompt(root, prompt) {
 module.exports = {
   sessionRoot, today, parseFrontmatter, readSafe, readHead,
   isValidSessionId, pointerPath, readPointer, bindSession,
+  readMarker, writeMarker, journalLine, pendingLine,
   resolveSessionDir, inferPhase, sessionIdFromStdin,
   isHeadless, latestCustomTitle, firstRealPromptText, detectTicket, slugifyTitle, extractText,
   sessionStartMs, findAdoptableDir, stampSessionId, sessionDirFromPrompt,
