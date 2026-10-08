@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.3 — 2026-10-07
+
+- feat(hooks): ask before copying, sending or printing secrets from Bash
+
 ## 0.4.2 — 2026-10-07
 
 - feat(hooks): add tiered guard core with critical deny rules
