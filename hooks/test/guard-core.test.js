@@ -541,10 +541,15 @@ test('classifier units: classifyPath', () => {
     assert.equal(classifyPath(p, HOME), null, p);
   }
   const aws = { pathId: 'aws-credentials', tier: 'deny' };
-  for (const p of ['~/.aws/credentials', '$HOME/.aws/credentials', '${HOME}/.aws/credentials', '/h/.aws/credentials', '.aws/credentials']) {
+  // The aws pattern is anchored on the normalized path, so `.`, `//` and `..` cannot hide the file.
+  for (const p of ['~/.aws/credentials', '$HOME/.aws/credentials', '${HOME}/.aws/credentials', '/h/.aws/credentials', '.aws/credentials',
+    '~/.aws/./credentials', '~/.aws//credentials', '~/.aws/x/../credentials']) {
     assert.deepEqual(classifyPath(p, HOME), aws, p);
   }
   assert.equal(classifyPath('/h/.aws/credentials.bak', HOME), null);
+  // ...and on a whole directory name, so a directory that only ends in `.aws` or `.ssh` is not the
+  // real one. A deny cannot be approved, so a false deny here would block a harmless read for good.
+  for (const p of ['/h/my.aws/credentials', '/h/foo.ssh/id_x']) assert.equal(classifyPath(p, HOME), null, p);
 
   // Ask tier.
   for (const p of ['.env', '.env.local', '.env.production', '/p/.env', '~/proj/.env.test', '.env.local.bak', './.env', 'a/../.env']) {
@@ -775,6 +780,13 @@ test('safety net A: a command word that is not a plain program name asks', () =>
     "bash -c 'a[0]=1 ls'",
     'find . -exec {} \\;',
     'echo x | xargs -I% %',
+    // A complete `[[ x ]]` closes its own test (it has no `&&` inside, so it is one segment that
+    // ends in `]]`). What follows is judged as before; if the test stayed open, every later
+    // command word in the same body would skip this net.
+    '[[ -f x ]] && $X',
+    '[[ -f x ]]; a[0]=1 ls',
+    'if [[ -f x ]]; then $X; fi',
+    '[[ -f x ]] && ls && $CC y',
   ];
   for (const cmd of asks) {
     const d = run(cmd);
@@ -982,20 +994,28 @@ test('RULES: a table of {id, tier, test} with unique ids and the documented rule
 
 // Run `node hooks/guard.js` the way Claude Code does: JSON on stdin, JSON on stdout. The child gets
 // an explicit env with temp HOME, log dir and session root, and none of the switches under test.
-function spawnGuard(input, { env = {} } = {}) {
-  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'guard-core-e2e-')));
-  const dirs = { home: path.join(root, 'home'), log: path.join(root, 'logs'), sessions: path.join(root, 'sessions') };
-  fs.mkdirSync(dirs.home);
+//
+// By default each call gets a fresh temp tree and removes it. Two options cover the log path:
+// `root` reuses (and leaves in place) a tree the test made, so several runs share one log dir;
+// `defaultLogDir` leaves CONSTELLATION_GUARD_LOG_DIR unset, so the child logs where production
+// does, under its HOME. Either way `logs` and `lines` are read from the dir the child wrote to.
+function spawnGuard(input, { env = {}, root: shared = null, defaultLogDir = false } = {}) {
+  const root = shared ?? fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'guard-core-e2e-')));
+  const home = path.join(root, 'home');
+  const dirs = { home, log: defaultLogDir ? path.join(home, '.claude', 'hooks-logs') : path.join(root, 'logs'), sessions: path.join(root, 'sessions') };
+  fs.mkdirSync(home, { recursive: true });
+  const childEnv = { PATH: process.env.PATH, HOME: home, SESSION_ROOT: dirs.sessions };
+  if (!defaultLogDir) childEnv.CONSTELLATION_GUARD_LOG_DIR = dirs.log;
   const r = spawnSync(process.execPath, [GUARD], {
     input: typeof input === 'string' ? input : JSON.stringify(input),
     encoding: 'utf8',
-    env: { PATH: process.env.PATH, HOME: dirs.home, CONSTELLATION_GUARD_LOG_DIR: dirs.log, SESSION_ROOT: dirs.sessions, ...env },
+    env: { ...childEnv, ...env },
     timeout: 20000,
   });
   const logs = fs.existsSync(dirs.log) ? fs.readdirSync(dirs.log) : [];
   const lines = logs.flatMap((f) => fs.readFileSync(path.join(dirs.log, f), 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)));
-  const out = { ...r, logs, lines, dirs, root, claudeDir: fs.existsSync(path.join(dirs.home, '.claude')) };
-  fs.rmSync(root, { recursive: true, force: true });
+  const out = { ...r, logs, lines, dirs, root, claudeDir: fs.existsSync(path.join(home, '.claude')) };
+  if (shared === null) fs.rmSync(root, { recursive: true, force: true });
   return out;
 }
 
@@ -1102,4 +1122,35 @@ test('e2e: the log target is cut to 200 characters', () => {
   const r = spawnGuard(bashPayload('cat .env ' + 'x'.repeat(500)));
   assert.equal(r.lines.length, 1);
   assert.equal(r.lines[0].target.length, 200);
+});
+
+test('e2e: each decision is appended to the log, never written over it', () => {
+  // Every other e2e test uses a fresh log dir and one decision, so none would notice a log that
+  // keeps only the last line (the audit trail would be gone) or one that cannot be written twice.
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'guard-core-e2e-shared-')));
+  try {
+    const first = spawnGuard(bashPayload('cat .env'), { root });
+    assert.equal(first.lines.length, 1);
+    const second = spawnGuard(bashPayload('rm -rf ~'), { root });
+    assert.equal(second.status, 0, second.stderr);
+    assert.equal(second.lines.length, 2, 'the second decision replaced or skipped the first line');
+    assert.deepEqual(second.lines.map((l) => l.id).sort(), ['read-secret', 'rm-root-home']);
+    const third = spawnGuard(bashPayload('cat .env.local'), { root });
+    assert.equal(third.lines.length, 3);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('e2e: without CONSTELLATION_GUARD_LOG_DIR the log goes to HOME/.claude/hooks-logs, created as needed', () => {
+  // A fresh machine has no ~/.claude, so the default dir needs a recursive mkdir. spawnGuard reads
+  // the log from that exact path, so a different default name finds nothing.
+  const r = spawnGuard(bashPayload('cat .env'), { defaultLogDir: true });
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.dirs.log, path.join(r.dirs.home, '.claude', 'hooks-logs'));
+  assert.equal(r.logs.length, 1, 'exactly one log file under HOME/.claude/hooks-logs');
+  assert.match(r.logs[0], /^\d{4}-\d{2}-\d{2}\.jsonl$/);
+  assert.equal(r.lines.length, 1);
+  assert.equal(r.lines[0].id, 'read-secret');
+  assert.equal(r.claudeDir, true);
 });
