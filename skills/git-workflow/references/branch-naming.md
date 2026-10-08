@@ -22,6 +22,7 @@ Consistent branch names make history readable, CI rules writable, and PR filteri
 | Type | When to Use |
 |------|-------------|
 | `feature` | New capability or user-facing behavior |
+| `feat` | Short form of `feature`, matching the `feat` commit type |
 | `fix` | Bug fix on a non-production branch |
 | `hotfix` | Emergency fix that goes directly to production |
 | `chore` | Dependency updates, tooling, non-code maintenance |
@@ -30,6 +31,8 @@ Consistent branch names make history readable, CI rules writable, and PR filteri
 | `test` | Adding or fixing tests, no production code change |
 | `release` | Release preparation branch (`release/v2.3.0`) |
 | `experiment` | Exploratory work, may never merge |
+| `ci` | CI pipeline and workflow changes |
+| `perf` | Measured performance improvement, no behavior change |
 
 ---
 
@@ -37,7 +40,7 @@ Consistent branch names make history readable, CI rules writable, and PR filteri
 
 | Rule | Detail |
 |------|--------|
-| Lowercase only | No uppercase letters anywhere |
+| Lowercase, except a leading ticket ID | No uppercase letters, except a ticket ID right after the type (`feature/PROJ-123-add-oauth`). The description after it stays lowercase |
 | Hyphens, not underscores | `add-user-auth` not `add_user_auth` |
 | No spaces | Spaces break shell commands |
 | No special characters | Only `/`, `-`, and `.` (dot for version numbers in release branches) |
@@ -59,6 +62,7 @@ Consistent branch names make history readable, CI rules writable, and PR filteri
 | `docs/api-rate-limiting` | PASS | Documentation-only |
 | `release/v3.2.0` | PASS | Release branch with semver |
 | `feature/AddOAuthLogin` | FAIL | Uppercase letters |
+| `feature/PROJ-42-AddLogin` | FAIL | Uppercase outside the ticket ID |
 | `feature/add_oauth_login` | FAIL | Underscores not allowed |
 | `PROJ-42-oauth` | FAIL | Missing type prefix |
 | `feature/` | FAIL | Empty description |
@@ -153,7 +157,7 @@ If your CI uses branch patterns, ensure the `type` you use matches those pattern
 
 ## Validation
 
-Use `scripts/branch-check.sh` to validate a branch name before creating it:
+Use `bash scripts/branch-check.sh` to validate a branch name before creating it:
 
 ```bash
 bash scripts/branch-check.sh "feature/PROJ-123-add-oauth-login"

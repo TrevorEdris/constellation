@@ -68,15 +68,15 @@ Good/bad messages:
 
 ## Sub-Workflow: branch
 
-1. Ask for purpose (`feature|fix|chore|docs|refactor|test|hotfix|release`), optional ticket ID, and a 2–5 word description.
+1. Ask for purpose (`feature|feat|fix|hotfix|chore|docs|refactor|test|release|experiment|ci|perf`), optional ticket ID, and a 2–5 word description.
 2. Build the name: with ticket `<type>/<ticket>-<kebab-desc>`, without `<type>/<kebab-desc>`.
 3. Validate: `bash scripts/branch-check.sh "<name>"` (PASS/FAIL + suggestion).
 4. Confirm, then `git checkout -b <name>`.
 
-Constraints (full set in `references/branch-naming.md`): lowercase; hyphens not underscores; only `/`, `-`, `.`; description ≤ 50 chars; total ≤ 100.
+Constraints (full set in `references/branch-naming.md`): lowercase, except a ticket ID right after the type (`PROJ-42`); hyphens not underscores; only `/`, `-`, `.`; description ≤ 50 chars; total ≤ 100.
 
 - ✅ `feature/PROJ-42-add-oauth-login`
-- ❌ `feature/AddOAuthLogin` (uppercase) / `feature/add_oauth_login` (underscores) / `PROJ-42-oauth` (no type prefix)
+- ❌ `feature/AddOAuthLogin` (uppercase outside the ticket) / `feature/add_oauth_login` (underscores) / `PROJ-42-oauth` (no type prefix)
 
 ## Sub-Workflow: conflict
 
