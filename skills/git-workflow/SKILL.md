@@ -1,6 +1,6 @@
 ---
 name: git-workflow
-description: "Use when committing, opening a PR, creating or naming a branch, resolving a merge conflict, setting up a worktree, squashing, rebasing, or wrapping up a finished branch — i.e. any hands-on git operation where the output (commit message, PR body, branch name, conflict resolution) needs to be correct."
+description: "Use when committing, opening a PR, creating or naming a branch, resolving a merge conflict, setting up a worktree, squashing, rebasing, wrapping up a finished branch, or merging, landing or shipping it to main — i.e. any hands-on git operation where the output (commit message, PR body, branch name, conflict resolution) needs to be correct."
 ---
 
 # Git Workflow
