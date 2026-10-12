@@ -41,6 +41,12 @@ type Recorded = {
   /** Set to make ui.open answer { isPlaced: false, reason }. */
   refuse: { reason: string | null }
   clock: MockClock
+  /** Each gh call's argv and whether it ran with GITHUB_TOKEN emptied. */
+  gh: Array<{ argv: readonly string[]; tokenCleared: boolean }>
+  /** What gh pr list prints, per call in order; past the end, the last. */
+  ghAnswers: Array<{ exitCode: number; stdout: string }>
+  /** Files $.fs.read serves, by absolute path. */
+  files: Record<string, string>
 }
 
 /**
@@ -49,7 +55,7 @@ type Recorded = {
  */
 function engine(on: On, answer: { current: ConsoleState | Error }): Recorded {
   const clock = mock.clock(on, { now: 0 })
-  const rec: Recorded = { runs: 0, submits: [], fills: [], statuses: [], copies: [], opened: [], panes: [], refuse: { reason: null }, clock }
+  const rec: Recorded = { runs: 0, submits: [], fills: [], statuses: [], copies: [], opened: [], panes: [], refuse: { reason: null }, clock, gh: [], ghAnswers: [{ exitCode: 0, stdout: '[]' }], files: {} }
   mockClock = clock
   mock.env(on, { SESSION_ROOT: '/root' })
   // Calls on $ answer { value }; events answer their result.
@@ -67,7 +73,16 @@ function engine(on: On, answer: { current: ConsoleState | Error }): Recorded {
     value: rec.panes.map(id => ({ id, title: id, isShown: true, isFocused: false, isPlaced: true })),
   }))
   on('ui.copy', (_$, e) => { rec.copies.push(e.text); return { value: { isCopied: true } } })
-  on('process.run', () => {
+  on('fs.read', (_$, e) => {
+    const text = rec.files[e.path]
+    return text === undefined ? { deny: `ENOENT: ${e.path}` } : { value: text }
+  })
+  on('process.run', (_$, e) => {
+    if (e.argv[0] === 'gh') {
+      rec.gh.push({ argv: e.argv, tokenCleared: e.init?.env?.GITHUB_TOKEN === '' })
+      const out = rec.ghAnswers[Math.min(rec.gh.length - 1, rec.ghAnswers.length - 1)] ?? { exitCode: 0, stdout: '[]' }
+      return { value: { ...out, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    }
     rec.runs += 1
     const a = answer.current
     const value = a instanceof Error
@@ -119,7 +134,7 @@ describe('pane', () => {
     await start($)
     for (const surface of SURFACES) {
       const ui = await $.ui.mount({ ...PANE, surface })
-      expect(await ui.find({ text: /No constellation session yet/ })).toBeDefined()
+      expect(await ui.find({ type: 'Text', text: 'No session journal yet.' })).toBeDefined()
       await ui.unmount()
     }
   })
@@ -168,7 +183,7 @@ describe('pane', () => {
     engine(on, { current: state({ plans: [plan({ score: 100, passed: false })] }) })
     await start($)
     const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-    const line = await ui.find({ type: 'Text', text: /validator 100 NEEDS WORK/ })
+    const line = await ui.find({ type: 'Text', text: /^validator 100, needs work$/ })
     expect(line?.props.color).toBe('warning')
   })
 
@@ -193,7 +208,7 @@ describe('pane', () => {
     answer.current = new Error('boom')
     await endTurn($)
     const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-    expect(await ui.find({ text: 'state unavailable: state: boom' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: "Couldn't read session state: state: boom" })).toBeDefined()
     expect(await ui.find({ text: /Validate plan/ })).toBeDefined()
   })
 })
@@ -207,7 +222,7 @@ describe('events', () => {
     await settle()
     expect(rec.runs).toBe(before + 1)
     const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-    expect(await ui.find({ text: /PLAN\.md {2}✎ writing…/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: 'writing' })).toBeDefined()
   })
 
   test('a Write outside the session dir does not refresh', async ($, on) => {
@@ -225,8 +240,8 @@ describe('events', () => {
     await $.skill.prompt({ skill: 'constellation:brainstorming', text: 'x' })
     await $.skill.prompt({ skill: 'caveman:caveman', text: 'x' })
     const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-    const row = await ui.find({ text: /^SKILLS / })
-    expect(row?.text).toBe('SKILLS brainstorming')
+    const row = await ui.find({ type: 'Text', text: /^Skills used: / })
+    expect(row?.text).toBe('Skills used: brainstorming')
   })
 
   test('status line: gate and no session', async ($, on) => {
@@ -315,6 +330,77 @@ describe('events', () => {
     engine(on, { current: state({ gate: 'awaiting-approval', plans: [plan({ status: 'Awaiting-Approval' })] }) })
     await start($)
     const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-    expect(await ui.find({ type: 'Text', text: /awaiting your approval: Console pane/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: 'Waiting for your approval on Console pane.' })).toBeDefined()
+  })
+})
+
+describe('drill-down', () => {
+  test('a session file opens inside the pane and Back returns to the overview', async ($, on) => {
+    const rec = engine(on, { current: state() })
+    rec.files[`${DIR}/SESSION.md`] = '# Session\n\nThe goal is a console pane.'
+    await start($)
+    for (const surface of SURFACES) {
+      const ui = await $.ui.mount({ ...PANE, surface })
+      await ui.press({ key: 'doc:SESSION.md' })
+      const md = await ui.find({ type: 'Markdown' })
+      expect(md?.props.text).toBe('# Session\n\nThe goal is a console pane.')
+      expect(await ui.find({ type: 'Text', text: 'Session files' })).toBeUndefined()
+      await ui.press({ key: 'back' })
+      expect(await ui.find({ type: 'Markdown' })).toBeUndefined()
+      expect(await ui.find({ type: 'Text', text: 'Session files' })).toBeDefined()
+      await ui.unmount()
+    }
+    expect(rec.submits).toEqual([])
+  })
+
+  test('a plan title opens the plan inside the pane', async ($, on) => {
+    const rec = engine(on, { current: state() })
+    rec.files[PLAN_PATH] = '# PLAN: Console pane'
+    await start($)
+    const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+    await ui.press({ key: `plan:${PLAN_PATH}` })
+    expect((await ui.find({ type: 'Markdown' }))?.props.text).toBe('# PLAN: Console pane')
+  })
+
+  test('a file that cannot be read says so in the pane', async ($, on) => {
+    engine(on, { current: state() })
+    await start($)
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+    await ui.press({ key: 'doc:PLAN.md' })
+    expect(await ui.find({ type: 'Text', text: /^Couldn't open PLAN\.md/ })).toBeDefined()
+  })
+
+  test('a shipping row with a pull request is a link to it', async ($, on) => {
+    const rec = engine(on, { current: state() })
+    rec.ghAnswers = [{ exitCode: 0, stdout: JSON.stringify([{ number: 39, url: 'https://github.com/o/r/pull/39', state: 'OPEN' }]) }]
+    await start($)
+    for (const surface of SURFACES) {
+      const ui = await $.ui.mount({ ...PANE, surface })
+      const link = await ui.find({ type: 'Link' })
+      expect(link?.props.href).toBe('https://github.com/o/r/pull/39')
+      expect(String(link?.props.label)).toBe('#39 feat/console → main')
+      await ui.unmount()
+    }
+    expect(rec.gh[0]?.argv).toEqual(['gh', 'pr', 'list', '--head', 'feat/console', '--state', 'all', '--json', 'number,url,state', '--limit', '1'])
+  })
+
+  test('a failing gh is retried once with GITHUB_TOKEN emptied', async ($, on) => {
+    const rec = engine(on, { current: state() })
+    rec.ghAnswers = [
+      { exitCode: 1, stdout: '' },
+      { exitCode: 0, stdout: JSON.stringify([{ number: 7, url: 'https://github.com/o/r/pull/7', state: 'MERGED' }]) },
+    ]
+    await start($)
+    expect(rec.gh.map(g => g.tokenCleared)).toEqual([false, true])
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+    expect((await ui.find({ type: 'Link' }))?.props.href).toBe('https://github.com/o/r/pull/7')
+  })
+
+  test('pull requests are looked up once, not on every refresh', async ($, on) => {
+    const rec = engine(on, { current: state() })
+    await start($)
+    await endTurn($)
+    await endTurn($)
+    expect(rec.gh).toHaveLength(1)
   })
 })

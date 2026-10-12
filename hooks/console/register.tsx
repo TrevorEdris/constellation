@@ -11,22 +11,26 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, Timer } from 'claude-code'
 
-import type { ConsoleState } from '../../types'
+import type { ConsolePr, ConsoleState } from '../../types'
 import {
-  ACTIVITY_MS, RAIL, actions, age, branchWarnings, currentStep, firstLine, gatedPlan,
-  isUnder, nextScores, pushActivity, pushSkill, statusLine,
+  ACTIVITY_MS, RAIL, STAR, actions, age, branchWarnings, constellationSvg, currentStep, deliveryRows, firstLine,
+  isOpenPlan, isUnder, nextScores, prKey, pushActivity, pushSkill, railGlyphs, sessionTitle, statusLine, statusSentence,
 } from './view'
 
 const PANE = 'constellation-console'
 const TITLE = 'Constellation'
 const POLL_MS = 15_000
 const STATE_TIMEOUT_MS = 5_000
+const GH_TIMEOUT_MS = 10_000
+const PR_TTL_MS = 5 * 60_000
 
 const snapshot = atom({ plugin: 'constellation', key: 'snapshot' } as const, null)
 const error = atom({ plugin: 'constellation', key: 'error' } as const, null)
 const scores = atom({ plugin: 'constellation', key: 'scores' } as const, {})
 const activity = atom({ plugin: 'constellation', key: 'activity' } as const, [])
 const skills = atom({ plugin: 'constellation', key: 'skills' } as const, [])
+const preview = atom({ plugin: 'constellation', key: 'preview' } as const, null)
+const prs = atom({ plugin: 'constellation', key: 'prs' } as const, {})
 
 let running: Promise<void> | null = null
 let again = false
@@ -57,6 +61,63 @@ async function refreshOnce($: EngineInterface): Promise<void> {
   } catch {
     // The status line is best-effort.
   }
+  try {
+    const shown = await read($, preview)
+    if (shown) await showFile($, shown.path)
+    const s = await read($, snapshot)
+    if (s) await lookUpPrs($, s)
+  } catch {
+    // The preview and PR links are best-effort; a refresh never throws.
+  }
+}
+
+/** Shows a file inside the pane, or why it could not be read. */
+async function showFile($: EngineInterface, path: string): Promise<void> {
+  const name = path.split('/').pop() ?? path
+  try {
+    const text = await $.fs.read(path)
+    await update($, preview, () => ({ name, path, text: String(text), error: null }))
+  } catch (err) {
+    const reason = firstLine(err instanceof Error ? err.message : String(err)) || 'unreadable'
+    await update($, preview, () => ({ name, path, text: null, error: reason }))
+  }
+}
+
+/** Looks up the PR of each shipping branch, at most once per 5 minutes per branch. */
+async function lookUpPrs($: EngineInterface, s: ConsoleState): Promise<void> {
+  const known = await read($, prs)
+  const now = await $.clock.now()
+  for (const row of deliveryRows(s)) {
+    if (!row.repoPath.startsWith('/') || row.branch === '?' || row.branch === 'n/a') continue
+    const key = prKey(row.repoPath, row.branch)
+    const seen = known[key]
+    if (seen && now - seen.at < PR_TTL_MS) continue
+    const pr = await ghPr($, row.repoPath, row.branch)
+    await update($, prs, all => ({ ...all, [key]: { pr, at: now } }))
+  }
+}
+
+/**
+ * The newest PR whose head is `branch`, from `gh pr list` run in the repo. A
+ * failed call is tried once more with GITHUB_TOKEN emptied, so gh falls back
+ * to its keyring login when an exported token is stale. Null when gh is
+ * missing, both calls fail, or the branch has no PR.
+ */
+async function ghPr($: EngineInterface, repo: string, branch: string): Promise<ConsolePr | null> {
+  const argv = ['gh', 'pr', 'list', '--head', branch, '--state', 'all', '--json', 'number,url,state', '--limit', '1']
+  for (const env of [undefined, { GITHUB_TOKEN: '' }]) {
+    try {
+      const res = await $.process.run(argv, { cwd: repo, timeoutMs: GH_TIMEOUT_MS, ...(env ? { env } : {}) })
+      if (res.exitCode !== 0) continue
+      const first: unknown = (JSON.parse(res.stdout) as unknown[])[0]
+      if (!first || typeof first !== 'object') return null
+      const { number, url, state } = first as Record<string, unknown>
+      return typeof number === 'number' && typeof url === 'string' ? { number, url, state: String(state ?? '') } : null
+    } catch {
+      // gh missing, timed out or printed something else: try the next way, then give up.
+    }
+  }
+  return null
 }
 
 async function refresh($: EngineInterface): Promise<void> {
@@ -173,96 +234,143 @@ export const register: Register = on => {
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const { Box, Text, Button } = $.ui.resolve(e)
+    const els = $.ui.resolve(e)
+    const { Box, Text, Button, Link, Markdown } = els
     const s = await read($, snapshot)
+    const shown = await read($, preview)
     const err = await read($, error)
     const writes = await read($, activity)
     const used = await read($, skills)
     const now = await $.clock.now()
-    const rule = '─'.repeat(Math.max(10, Math.min(e.props.bodyColumns || 40, 80)))
+    const problem = err && <Text color="warning">Couldn't read session state: {err}</Text>
 
     if (!s || !s.sessionDir) {
       return (
         <Box flexDirection="column">
-          <Text bold>✦ {TITLE}</Text>
-          {err && <Text dimColor>state unavailable: {err}</Text>}
-          <Text dimColor>No constellation session yet — the journal starts when this turn ends.</Text>
+          {problem}
+          <Text>No session journal yet.</Text>
+          <Text dimColor>It starts when this turn ends.</Text>
+        </Box>
+      )
+    }
+
+    if (shown) {
+      return (
+        <Box flexDirection="column">
+          <Box flexDirection="row" gap={1}>
+            <Button key="back" label="Back" hotkey="b" onPress={() => void update($, preview, () => null)} />
+            <Text bold wrap="truncate-end">{shown.name}</Text>
+          </Box>
+          <Box flexDirection="column" marginTop={1}>
+            {shown.error === null
+              ? <Markdown text={shown.text ?? ''} />
+              : <Text color="warning">Couldn't open {shown.name}: {shown.error}</Text>}
+          </Box>
         </Box>
       )
     }
 
     const dir = s.sessionDir
-    const step = currentStep(s)
-    const at = RAIL.findIndex(r => r.step === step)
-    const gated = s.gate ? gatedPlan(s) : null
+    const at = RAIL.findIndex(r => r.step === currentStep(s))
     const writing = new Set(writes.filter(w => now - w.at < ACTIVITY_MS).map(w => w.path))
-    const shown = s.plans.slice(0, 2)
+    const plans = s.plans.slice(0, 2)
+    const shipping = deliveryRows(s)
+    const prLookups = await read($, prs)
+    const warnings = branchWarnings(s)
 
     return (
       <Box flexDirection="column">
-        <Text bold>✦ {TITLE}</Text>
-        {err && <Text dimColor>state unavailable: {err}</Text>}
-        <Text>{dir.split('/').pop() ?? dir}</Text>
-        <Text dimColor wrap="truncate-start">{dir}</Text>
+        {problem}
+        <Text bold wrap="truncate-end">{sessionTitle(dir)}</Text>
         <Box flexDirection="row" gap={1}>
-          <Button key="open-dir" label="open dir" hotkey="o" plain onPress={() => void $.prompt.submit({ text: `Open the session directory ${dir} in Finder.` })} />
-          <Button key="copy" label="copy path" hotkey="y" plain onPress={() => void $.ui.copy({ text: dir, surface: e.surface })} />
+          <Box flexGrow={1} flexShrink={1}>
+            <Text dimColor wrap="truncate-start">{dir}</Text>
+          </Box>
+          <Button key="copy" label="copy path" hotkey="y" plain dimColor onPress={() => void $.ui.copy({ text: dir, surface: e.surface })} />
         </Box>
-        <Text dimColor>{rule}</Text>
-        <Box flexDirection="row" flexWrap="wrap">
-          {RAIL.map((r, i) => (
-            <Text key={`rail-${r.step}`} inverse={i === at} bold={i === at} dimColor={i > at}>
-              {i === 0 ? '' : ' ─ '}{r.label}
-            </Text>
-          ))}
+
+        <Box flexDirection="column" marginTop={1}>
+          {'Svg' in els
+            ? <els.Svg source={constellationSvg(at)} alt={`Phase: ${RAIL[at]?.label ?? 'none'}`} />
+            : (
+              <Box flexDirection="row" flexWrap="wrap" columnGap={1}>
+                {railGlyphs(at).map(g => (
+                  <Text key={`rail-${g.label}`} color={g.state === 'ahead' ? undefined : STAR} dimColor={g.state === 'ahead'} bold={g.state === 'current'}>
+                    {g.glyph} {g.label}
+                  </Text>
+                ))}
+              </Box>
+            )}
+          <Text wrap="wrap">{statusSentence(s)}</Text>
         </Box>
-        {gated && <Text color="warning">awaiting your approval: {gated.title ?? gated.path.split('/').pop()}</Text>}
-        <Box flexDirection="row" gap={1} flexWrap="wrap">
-          {actions(s).map(a => (
+        <Box flexDirection="row" gap={1} flexWrap="wrap" marginTop={1}>
+          {actions(s).map((a, i) => (
             <Button
               key={a.key}
               label={a.label}
               hotkey={a.hotkey}
+              variant={i === 0 ? 'primary' : 'secondary'}
               onPress={() => void (a.kind === 'fill'
                 ? $.prompt.fill({ text: a.text, mode: 'insert' })
                 : $.prompt.submit({ text: a.text }))}
             />
           ))}
         </Box>
-        {shown.length > 0 && <Text dimColor>{rule}</Text>}
-        {shown.map(p => (
-          <Box key={`plan-${p.path}`} flexDirection="column">
-            <Text bold wrap="truncate-end">PLAN  {p.title ?? p.path.split('/').pop()}  <Text dimColor>{p.status ?? '—'}</Text></Text>
-            <Text color={p.score === null ? undefined : p.passed ? 'success' : 'warning'}>
-              validator {p.score === null ? '—' : `${p.score} ${p.passed ? 'PASS' : 'NEEDS WORK'}`}
+
+        {plans.length > 0 && <Box marginTop={1}><Text bold>Plans</Text></Box>}
+        {plans.map(p => (
+          <Box key={`plan-${p.path}`} flexDirection="column" marginTop={1}>
+            <Button key={`plan:${p.path}`} plain label={p.title ?? p.path.split('/').pop() ?? p.path} onPress={() => void showFile($, p.path)} />
+            <Text wrap="truncate-end">
+              <Text dimColor>{p.status ?? 'no status'}, </Text>
+              <Text color={p.score === null ? 'inactive' : p.passed ? 'success' : 'warning'}>
+                {p.score === null ? 'not validated' : `validator ${p.score}, ${p.passed ? 'passing' : 'needs work'}`}
+              </Text>
             </Text>
-            {p.size && <Text dimColor>size {p.size}</Text>}
-            {p.needsCall.length > 0 && <Text>needs your call ({p.needsCall.length})</Text>}
-            {p.needsCall.map(c => (
-              <Text key={`call-${p.path}-${c.n}`} wrap="truncate-end"> {c.n} {c.text}  → {c.default}</Text>
+            {p.size && <Text dimColor wrap="truncate-end">{p.size}</Text>}
+            {isOpenPlan(p) && p.needsCall.map(c => (
+              <Text key={`call-${p.path}-${c.n}`} wrap="truncate-end">
+                {c.n}. {c.text} <Text dimColor>Default: {c.default}</Text>
+              </Text>
             ))}
           </Box>
         ))}
-        {s.plans.length > shown.length && <Text dimColor>+ {s.plans.length - shown.length} more</Text>}
-        <Text dimColor>{rule}</Text>
-        <Text bold>DOCS</Text>
-        {s.docs.map(d => (
-          <Button
-            key={`doc:${d.name}`}
-            plain
-            label={`${d.name}${writing.has(`${dir}/${d.name}`) ? '  ✎ writing…' : ''}  ${age(now, d.mtimeMs)}`}
-            onPress={() => void $.prompt.submit({ text: `Show me a summary of ${dir}/${d.name}.` })}
-          />
-        ))}
-        {used.length > 0 && <Text dimColor wrap="truncate-end">SKILLS {used.map(n => n.replace(/^constellation:/, '')).join(' › ')}</Text>}
+        {s.plans.length > plans.length && <Text dimColor>{s.plans.length - plans.length} more</Text>}
+
+        {s.docs.length > 0 && <Box marginTop={1}><Text bold>Session files</Text></Box>}
+        {s.docs.map(d => {
+          const isWriting = writing.has(`${dir}/${d.name}`)
+          return (
+            <Box key={`docrow:${d.name}`} flexDirection="row" justifyContent="space-between" gap={1}>
+              <Button key={`doc:${d.name}`} plain label={d.name} onPress={() => void showFile($, `${dir}/${d.name}`)} />
+              <Text color={isWriting ? STAR : undefined} dimColor={!isWriting}>{isWriting ? 'writing' : age(now, d.mtimeMs)}</Text>
+            </Box>
+          )
+        })}
+        {used.length > 0 && (
+          <Box marginTop={1}>
+            <Text dimColor wrap="truncate-end">Skills used: {used.map(n => n.replace(/^constellation:/, '')).join(', ')}</Text>
+          </Box>
+        )}
+
         <Box flexGrow={1} />
-        {s.plans.flatMap(p => p.delivery).length > 0 && <Text dimColor>{rule}</Text>}
-        {s.plans.flatMap(p => p.delivery.map((d, i) => (
-          <Text key={`delivery-${p.path}-${i}`} wrap="truncate-end">
-            {(d.repo ?? '').split('/').pop()}  {d.branch ?? '?'} → {d.base ?? '?'} · {d.mode ?? '?'} · {d.prs ?? 0} PR
-          </Text>
-        )))}
-        {branchWarnings(s).map((w, i) => (
+        {(shipping.length > 0 || warnings.length > 0) && <Box marginTop={1}><Text bold>Shipping</Text></Box>}
+        {shipping.map(d => {
+          const pr = prLookups[prKey(d.repoPath, d.branch)]?.pr ?? null
+          return pr
+            ? (
+              <Box key={`delivery-${d.key}`} flexDirection="row" gap={1}>
+                <Link href={pr.url} label={`#${pr.number} ${d.branch} → ${d.base}`} />
+                <Text dimColor>{pr.state.toLowerCase()}</Text>
+              </Box>
+            )
+            : (
+              <Text key={`delivery-${d.key}`} wrap="truncate-end">
+                {d.branch} → {d.base} <Text dimColor>{d.repo}, no PR yet</Text>
+              </Text>
+            )
+        })}
+        {warnings.map((w, i) => (
           <Text key={`warn-${i}`} color={w.level}>{w.text}</Text>
         ))}
       </Box>

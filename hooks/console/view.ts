@@ -10,10 +10,106 @@ export type RailStep = 'discover' | 'plan' | 'gate' | 'implement' | 'complete'
 export const RAIL: ReadonlyArray<{ step: RailStep; label: string }> = [
   { step: 'discover', label: 'Discover' },
   { step: 'plan', label: 'Plan' },
-  { step: 'gate', label: '◆Gate' },
+  { step: 'gate', label: 'Approval' },
   { step: 'implement', label: 'Implement' },
   { step: 'complete', label: 'Done' },
 ]
+
+/** Starlight amber: reached stars, done links, and the mark on a file being written. */
+export const STAR = '#E0A43A'
+const SLATE = '#5B6577'
+const LABEL = '#8B93A1'
+
+// Star positions on a 300 x 70 chart: an uneven arc, so the rail reads as a constellation.
+const STAR_X = [32, 91, 150, 209, 268]
+const STAR_Y = [34, 20, 30, 14, 26]
+
+/**
+ * The phase rail as a small star chart (an SVG document). Stars before `at`
+ * are reached, the star at `at` carries a halo, later ones are hollow; the
+ * approval star is a diamond. `at` is -1 when there is no phase yet.
+ */
+export function constellationSvg(at: number): string {
+  const parts: string[] = []
+  for (let i = 0; i < STAR_X.length - 1; i++) {
+    const done = i < at
+    parts.push(
+      `<line x1="${STAR_X[i]}" y1="${STAR_Y[i]}" x2="${STAR_X[i + 1]}" y2="${STAR_Y[i + 1]}" stroke="${done ? STAR : SLATE}" stroke-width="${done ? 1.6 : 1}"${done ? '' : ' stroke-dasharray="3 3"'} stroke-linecap="round"/>`,
+    )
+  }
+  RAIL.forEach((r, i) => {
+    const x = STAR_X[i] ?? 0
+    const y = STAR_Y[i] ?? 0
+    const reached = i <= at
+    if (i === at) parts.push(`<circle cx="${x}" cy="${y}" r="10" fill="${STAR}" fill-opacity="0.18"/>`)
+    const size = i === at ? 5 : 3.5
+    const paint = reached ? `fill="${STAR}"` : `fill="none" stroke="${SLATE}" stroke-width="1.2"`
+    parts.push(r.step === 'gate'
+      ? `<rect x="${x - size}" y="${y - size}" width="${size * 2}" height="${size * 2}" transform="rotate(45 ${x} ${y})" ${paint}/>`
+      : `<circle cx="${x}" cy="${y}" r="${size}" ${paint}/>`)
+    parts.push(
+      `<text x="${x}" y="62" text-anchor="middle" font-family="-apple-system, system-ui, sans-serif" font-size="10.5" fill="${i === at ? STAR : LABEL}"${i === at ? ' font-weight="600"' : ''}>${r.label}</text>`,
+    )
+  })
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 70" width="300" height="70">${parts.join('')}</svg>`
+}
+
+/** The phase rail for surfaces without Svg, one glyph per star: reached ●, current ◉, ahead ○, approval ◆/◇. */
+export function railGlyphs(at: number): Array<{ glyph: string; label: string; state: 'reached' | 'current' | 'ahead' }> {
+  return RAIL.map((r, i) => {
+    const state = i < at ? 'reached' : i === at ? 'current' : 'ahead'
+    const glyph = r.step === 'gate' ? (state === 'ahead' ? '◇' : '◆') : state === 'current' ? '◉' : state === 'reached' ? '●' : '○'
+    return { glyph, label: r.label, state }
+  })
+}
+
+/** A session dir's name as a title: `2026-10-10_PROJ-1_Add-Auth` reads `Add Auth`. */
+export function sessionTitle(dir: string): string {
+  const name = dir.split('/').pop() ?? dir
+  const slug = name.replace(/^\d{4}-\d{2}-\d{2}_/, '').replace(/^[A-Z][A-Z0-9]+-\d+_/, '')
+  return slug.replace(/[-_]+/g, ' ').trim() || name
+}
+
+/** One plain sentence saying where the work stands. */
+export function statusSentence(s: ConsoleState): string {
+  const name = (p: ConsolePlan | null) => p?.title ?? p?.path.split('/').pop() ?? 'the plan'
+  switch (currentStep(s)) {
+    case 'discover': return 'Discovering. Findings go in DISCOVERY.md.'
+    case 'plan': return `Planning ${name(leadPlan(s))}.`
+    case 'gate': return `Waiting for your approval on ${name(gatedPlan(s))}.`
+    case 'implement': return `Implementing ${name(leadPlan(s))}.`
+    case 'complete': return 'All plans are complete. Wrap up the branch when ready.'
+    default: return 'No phase yet.'
+  }
+}
+
+/** True while a plan still takes answers: drafted, being planned, or awaiting approval. */
+export function isOpenPlan(p: ConsolePlan): boolean {
+  return ['draft', 'planning', 'plan', 'awaiting-approval'].includes(String(p.status ?? '').toLowerCase())
+}
+
+export type DeliveryRow = { key: string; repoPath: string; repo: string; branch: string; base: string; prs: number }
+
+/** Every plan's delivery items, once each: repo path and name, branch, base and PR count. */
+export function deliveryRows(s: ConsoleState): DeliveryRow[] {
+  const seen = new Set<string>()
+  const rows: DeliveryRow[] = []
+  for (const p of s.plans) {
+    for (const d of p.delivery) {
+      const key = `${d.repo ?? ''}|${d.branch ?? ''}|${d.base ?? ''}`
+      if (seen.has(key)) continue
+      seen.add(key)
+      const repoPath = d.repo ?? ''
+      rows.push({ key, repoPath, repo: repoPath.split('/').pop() ?? '', branch: d.branch ?? '?', base: d.base ?? '?', prs: d.prs ?? 0 })
+    }
+  }
+  return rows
+}
+
+/** Where a branch's PR lookup is kept: one entry per repo and branch. */
+export function prKey(repoPath: string, branch: string): string {
+  return `${repoPath}|${branch}`
+}
 
 /** The rail step to highlight: the gate while a plan awaits approval, else the phase. */
 export function currentStep(s: ConsoleState | null): RailStep | null {

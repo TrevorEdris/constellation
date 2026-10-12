@@ -48,6 +48,15 @@ export type ConsoleScore = { mtimeMs: number; score: number; passed: boolean }
 /** A file Claude wrote under the session dir, and when (epoch ms). */
 export type ConsoleActivity = { path: string; at: number }
 
+/** A file shown inside the pane: its text, or why it could not be read. */
+export type ConsolePreview = { name: string; path: string; text: string | null; error: string | null }
+
+/** A branch's pull request as `gh pr list` reports it. */
+export type ConsolePr = { number: number; url: string; state: string }
+
+/** One branch's PR lookup: the PR (null when there is none) and when it was looked up (epoch ms). */
+export type ConsolePrLookup = { pr: ConsolePr | null; at: number }
+
 declare module 'claude-code' {
   interface PluginState {
     constellation: {
@@ -56,6 +65,8 @@ declare module 'claude-code' {
       scores: Record<string, ConsoleScore>
       activity: ConsoleActivity[]
       skills: string[]
+      preview: ConsolePreview | null
+      prs: Record<string, ConsolePrLookup>
     }
   }
 }
