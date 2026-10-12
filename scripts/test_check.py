@@ -2,7 +2,7 @@
 """Tests for scripts/check.sh.
 
 check.sh runs every repo check (node syntax, node tests, pytest, the two
-generators, the version files, bash tests), reports each as PASS, FAIL or
+generators, the version files, bash tests, the mod checks), reports each as PASS, FAIL or
 SKIP, and exits 1 if any step failed. What these tests cover is that
 aggregation: every step runs even after an earlier one fails, a failure in
 any file or any directory depth is caught, and a step with nothing to run is
@@ -61,6 +61,10 @@ STEPS = [
     "version-files",
     "bash-tests",
 ]
+# The tree has no hooks.json "modules", so the mod checks have nothing to run.
+MOD_SKIPS = ["SKIP mod-validate: no modules", "SKIP mod-tests: no modules"]
+# A stub claude that logs its arguments and exits with $CLAUDE_STUB_EXIT.
+CLAUDE_STUB = '#!/usr/bin/env bash\necho "$*" >> "$CLAUDE_STUB_LOG"\nexit "${CLAUDE_STUB_EXIT:-0}"\n'
 
 
 def write(tree, rel, text):
@@ -84,14 +88,29 @@ def make_tree(tree):
     return tree
 
 
-def run_check(tree):
+def run_check(tree, env=None):
     """Run the tree's check.sh from an unrelated cwd, so only its own cd finds the tree."""
     elsewhere = tree.parent / "elsewhere"
     elsewhere.mkdir(exist_ok=True)
     return subprocess.run(
         ["bash", str(tree / "scripts" / "check.sh")],
-        cwd=elsewhere, capture_output=True, text=True, timeout=180,
+        cwd=elsewhere, capture_output=True, text=True, timeout=180, env=env,
     )
+
+
+def with_mod(tree, claude_exit=None):
+    """Give the tree a hooks.json "modules" entry; with claude_exit, put a stub claude first on PATH."""
+    write(tree, "hooks/hooks.json", '{ "modules": ["./m.ts"], "hooks": {} }\n')
+    env = dict(os.environ)
+    if claude_exit is not None:
+        stub = write(tree.parent / "bin", "claude", CLAUDE_STUB)
+        stub.chmod(0o755)
+        env["PATH"] = f"{stub.parent}{os.pathsep}{env['PATH']}"
+        env["CLAUDE_STUB_LOG"] = str(tree.parent / "claude.log")
+        env["CLAUDE_STUB_EXIT"] = str(claude_exit)
+    else:
+        env["PATH"] = "/usr/bin:/bin"
+    return env
 
 
 def status_lines(res):
@@ -124,7 +143,7 @@ def test_all_green_exits_zero(tree):
     res = run_check(tree)
 
     assert res.returncode == 0, res.stdout + res.stderr
-    assert status_lines(res) == [f"PASS {step}" for step in STEPS], res.stdout
+    assert status_lines(res) == [f"PASS {step}" for step in STEPS] + MOD_SKIPS, res.stdout
     assert res.stdout.splitlines()[-1] == "ALL CHECKS PASSED"
 
 
@@ -191,3 +210,35 @@ def test_missing_tests_skip_not_fail(tree):
     assert status_of(res, "bash-tests") == "SKIP bash-tests: no files", res.stdout
     assert not [ln for ln in status_lines(res) if ln.startswith("FAIL")], res.stdout
     assert res.stdout.splitlines()[-1] == "ALL CHECKS PASSED"
+
+
+def test_mod_checks_run_claude_validate_then_test(tree):
+    env = with_mod(tree, claude_exit=0)
+
+    res = run_check(tree, env)
+
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert status_of(res, "mod-validate") == "PASS mod-validate", res.stdout
+    assert status_of(res, "mod-tests") == "PASS mod-tests", res.stdout
+    log = (tree.parent / "claude.log").read_text(encoding="utf-8").splitlines()
+    assert log == ["plugin validate .", "plugin test ."], log
+
+
+def test_mod_check_failure_is_reported(tree):
+    env = with_mod(tree, claude_exit=1)
+
+    res = run_check(tree, env)
+
+    assert res.returncode == 1, res.stdout + res.stderr
+    assert status_of(res, "mod-validate").startswith("FAIL mod-validate"), res.stdout
+    assert status_of(res, "mod-tests").startswith("FAIL mod-tests"), res.stdout
+    assert res.stdout.splitlines()[-1] == "CHECKS FAILED: 2"
+
+
+def test_mod_checks_skip_without_claude(tree):
+    env = with_mod(tree)
+
+    res = run_check(tree, env)
+
+    assert status_of(res, "mod-validate") == "SKIP mod-validate: claude not on PATH", res.stdout
+    assert status_of(res, "mod-tests") == "SKIP mod-tests: claude not on PATH", res.stdout

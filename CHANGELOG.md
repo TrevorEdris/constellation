@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.0 (2026-10-12)
+
+- Add the console mod: /constellation pane and status line for the session's workflow state.
+
 ## 0.5.0 (2026-10-12)
 
 - Add scripts/state.js: one session's workflow state (dir, phase, gate, plans, docs, git) as JSON.
