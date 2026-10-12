@@ -185,6 +185,14 @@ const PHASE_BY_STATUS = new Map([
 ]);
 const PHASE_ORDER = ['plan', 'implement', 'complete'];
 
+/** The phase one PLAN `status` puts a session in; an unknown status counts as past planning. */
+function phaseOfStatus(status) {
+  return PHASE_BY_STATUS.get(String(status || '').toLowerCase()) || 'implement';
+}
+
+/** Where a phase sits in PLAN order (plan, implement, complete); lower is less advanced. */
+function phaseRank(phase) { return PHASE_ORDER.indexOf(phase); }
+
 function inferPhase(sessionDir) {
   // PLAN frontmatter status decides; with several plans the least advanced wins.
   // PLAN-INDEX.md only lists plans, so it never counts.
@@ -193,10 +201,7 @@ function inferPhase(sessionDir) {
     planFiles = fs.readdirSync(sessionDir).filter(f => /^PLAN.*\.md$/.test(f) && f !== 'PLAN-INDEX.md');
   } catch { /* none */ }
   if (planFiles.length) {
-    const rank = f => {
-      const status = (parseFrontmatter(readSafe(path.join(sessionDir, f))).status || '').toLowerCase();
-      return PHASE_ORDER.indexOf(PHASE_BY_STATUS.get(status) || 'implement'); // unknown status: past planning
-    };
+    const rank = f => phaseRank(phaseOfStatus(parseFrontmatter(readSafe(path.join(sessionDir, f))).status));
     return PHASE_ORDER[Math.min(...planFiles.map(rank))];
   }
   if (fs.existsSync(path.join(sessionDir, 'DISCOVERY.md'))) return 'plan';
@@ -444,7 +449,7 @@ module.exports = {
   sessionRoot, today, parseFrontmatter, readSafe, readHead,
   isValidSessionId, pointerPath, readPointer, bindSession,
   readMarker, writeMarker, journalLine, pendingLine,
-  resolveSessionDir, inferPhase, sessionIdFromStdin,
+  resolveSessionDir, inferPhase, phaseOfStatus, phaseRank, sessionIdFromStdin,
   isHeadless, latestCustomTitle, firstRealPromptText, detectTicket, slugifyTitle, extractText,
   sessionStartMs, findAdoptableDir, stampSessionId, sessionDirFromPrompt,
 };
