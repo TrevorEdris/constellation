@@ -32,6 +32,11 @@ bash scripts/install.sh --dry-run  # preview
 ```
 See `.codex/INSTALL.md`.
 
+## Console pane
+Claude Code only. `/constellation` opens a pane beside the transcript (inline above the prompt where the terminal cannot dock it) that shows the session's workflow state: the session dir, the phase rail with the approval gate, each plan's validator score, size and open questions, the session docs with their ages, the skills used, and each plan's delivery branch with a warning when you are on another one. Its buttons steer the work by prompting Claude: validate or render the plan card, continue, save a handoff. Approve and Request changes only fill the prompt, so you finish the reply yourself. The status line shows the phase even with the pane closed. `/constellation open` and `/constellation close` force either state.
+
+The pane reads `node scripts/state.js --session-id <id>`, which prints the same state as JSON.
+
 ## Adding a skill
 Drop `skills/<name>/SKILL.md` (frontmatter: `name` + `description` only; description starts with "Use when …"). Run `python scripts/gen-catalog.py` to register it. No manifest edit needed.
 
