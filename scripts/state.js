@@ -30,7 +30,7 @@ const CHILD_TIMEOUT_MS = 5000;
 const FRONTMATTER_RE = /^---\n([\s\S]*?)\n---/;
 
 function usage(message) {
-  process.stderr.write(`state: ${message}\nusage: node scripts/state.js --session-id <id> [--cwd <dir>] [--cache-stdin]\n`);
+  process.stderr.write(`state: ${message} (usage: node scripts/state.js --session-id <id> [--cwd <dir>] [--cache-stdin])\n`);
   process.exit(2);
 }
 
@@ -92,6 +92,17 @@ function needsCall(brief) {
   return calls;
 }
 
+/** A `prs:` value as a number; empty or non-numeric text is null, not 0. */
+function prsOf(raw) {
+  const value = raw.trim();
+  return value !== '' && Number.isFinite(Number(value)) ? Number(value) : null;
+}
+
+/** mtimeMs of `file`, or null when it cannot be stat'ed (e.g. deleted since readdir). */
+function mtimeOf(file) {
+  try { return fs.statSync(file).mtimeMs; } catch { return null; }
+}
+
 /**
  * The `delivery:` block list of the frontmatter. parseFrontmatter skips
  * indented lines on purpose, so the list is read here: each `- key: value`
@@ -110,7 +121,7 @@ function delivery(text) {
     if (m[1]) items.push({});
     const item = items[items.length - 1];
     if (!item) continue;
-    item[m[2]] = m[2] === 'prs' ? Number(m[3]) : m[3].trim();
+    item[m[2]] = m[2] === 'prs' ? prsOf(m[3]) : m[3].trim();
   }
   return items;
 }
@@ -127,9 +138,11 @@ function score(planPath) {
   }
 }
 
+/** The plan at `file`, or null when it vanished before it could be read. */
 function readPlan(file, cache) {
+  const mtimeMs = mtimeOf(file);
+  if (mtimeMs === null) return null;
   const text = readSafe(file) || '';
-  const mtimeMs = fs.statSync(file).mtimeMs;
   const status = parseFrontmatter(text).status || null;
   const cached = cache[file];
   const scored = cached && cached.mtimeMs === mtimeMs && typeof cached.score === 'number'
@@ -158,13 +171,15 @@ function plans(dir, cache) {
   return listDir(dir)
     .filter(f => /^PLAN.*\.md$/.test(f) && f !== 'PLAN-INDEX.md')
     .map(f => readPlan(path.join(dir, f), cache))
+    .filter(Boolean)
     .sort((a, b) => phaseRank(a.phase) - phaseRank(b.phase) || a.path.localeCompare(b.path));
 }
 
 function docs(dir) {
   return listDir(dir)
     .filter(f => f.endsWith('.md'))
-    .map(f => ({ name: f, mtimeMs: fs.statSync(path.join(dir, f)).mtimeMs }))
+    .map(f => ({ name: f, mtimeMs: mtimeOf(path.join(dir, f)) }))
+    .filter(d => d.mtimeMs !== null)
     .sort((a, b) => b.mtimeMs - a.mtimeMs || a.name.localeCompare(b.name));
 }
 
@@ -188,7 +203,7 @@ function main() {
     root,
     sessionDir,
     phase: sessionDir ? inferPhase(sessionDir) : null,
-    gate: planList.some(p => p.status === 'awaiting-approval') ? 'awaiting-approval' : null,
+    gate: planList.some(p => String(p.status || '').toLowerCase() === 'awaiting-approval') ? 'awaiting-approval' : null,
     plans: planList,
     docs: sessionDir ? docs(sessionDir) : [],
     git: git(args.cwd),

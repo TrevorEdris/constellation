@@ -202,5 +202,34 @@ test('git: toplevel realpath and branch inside a repo, null outside', () => {
 test('usage: no --session-id exits 2 with one stderr line', () => {
   const res = spawnSync(process.execPath, [SCRIPT], { env: hookEnv(), encoding: 'utf8' });
   assert.equal(res.status, 2);
-  assert.match(res.stderr, /^state: --session-id is required\n/);
+  assert.match(res.stderr, /^state: --session-id is required \(usage: node scripts\/state\.js --session-id <id> \[--cwd <dir>\] \[--cache-stdin\]\)\n$/);
+});
+
+test('a file that vanishes between readdir and stat is dropped, not fatal', () => {
+  const { env, dir } = session({ 'PLAN.md': plan('draft') });
+  // A dangling symlink lists in readdir but fails stat, as a deleted file would mid-run.
+  fs.symlinkSync(path.join(dir, 'nowhere.md'), path.join(dir, 'PLAN-gone.md'));
+  fs.symlinkSync(path.join(dir, 'nowhere.md'), path.join(dir, 'GONE.md'));
+  const { status, json } = run(env);
+  assert.equal(status, 0);
+  assert.deepEqual(json.plans.map(p => path.basename(p.path)), ['PLAN.md']);
+  const names = json.docs.map(d => d.name);
+  assert.ok(!names.includes('PLAN-gone.md'));
+  assert.ok(!names.includes('GONE.md'));
+});
+
+test('delivery prs: empty or non-numeric is null', () => {
+  const fm = [
+    '---', 'status: draft', 'delivery:',
+    '  - repo: /src/a', '    prs:',
+    '  - repo: /src/b', '    prs: x',
+    '---', '', '# PLAN: Bad prs', '',
+  ].join('\n');
+  const { env } = session({ 'PLAN.md': fm });
+  assert.deepEqual(run(env).json.plans[0].delivery.map(d => d.prs), [null, null]);
+});
+
+test('gate: status case does not matter', () => {
+  const { env } = session({ 'PLAN.md': plan('Awaiting-Approval') });
+  assert.equal(run(env).json.gate, 'awaiting-approval');
 });
