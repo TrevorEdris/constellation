@@ -17,6 +17,9 @@
 #   version-files  bash scripts/bump-version.sh --check
 #   bash-tests     every skills/**/scripts/test-*.sh at any depth, plus
 #                  scripts/test-*.sh
+#   mod-validate   claude plugin validate . (SKIP with no hooks.json "modules"
+#                  or no claude on PATH)
+#   mod-tests      claude plugin test . (same SKIP rule)
 #
 # Every step runs even if an earlier one failed, so one run lists every
 # problem. A step with nothing to run is a SKIP, never a FAIL. A failing
@@ -135,6 +138,24 @@ step_bash_tests() {
   fi
 }
 
+# A mod (hooks.json "modules") runs only under Claude Code, so its checks need
+# the claude CLI. With no module to check, or no claude (as in CI), they SKIP.
+step_mod() {
+  local reason=""
+  if ! grep -q '"modules"' hooks/hooks.json 2>/dev/null; then
+    reason="no modules"
+  elif ! command -v claude >/dev/null 2>&1; then
+    reason="claude not on PATH"
+  fi
+  if [ -n "$reason" ]; then
+    skip mod-validate "$reason"
+    skip mod-tests "$reason"
+    return
+  fi
+  run_step mod-validate claude plugin validate .
+  run_step mod-tests claude plugin test .
+}
+
 step_node_syntax
 step_node_tests
 step_pytest
@@ -142,6 +163,7 @@ run_step gen-catalog python3 scripts/gen-catalog.py --check
 run_step gen-bootstrap python3 scripts/gen-bootstrap.py --check
 run_step version-files bash scripts/bump-version.sh --check
 step_bash_tests
+step_mod
 
 if [ "$FAILS" -eq 0 ]; then
   echo "ALL CHECKS PASSED"
