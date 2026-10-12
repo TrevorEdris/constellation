@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.0 (2026-10-12)
+
+- Add scripts/state.js: one session's workflow state (dir, phase, gate, plans, docs, git) as JSON.
+
 ## 0.4.6 — 2026-10-07
 
 - feat(hooks): ask before merging or pushing into the default branch

@@ -14,7 +14,7 @@ A Claude Code + Codex skills plugin: a curated set of skills that work together 
 - `agents/` — specialist subagents for dispatched review and debugging.
 - `hooks/` — session bootstrap, safety guards, and session-doc automation.
 - `rules/` — standing conventions. `docs/` — design notes, PLAN v2 template, CC↔Codex parity matrix.
-- `scripts/` — `install.sh`, `gen-catalog.py`, `gen-bootstrap.py`, `new-session.sh`.
+- `scripts/` — `install.sh`, `gen-catalog.py`, `gen-bootstrap.py`, `new-session.sh`, `state.js` (a session's workflow state as JSON).
 
 ## Install
 
