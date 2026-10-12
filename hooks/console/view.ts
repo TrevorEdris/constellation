@@ -28,7 +28,7 @@ export function leadPlan(s: ConsoleState): ConsolePlan | null {
 
 /** The first plan waiting for approval; the gate buttons act on it. */
 export function gatedPlan(s: ConsoleState): ConsolePlan | null {
-  return s.plans.find(p => p.status === 'awaiting-approval') ?? null
+  return s.plans.find(p => String(p.status ?? '').toLowerCase() === 'awaiting-approval') ?? null
 }
 
 /**

@@ -46,9 +46,17 @@ async function refreshOnce($: EngineInterface): Promise<void> {
     await update($, scores, () => nextScores(state))
     await update($, error, () => null)
   } catch (err) {
-    await update($, error, () => firstLine(err instanceof Error ? err.message : String(err)) || 'unknown error')
+    try {
+      await update($, error, () => firstLine(err instanceof Error ? err.message : String(err)) || 'unknown error')
+    } catch {
+      // The error atom is best-effort; a refresh never throws.
+    }
   }
-  $.ui.status(statusLine(await read($, snapshot)))
+  try {
+    $.ui.status(statusLine(await read($, snapshot)))
+  } catch {
+    // The status line is best-effort.
+  }
 }
 
 async function refresh($: EngineInterface): Promise<void> {
@@ -57,14 +65,21 @@ async function refresh($: EngineInterface): Promise<void> {
     return running
   }
   running = (async () => {
-    do {
-      again = false
-      await refreshOnce($)
-    } while (again)
-  })().finally(() => {
-    running = null
-  })
+    try {
+      do {
+        again = false
+        await refreshOnce($)
+      } while (again)
+    } finally {
+      running = null
+    }
+  })()
   return running
+}
+
+/** Starts a refresh without waiting for it, so an event never waits on the CLI. */
+function refreshLater($: EngineInterface): void {
+  void refresh($).catch(() => undefined)
 }
 
 async function open($: EngineInterface): Promise<string> {
@@ -90,7 +105,7 @@ export const register: Register = on => {
       description: 'Show the constellation workflow pane',
       argumentHint: '[open|close]',
     })
-    await refresh($)
+    refreshLater($)
     return next(e)
   })
 
@@ -116,7 +131,7 @@ export const register: Register = on => {
       const now = await $.clock.now()
       await update($, activity, list => pushActivity(list, file, now))
     }
-    await refresh($)
+    refreshLater($)
     return result
   })
 
@@ -127,22 +142,25 @@ export const register: Register = on => {
 
   on('turn.complete', async ($, e, next) => {
     const result = await next(e)
-    await refresh($)
+    refreshLater($)
     return result
   })
 
   on('classic.SessionStart', async ($, e, next) => {
     const result = await next(e)
-    await refresh($)
+    // Must match sessionRoot() in hooks/lib/session.js: SESSION_ROOT if set, else $HOME/src/.ai/sessions.
+    const fromEnv = await $.env.get('SESSION_ROOT')
+    const home = await $.env.get('HOME')
+    const root = fromEnv || (home ? `${home}/src/.ai/sessions` : null)
     const s = await read($, snapshot)
-    if (!s) return result
-    const watch = [`${s.root}/.sessions`, ...(s.sessionDir ? [s.sessionDir] : [])]
+    refreshLater($)
+    const watch = [...(root ? [`${root}/.sessions`] : []), ...(s?.sessionDir ? [s.sessionDir] : [])]
     return { ...result, watchPaths: [...(result.watchPaths ?? []), ...watch] }
   })
 
   on('classic.FileChanged', async ($, e, next) => {
     const result = await next(e)
-    await refresh($)
+    refreshLater($)
     return result
   })
 

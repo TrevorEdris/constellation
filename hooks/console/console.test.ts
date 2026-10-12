@@ -5,7 +5,7 @@
  * drawing test runs on the terminal and the desktop.
  */
 import { describe, expect, mock, test } from 'claude-code/testing'
-import type { Engine } from 'claude-code/testing'
+import type { Engine, MockClock } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
 import type { ConsolePlan, ConsoleState } from '../../types'
@@ -36,6 +36,11 @@ type Recorded = {
   statuses: (string | undefined)[]
   copies: string[]
   opened: string[]
+  /** Panes open now: opens minus closes. */
+  panes: string[]
+  /** Set to make ui.open answer { isPlaced: false, reason }. */
+  refuse: { reason: string | null }
+  clock: MockClock
 }
 
 /**
@@ -43,15 +48,24 @@ type Recorded = {
  * runs print: a state, or an Error for a run that exits 1 with its message.
  */
 function engine(on: On, answer: { current: ConsoleState | Error }): Recorded {
-  const rec: Recorded = { runs: 0, submits: [], fills: [], statuses: [], copies: [], opened: [] }
-  mock.clock(on, { now: 0 })
+  const clock = mock.clock(on, { now: 0 })
+  const rec: Recorded = { runs: 0, submits: [], fills: [], statuses: [], copies: [], opened: [], panes: [], refuse: { reason: null }, clock }
+  mockClock = clock
+  mock.env(on, { SESSION_ROOT: '/root' })
   // Calls on $ answer { value }; events answer their result.
   on('session.id', () => ({ value: 'test-session' }))
   on('command.register', (_$, e) => ({ value: { command: e.name } }))
   on('ui.status', (_$, e) => { rec.statuses.push(e.text); return { value: undefined } })
-  on('ui.open', (_$, e) => { rec.opened.push(e.id); return { value: { isPlaced: true } } })
-  on('ui.close', () => ({ value: undefined }))
-  on('ui.panes', () => ({ value: [] }))
+  on('ui.open', (_$, e) => {
+    if (rec.refuse.reason) return { value: { isPlaced: false, reason: rec.refuse.reason } } as never
+    rec.opened.push(e.id)
+    if (!rec.panes.includes(e.id)) rec.panes.push(e.id)
+    return { value: { isPlaced: true } }
+  })
+  on('ui.close', (_$, e) => { rec.panes = rec.panes.filter(id => id !== e.id); return { value: undefined } })
+  on('ui.panes', () => ({
+    value: rec.panes.map(id => ({ id, title: id, isShown: true, isFocused: false, isPlaced: true })),
+  }))
   on('ui.copy', (_$, e) => { rec.copies.push(e.text); return { value: { isCopied: true } } })
   on('process.run', () => {
     rec.runs += 1
@@ -80,10 +94,23 @@ const PANE = {
 /** Raises the end of a turn, which refreshes the state. */
 async function endTurn($: Engine): Promise<void> {
   await $.turn.complete({ answer: '', durationMs: 0, isAborted: false, turnId: 't', reason: 'answer' })
+  await settle()
+}
+
+let mockClock: MockClock
+
+/**
+ * Refreshes run off the event path, so after raising an event give the
+ * pending ones time to finish: moving the mock clock by 0 ms resolves once
+ * the event loop has settled.
+ */
+async function settle(): Promise<void> {
+  await mockClock.advance(0)
 }
 
 async function start($: Engine): Promise<void> {
   await $.session.start({ cwd: '/src/constellation', surface: 'terminal', isInteractive: true })
+  await settle()
 }
 
 describe('pane', () => {
@@ -177,6 +204,7 @@ describe('events', () => {
     await start($)
     const before = rec.runs
     await $.tool.call({ tool: 'Write', tool_use_id: 'w1', file_path: `${DIR}/PLAN.md`, content: 'x' } as never)
+    await settle()
     expect(rec.runs).toBe(before + 1)
     const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
     expect(await ui.find({ text: /PLAN\.md {2}✎ writing…/ })).toBeDefined()
@@ -187,6 +215,7 @@ describe('events', () => {
     await start($)
     const before = rec.runs
     await $.tool.call({ tool: 'Write', tool_use_id: 'w2', file_path: '/elsewhere/x.md', content: 'x' } as never)
+    await settle()
     expect(rec.runs).toBe(before)
   })
 
@@ -216,5 +245,76 @@ describe('events', () => {
     const res = await $.command.run({ command: 'constellation', args: '' } as never)
     expect(res.text).toBe('Constellation pane opened.')
     expect(rec.opened).toEqual(['constellation-console'])
+  })
+
+  test('/constellation twice closes the pane', async ($, on) => {
+    engine(on, { current: state() })
+    await start($)
+    await $.command.run({ command: 'constellation', args: '' } as never)
+    const res = await $.command.run({ command: 'constellation', args: '' } as never)
+    expect(res.text).toBe('Constellation pane closed.')
+  })
+
+  test('/constellation open reports a pane that was not placed', async ($, on) => {
+    const rec = engine(on, { current: state() })
+    await start($)
+    rec.refuse.reason = 'dialog'
+    const res = await $.command.run({ command: 'constellation', args: 'open' } as never)
+    expect(res.text).toBe('Constellation pane not shown: dialog')
+  })
+
+  test('the pane polls every 15 s until /constellation close', async ($, on) => {
+    const rec = engine(on, { current: state() })
+    await start($)
+    await $.command.run({ command: 'constellation', args: 'open' } as never)
+    const open = rec.runs
+    await rec.clock.advance(15_000)
+    await settle()
+    expect(rec.runs).toBe(open + 1)
+    await $.command.run({ command: 'constellation', args: 'close' } as never)
+    const closed = rec.runs
+    await rec.clock.advance(30_000)
+    await settle()
+    expect(rec.runs).toBe(closed)
+  })
+
+  test('classic SessionStart watches the sessions dir without waiting on the CLI', async ($, on) => {
+    engine(on, { current: state({ root: '/other' }) })
+    on('classic.SessionStart', () => ({}) as never)
+    const res = await $.classic.SessionStart({ source: 'startup' } as never)
+    expect(res.watchPaths).toContain('/root/.sessions')
+  })
+
+  test('a changed watched file refreshes once', async ($, on) => {
+    const rec = engine(on, { current: state() })
+    on('classic.FileChanged', () => ({}) as never)
+    await start($)
+    const before = rec.runs
+    await $.classic.FileChanged({ file_path: '/root/x.md', event: 'change' } as never)
+    await settle()
+    expect(rec.runs).toBe(before + 1)
+  })
+
+  test('an Edit under the session dir refreshes once', async ($, on) => {
+    const rec = engine(on, { current: state() })
+    await start($)
+    const before = rec.runs
+    await $.tool.call({ tool: 'Edit', tool_use_id: 'e1', file_path: `${DIR}/DISCOVERY.md`, old_string: 'a', new_string: 'b' } as never)
+    await settle()
+    expect(rec.runs).toBe(before + 1)
+  })
+
+  test('implementing on main shows a red warning', async ($, on) => {
+    engine(on, { current: state({ phase: 'implement', plans: [plan({ status: 'approved', phase: 'implement', delivery: [] })], git: { toplevel: '/src/constellation', branch: 'main' } }) })
+    await start($)
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+    expect((await ui.find({ type: 'Text', text: '⚠ on main' }))?.props.color).toBe('error')
+  })
+
+  test('the approval caption ignores the case of the plan status', async ($, on) => {
+    engine(on, { current: state({ gate: 'awaiting-approval', plans: [plan({ status: 'Awaiting-Approval' })] }) })
+    await start($)
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+    expect(await ui.find({ type: 'Text', text: /awaiting your approval: Console pane/ })).toBeDefined()
   })
 })
