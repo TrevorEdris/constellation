@@ -7,5 +7,6 @@
     "email": "trevor.edris@gmail.com"
   },
   "license": "MIT",
-  "keywords": ["skills", "tdd", "debugging", "code-review", "planning", "session-docs", "workflows"]
+  "keywords": ["skills", "tdd", "debugging", "code-review", "planning", "session-docs", "workflows"],
+  "types": "./types/index.d.ts"
 }
