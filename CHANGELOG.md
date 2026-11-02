@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.1 (2026-11-02)
+
+- Session journal: when a turn is interrupted (Stop never runs), the next prompt now creates or adopts the session dir instead of leaving the session without one.
+
 ## 0.6.0 (2026-10-12)
 
 - Add the console mod: /constellation pane and status line for the session's workflow state.

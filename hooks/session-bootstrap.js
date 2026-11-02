@@ -9,44 +9,20 @@
  * Order: no valid session id or no transcript does nothing; a session that
  * already resolves (rebinding its pointer if only a scan found it) is left
  * alone; headless runs (`claude -p`, the Agent SDK) get no journal and do
- * nothing more, unless CONSTELLATION_SCAFFOLD=always; a first prompt that names
- * a PLAN inside the root binds the session to that PLAN's dir; a dir the agent
- * made by hand this session is stamped with the session id and bound; anything
- * else is scaffolded by new-session.sh.
+ * nothing more, unless CONSTELLATION_SCAFFOLD=always; anything else goes to
+ * ensureJournal (PLAN binding, then adoption, then new-session.sh).
+ *
+ * Stop does not run when a turn is interrupted. session-reminder.js covers
+ * that case by calling ensureJournal on the next prompt.
  *
  * @hook {"event":"Stop","matcher":"","description":"Auto-scaffolds a SESSION.md from the real session title"}
  */
-const { execFileSync } = require('child_process');
-const path = require('path');
 const {
-  sessionRoot, today, isValidSessionId, readPointer, bindSession, resolveSessionDir,
-  sessionDirFromPrompt, findAdoptableDir, stampSessionId,
-  isHeadless, latestCustomTitle, firstRealPromptText, detectTicket, slugifyTitle,
+  sessionRoot, isValidSessionId, readPointer, bindSession, resolveSessionDir,
+  isHeadless, ensureJournal,
 } = require('./lib/session');
 
-const PLUGIN_ROOT = path.dirname(__dirname);
 const FAILURE_PREFIX = 'Constellation session journal not created: ';
-
-function firstLine(text) {
-  return String(text || '').split('\n').map(l => l.trim()).find(Boolean) || '';
-}
-
-/** Runs new-session.sh; returns null on success or the first line saying why it failed. */
-function scaffold({ slug, ticket, sessionId }) {
-  const script = path.join(PLUGIN_ROOT, 'scripts', 'new-session.sh');
-  try {
-    // The script writes the pointer too, so there is nothing to bind afterwards.
-    // Its stdout (the new dir) is piped away: a hook prints exactly one JSON object.
-    execFileSync('bash', [script, slug, ticket || '', sessionId], {
-      env: { ...process.env, SESSION_DATE: today() },
-      stdio: ['ignore', 'pipe', 'pipe'],
-      encoding: 'utf8',
-    });
-    return null;
-  } catch (err) {
-    return firstLine(err.stderr) || firstLine(err.message) || 'new-session.sh failed';
-  }
-}
 
 async function main() {
   let input = '';
@@ -76,27 +52,7 @@ async function main() {
   // each of them would aim all of them at that one dir's SESSION.md.
   if (isHeadless(process.env, transcriptPath)) { console.log('{}'); return; }
 
-  // A first prompt that names a PLAN inside the root puts the session in that
-  // PLAN's dir. Binding comes first (and stamping, below, only after it), so a
-  // pointer that cannot be written leaves the dir untouched and falls through.
-  const firstPrompt = firstRealPromptText(transcriptPath) || '';
-  const planDir = sessionDirFromPrompt(root, firstPrompt);
-  if (planDir && bindSession(root, sessionId, planDir)) { console.log('{}'); return; }
-
-  // A dir the agent made by hand this session is the session's journal.
-  const adopted = findAdoptableDir(root, transcriptPath);
-  if (adopted && bindSession(root, sessionId, adopted)) {
-    stampSessionId(adopted, sessionId);
-    console.log('{}');
-    return;
-  }
-
-  const title = latestCustomTitle(transcriptPath) || firstPrompt;
-  if (!title) { console.log('{}'); return; }
-
-  const ticket = detectTicket(title) || detectTicket(firstPrompt);
-  const failure = scaffold({ slug: slugifyTitle(title, ticket), ticket, sessionId });
-
+  const { failure } = ensureJournal(root, sessionId, transcriptPath);
   console.log(failure ? JSON.stringify({ systemMessage: FAILURE_PREFIX + failure }) : '{}');
 }
 

@@ -13,13 +13,13 @@ const fs = require('fs');
 const path = require('path');
 
 const { HOOKS_DIR, makeTmp, hookEnv, runHook } = require('./helpers');
-const { bindSession, readMarker, writeMarker } = require('../lib/session');
+const { bindSession, readMarker, readPointer, today, writeMarker } = require('../lib/session');
 
 const PLUGIN_DIR = path.resolve(HOOKS_DIR, '..');
 const ROUTER_FILE = path.join(PLUGIN_DIR, 'skills', 'using-constellation', 'SKILL.md');
 
 const pendingLine = root =>
-  `Session journal: not created yet. Constellation creates it under ${root} when this turn ends, or adopts a session dir you create there this turn.`;
+  `Session journal: not created yet. Constellation creates it under ${root} when this turn ends (or at the next prompt, if this turn is interrupted), or adopts a session dir you create there this turn.`;
 const journalLine = dir =>
   `Session journal: ${dir}/SESSION.md. Journal there; do not create another session dir. Keep '## Decisions' and '## Status' current.`;
 
@@ -179,6 +179,76 @@ test('reminder with a missing or invalid id prints {} and touches nothing', () =
   assert.deepEqual(garbage.json, {});
 
   assert.deepEqual(fs.readdirSync(root), [], 'nothing was written under the root');
+});
+
+// --- a turn that never reached Stop -------------------------------------------
+
+const SESSION_UUID = '0f8e9c1a-2b3d-4e5f-8a9b-0c1d2e3f4a5b';
+
+/**
+ * A transcript for an interactive session whose first turn ended without a
+ * Stop (the user interrupted it): the prompt, the custom title Claude Code
+ * wrote, and optionally an assistant tool call that names `madeDir`.
+ */
+function interruptedTranscript({ madeDir } = {}) {
+  const entries = [
+    { type: 'bridge-session' },
+    { type: 'user', entrypoint: 'claude-desktop', timestamp: '2026-10-07T12:00:00.000Z', message: { role: 'user', content: 'Fix the login bug' } },
+    { type: 'custom-title', customTitle: 'Fix login bug' },
+  ];
+  if (madeDir) {
+    entries.push({
+      type: 'assistant', entrypoint: 'claude-desktop', timestamp: '2026-10-07T12:00:05.000Z',
+      message: { role: 'assistant', content: [{ type: 'tool_use', name: 'Write', input: { file_path: path.join(madeDir, 'SESSION.md') } }] },
+    });
+  }
+  entries.push({ type: 'user', message: { role: 'user', content: [{ type: 'text', text: '[Request interrupted by user]' }] } });
+  const file = path.join(makeTmp(), 'transcript.jsonl');
+  fs.writeFileSync(file, entries.map(e => JSON.stringify(e)).join('\n') + '\n');
+  return file;
+}
+
+test('the next prompt creates the journal when the first turn never reached Stop', () => {
+  const env = hookEnv();
+  const root = env.SESSION_ROOT;
+  const transcript = interruptedTranscript();
+
+  assert.equal(contextOf(remind(env, SESSION_UUID, { transcript_path: transcript })), pendingLine(root));
+  assert.deepEqual(fs.readdirSync(root), ['.sessions'], 'the first prompt only records pending');
+
+  // No Stop ran. The second prompt finds the marker still pending and makes the journal itself.
+  const dir = path.join(root, `${today()}_Fix-login-bug`);
+  const second = remind(env, SESSION_UUID, { transcript_path: transcript });
+  assert.equal(second.status, 0);
+  assert.equal(contextOf(second), journalLine(dir));
+  assert.ok(fs.existsSync(path.join(dir, 'SESSION.md')));
+  assert.equal(readPointer(root, SESSION_UUID), dir);
+  assert.equal(readMarker(root, SESSION_UUID), dir);
+
+  assert.deepEqual(remind(env, SESSION_UUID, { transcript_path: transcript }).json, {}, 'announced once');
+  assert.equal(fs.readdirSync(root).filter(n => !n.startsWith('.')).length, 1, 'one journal dir');
+});
+
+test('the next prompt adopts a dir the agent made during the interrupted turn', () => {
+  const env = hookEnv();
+  const root = env.SESSION_ROOT;
+  const made = makeSessionDir(root, '2026-10-07_My-own-dir');
+  const transcript = interruptedTranscript({ madeDir: made });
+
+  writeMarker(root, SESSION_UUID, 'pending');
+  assert.equal(contextOf(remind(env, SESSION_UUID, { transcript_path: transcript })), journalLine(made));
+  assert.equal(readPointer(root, SESSION_UUID), made);
+  assert.match(fs.readFileSync(path.join(made, 'SESSION.md'), 'utf8'), new RegExp(`session_id: ${SESSION_UUID}`));
+  assert.deepEqual(fs.readdirSync(root).filter(n => !n.startsWith('.')), ['2026-10-07_My-own-dir'], 'no second dir');
+});
+
+test('a pending headless run still gets no journal from the next prompt', () => {
+  const env = hookEnv({ CLAUDE_CODE_ENTRYPOINT: 'sdk-cli' });
+  const root = env.SESSION_ROOT;
+  writeMarker(root, SESSION_UUID, 'pending');
+
+  assert.deepEqual(remind(env, SESSION_UUID, { transcript_path: interruptedTranscript() }).json, {});
+  assert.deepEqual(fs.readdirSync(root), ['.sessions'], 'nothing scaffolded');
 });
 
 // --- the marker helpers -------------------------------------------------------
