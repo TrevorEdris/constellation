@@ -11,6 +11,9 @@
  *     record the dir (this also fires when the session is bound to a new dir)
  *   - no dir and no marker: promise that one is coming (the Stop hook
  *     scaffolds it or adopts the agent's own), and record `pending`
+ *   - no dir, a `pending` marker and a transcript: an earlier turn ended
+ *     without a Stop (it was interrupted), so give the session its journal
+ *     now (ensureJournal) and say where it is
  *   - anything else: stay silent
  *
  * session-start.js says the journal line again after a compaction, which wipes
@@ -20,7 +23,7 @@
  */
 const {
   sessionRoot, resolveSessionDir, isValidSessionId, isHeadless,
-  readMarker, writeMarker, journalLine, pendingLine,
+  readMarker, writeMarker, journalLine, pendingLine, ensureJournal,
 } = require('./lib/session');
 
 const PENDING = 'pending';
@@ -38,6 +41,13 @@ function nextAnnouncement(root, sessionId, transcriptPath) {
     if (dir === marker) return null;
     writeMarker(root, sessionId, dir);
     return journalLine(dir);
+  }
+  if (marker === PENDING && typeof transcriptPath === 'string' && transcriptPath) {
+    // A failed scaffold says nothing here; the marker stays pending, so the next prompt tries again.
+    const made = ensureJournal(root, sessionId, transcriptPath).dir;
+    if (!made) return null;
+    writeMarker(root, sessionId, made);
+    return journalLine(made);
   }
   if (marker !== null) return null;
   writeMarker(root, sessionId, PENDING);

@@ -14,7 +14,8 @@
  *
  * A session with no dir yet can still be matched to one: a first prompt that
  * names a PLAN inside the root (sessionDirFromPrompt), or a dir the agent made
- * by hand this session (findAdoptableDir, then stampSessionId).
+ * by hand this session (findAdoptableDir, then stampSessionId). ensureJournal
+ * tries those and otherwise scaffolds a new dir.
  *
  * The agent is told where its journal is once per session: <root>/.sessions/<id>.announced
  * holds the dir it was told about, or `pending` (readMarker, writeMarker).
@@ -23,6 +24,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
+const { execFileSync } = require('child_process');
 
 const HEAD_BYTES = 4096;
 const SESSION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
@@ -294,7 +296,7 @@ function journalLine(dir) {
 
 /** The line for a session with no journal yet: one is coming, or the agent's own dir will be adopted. */
 function pendingLine(root) {
-  return `Session journal: not created yet. Constellation creates it under ${root} when this turn ends, or adopts a session dir you create there this turn.`;
+  return `Session journal: not created yet. Constellation creates it under ${root} when this turn ends (or at the next prompt, if this turn is interrupted), or adopts a session dir you create there this turn.`;
 }
 
 // --- Matching a session to a dir that already exists -------------------------
@@ -445,11 +447,65 @@ function sessionDirFromPrompt(root, prompt) {
   return null;
 }
 
+// --- Giving a session its journal ---------------------------------------------
+
+const NEW_SESSION_SCRIPT = path.resolve(__dirname, '..', '..', 'scripts', 'new-session.sh');
+
+function firstLine(text) {
+  return String(text || '').split('\n').map(l => l.trim()).find(Boolean) || '';
+}
+
+/** Runs new-session.sh; returns null on success or the first line saying why it failed. */
+function scaffold({ slug, ticket, sessionId }) {
+  try {
+    // The script writes the pointer too, so there is nothing to bind afterwards.
+    // Its stdout (the new dir) is piped away: a hook prints exactly one JSON object.
+    execFileSync('bash', [NEW_SESSION_SCRIPT, slug, ticket || '', sessionId], {
+      env: { ...process.env, SESSION_DATE: today() },
+      stdio: ['ignore', 'pipe', 'pipe'],
+      encoding: 'utf8',
+    });
+    return null;
+  } catch (err) {
+    return firstLine(err.stderr) || firstLine(err.message) || 'new-session.sh failed';
+  }
+}
+
+/**
+ * Gives a session that resolves to no dir its journal, and binds it. In order:
+ * a first prompt that names a PLAN inside the root binds the session to that
+ * PLAN's dir; a dir the agent made by hand this session is bound and stamped;
+ * anything else is scaffolded by new-session.sh from the custom title (or the
+ * first prompt). Returns { dir } when the session now has a dir, { failure }
+ * when the scaffold failed, or {} when there is no title to name one by.
+ * Callers check the session id, the transcript and headless runs first.
+ */
+function ensureJournal(root, sessionId, transcriptPath) {
+  // Binding comes first (and stamping, below, only after it), so a pointer
+  // that cannot be written leaves the dir untouched and falls through.
+  const firstPrompt = firstRealPromptText(transcriptPath) || '';
+  const planDir = sessionDirFromPrompt(root, firstPrompt);
+  if (planDir && bindSession(root, sessionId, planDir)) return { dir: readPointer(root, sessionId) };
+
+  const adopted = findAdoptableDir(root, transcriptPath);
+  if (adopted && bindSession(root, sessionId, adopted)) {
+    stampSessionId(adopted, sessionId);
+    return { dir: readPointer(root, sessionId) };
+  }
+
+  const title = latestCustomTitle(transcriptPath) || firstPrompt;
+  if (!title) return {};
+
+  const ticket = detectTicket(title) || detectTicket(firstPrompt);
+  const failure = scaffold({ slug: slugifyTitle(title, ticket), ticket, sessionId });
+  return failure ? { failure } : { dir: resolveSessionDir(root, { sessionId }) };
+}
+
 module.exports = {
   sessionRoot, today, parseFrontmatter, readSafe, readHead,
   isValidSessionId, pointerPath, readPointer, bindSession,
   readMarker, writeMarker, journalLine, pendingLine,
   resolveSessionDir, inferPhase, phaseOfStatus, phaseRank, sessionIdFromStdin,
   isHeadless, latestCustomTitle, firstRealPromptText, detectTicket, slugifyTitle, extractText,
-  sessionStartMs, findAdoptableDir, stampSessionId, sessionDirFromPrompt,
+  sessionStartMs, findAdoptableDir, stampSessionId, sessionDirFromPrompt, ensureJournal,
 };
