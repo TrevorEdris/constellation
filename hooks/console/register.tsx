@@ -4,9 +4,14 @@
  * prompting Claude, so every state change still goes through a skill.
  *
  * State comes from scripts/state.js, run on session start, after Claude
- * writes into the session dir, at the end of each turn, when a watched file
- * changes, and every 15 s while the pane is open. Refreshes never overlap: a
- * request that arrives during one runs once more after it.
+ * writes into the session dir, at the end of each turn, and every 15 s while
+ * the pane is open. Refreshes never overlap: a request that arrives during one
+ * runs once more after it.
+ *
+ * Where Claude Code's built-in guard loads (managed settings, or a Team or
+ * Enterprise login), it skips a user-installed mod's hooks on classic.* and
+ * skill.prompt, so this module hooks neither: skills are seen at tool.call
+ * and command.run, and there is no file watch.
  */
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, Timer } from 'claude-code'
@@ -159,6 +164,11 @@ async function close($: EngineInterface): Promise<string> {
   return 'Constellation pane closed.'
 }
 
+/** Records a constellation skill in the pane's "Skills used" list; ignores any other name. */
+async function noteSkill($: EngineInterface, name: string): Promise<void> {
+  if (name.startsWith('constellation:')) await update($, skills, list => pushSkill(list, name))
+}
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
@@ -180,8 +190,18 @@ export const register: Register = on => {
     return { text: isOpen ? await close($) : await open($) }
   })
 
+  // A typed /constellation:<skill> runs here, not through the Skill tool.
+  on('command.run', async ($, e, next) => {
+    await noteSkill($, e.command)
+    return next(e)
+  })
+
   on('tool.call', async ($, e, next) => {
     const result = await next(e)
+    if (e.tool === 'Skill') {
+      await noteSkill($, e.skill)
+      return result
+    }
     const file = e.tool === 'Write' || e.tool === 'Edit'
       ? e.file_path
       : e.tool === 'NotebookEdit' ? e.notebook_path : null
@@ -196,30 +216,7 @@ export const register: Register = on => {
     return result
   })
 
-  on('skill.prompt', async ($, e, next) => {
-    if (e.skill.startsWith('constellation:')) await update($, skills, list => pushSkill(list, e.skill))
-    return next(e)
-  })
-
   on('turn.complete', async ($, e, next) => {
-    const result = await next(e)
-    refreshLater($)
-    return result
-  })
-
-  on('classic.SessionStart', async ($, e, next) => {
-    const result = await next(e)
-    // Must match sessionRoot() in hooks/lib/session.js: SESSION_ROOT if set, else $HOME/src/.ai/sessions.
-    const fromEnv = await $.env.get('SESSION_ROOT')
-    const home = await $.env.get('HOME')
-    const root = fromEnv || (home ? `${home}/src/.ai/sessions` : null)
-    const s = await read($, snapshot)
-    refreshLater($)
-    const watch = [...(root ? [`${root}/.sessions`] : []), ...(s?.sessionDir ? [s.sessionDir] : [])]
-    return { ...result, watchPaths: [...(result.watchPaths ?? []), ...watch] }
-  })
-
-  on('classic.FileChanged', async ($, e, next) => {
     const result = await next(e)
     refreshLater($)
     return result
@@ -249,7 +246,7 @@ export const register: Register = on => {
         <Box flexDirection="column">
           {problem}
           <Text>No session journal yet.</Text>
-          <Text dimColor>It starts when this turn ends.</Text>
+          <Text dimColor>It starts when this turn ends, or at your next prompt if the turn was interrupted.</Text>
         </Box>
       )
     }
