@@ -95,7 +95,6 @@ function engine(on: On, answer: { current: ConsoleState | Error }): Recorded {
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
   on('turn.complete', () => ({ text: '' }))
   on('tool.call', () => ({ result: {}, text: 'ok' }) as never)
-  on('skill.prompt', (_$, e) => ({ text: e.text }))
   return rec
 }
 
@@ -234,14 +233,29 @@ describe('events', () => {
     expect(rec.runs).toBe(before)
   })
 
-  test('constellation skills are listed; other skills are not', async ($, on) => {
+  test('constellation skills Claude calls are listed; other skills are not', async ($, on) => {
     engine(on, { current: state() })
     await start($)
-    await $.skill.prompt({ skill: 'constellation:brainstorming', text: 'x' })
-    await $.skill.prompt({ skill: 'caveman:caveman', text: 'x' })
+    await $.tool.call({ tool: 'Skill', tool_use_id: 's1', skill: 'constellation:brainstorming' } as never)
+    await $.tool.call({ tool: 'Skill', tool_use_id: 's2', skill: 'caveman:caveman' } as never)
+    await settle()
     const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
     const row = await ui.find({ type: 'Text', text: /^Skills used: / })
     expect(row?.text).toBe('Skills used: brainstorming')
+  })
+
+  test('a typed constellation skill command is listed and still runs', async ($, on) => {
+    engine(on, { current: state() })
+    const ran: string[] = []
+    on('command.run', (_$, e) => { ran.push(e.command); return { text: '' } as never })
+    await start($)
+    await $.command.run({ command: 'constellation:writing-plans', args: '' } as never)
+    await $.command.run({ command: 'caveman:caveman', args: '' } as never)
+    await settle()
+    expect(ran).toEqual(['constellation:writing-plans', 'caveman:caveman'])
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+    const row = await ui.find({ type: 'Text', text: /^Skills used: / })
+    expect(row?.text).toBe('Skills used: writing-plans')
   })
 
   test('status line: gate and no session', async ($, on) => {
@@ -291,23 +305,6 @@ describe('events', () => {
     await rec.clock.advance(30_000)
     await settle()
     expect(rec.runs).toBe(closed)
-  })
-
-  test('classic SessionStart watches the sessions dir without waiting on the CLI', async ($, on) => {
-    engine(on, { current: state({ root: '/other' }) })
-    on('classic.SessionStart', () => ({}) as never)
-    const res = await $.classic.SessionStart({ source: 'startup' } as never)
-    expect(res.watchPaths).toContain('/root/.sessions')
-  })
-
-  test('a changed watched file refreshes once', async ($, on) => {
-    const rec = engine(on, { current: state() })
-    on('classic.FileChanged', () => ({}) as never)
-    await start($)
-    const before = rec.runs
-    await $.classic.FileChanged({ file_path: '/root/x.md', event: 'change' } as never)
-    await settle()
-    expect(rec.runs).toBe(before + 1)
   })
 
   test('an Edit under the session dir refreshes once', async ($, on) => {

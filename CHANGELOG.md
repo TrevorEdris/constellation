@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.2 (2026-11-16)
+
+- Console pane: stop hooking classic.* and skill.prompt, which Claude Code's built-in guard skips for user-installed mods on managed or Team/Enterprise machines (the 'hook was skipped' lines). Skills are now tracked from Skill tool calls and typed /constellation:<skill> commands; the pane's file watch is gone.
+
 ## 0.6.1 (2026-11-02)
 
 - Session journal: when a turn is interrupted (Stop never runs), the next prompt now creates or adopts the session dir instead of leaving the session without one.
